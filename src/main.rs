@@ -1,4 +1,6 @@
-use std::{fmt::Debug, sync::Arc};
+use std::{
+    fmt::Debug, ops::{Bound, RangeBounds}, path::Component, sync::Arc
+};
 
 use bytes::{Bytes, BytesMut};
 use genawaiter::rc::{Co, Gen};
@@ -22,25 +24,20 @@ const FINGERPRINTS_TABLE: redb::TableDefinition<FingerprintKey<'static>, Fingerp
 
 type Path<'a> = &'a [&'a [u8]];
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct OwnedPath(Arc<Vec<Bytes>>);
-
-impl Default for OwnedPath {
-    fn default() -> Self {
-        Self(Arc::new(vec![Bytes::new()]))
-    }
-}
 
 impl Debug for OwnedPath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_list().entries(self.as_ref().iter().map(|x| hex::encode(x))).finish()
+        f.debug_list()
+            .entries(self.as_ref().iter().map(|x| hex::encode(x)))
+            .finish()
     }
-
 }
 
 impl AsRef<[Bytes]> for OwnedPath {
     fn as_ref(&self) -> &[Bytes] {
-        &self.0[1..]
+        &self.0
     }
 }
 
@@ -118,13 +115,11 @@ impl PathGenerator {
     }
 
     fn push_owned(&mut self, component: Bytes) {
-        self.current_path
-            .get_mut()
-            .push(component);
+        self.current_path.get_mut().push(component);
     }
 
-    fn path(&self) -> OwnedPath {
-        self.current_path.clone()
+    fn path(&self) -> &OwnedPath {
+        &self.current_path
     }
 }
 
@@ -162,7 +157,7 @@ impl std::fmt::Debug for TransactionAndTables {
     }
 }
 
-pub struct TransactionAndTables {
+struct TransactionAndTables {
     inner: TransactionAndTablesInner,
 }
 
@@ -201,43 +196,243 @@ struct TreeStore {
 const ROOT_INODE: INode = 0;
 const EMPTY_PATH: &'static [u8] = &[];
 
+trait RangeController<'a> {
+    // go one level down in the directory tree
+    fn down(&mut self);
+    // set the current last component of the path.
+    fn set_last(&mut self, component: &[u8]);
+    // get the range when iterating over the directory below the current path
+    fn range(&self, inode: INode) -> RcRange<BlobKey<'a>>;
+    // go one level up in the directory tree
+    fn up(&mut self);
+}
+
 trait IterController<'a> {
     type Item;
+    // go one level down in the directory tree
     fn down(&mut self);
+    // set the current last component of the path.
+    fn set_last(&mut self, component: &[u8]);
+    // get the range when iterating over the directory below the current path
+    fn range(&self, inode: INode) -> RcRange<BlobKey<'a>>;
+    // produce an item, given a value
+    fn item(&self, value: Option<&Value>) -> Option<Self::Item>;
+    // go one level up in the directory tree
     fn up(&mut self);
-    fn set(&mut self, component: &[u8]);
-    fn range(&self, inode: INode) -> std::result::Result<redb::Range<'a, BlobKey<'static>, BlobValue>, redb::StorageError>;
-    fn item(&self, value: &Value) -> Self::Item;
 }
 
-struct AllPathsIterController<'a> {
+struct AllPathsIterController {
     path_gen: PathGenerator,
-    tables: &'a Tables<'a>,
 }
 
-impl<'a> IterController<'a> for AllPathsIterController<'a> {
+struct RangeFromIterController<'a> {
+    path_gen: PathGenerator,
+    from: Path<'a>,
+}
+
+struct RangeFromToIterController<'a> {
+    path_gen: PathGenerator,
+    from: Path<'a>,
+    to: Path<'a>,
+}
+
+fn strip_prefix<'a>(path: Path<'a>, prefix: &[Bytes]) -> Option<Path<'a>> {
+    if path.len() < prefix.len() {
+        return None;
+    }
+    for (a, b) in path.iter().zip(prefix.iter()) {
+        if a != b {
+            return None;
+        }
+    }
+    Some(&path[prefix.len()..])
+}
+
+impl<'a> IterController<'a> for RangeFromIterController<'a> {
     type Item = (OwnedPath, Value);
 
     fn down(&mut self) {
         self.path_gen.push(EMPTY_PATH);
     }
 
+    // go one level up in the directory tree
+    fn up(&mut self) {
+        self.path_gen.pop();
+        self.from = &[];
+    }
+
+    // set the current last component of the path.
+    //
+    // this will be called after down()
+    fn set_last(&mut self, component: &[u8]) {
+        self.path_gen.set_last(component);
+        if self.from.get(0) == Some(&component) {
+            self.from = &self.from[1..];
+        } else {
+            self.from = &[];
+        }
+    }
+
+    // get the range when iterating over the directory below the current path
+    fn range(&self, inode: INode) -> RcRange<BlobKey<'a>> {
+        let start = self.from.get(0).map(|x| *x).unwrap_or_default();
+        ((inode, start)..(inode + 1, EMPTY_PATH)).into()
+    }
+
+    // produce an item, given a value
+    fn item(&self, value: Option<&Value>) -> Option<Self::Item> {
+        if self.from.is_empty() {
+            Some((self.path_gen.path().clone(), *value?))
+        } else {
+            None
+        }
+    }
+}
+
+impl<'a> IterController<'a> for RangeFromToIterController<'a> {
+    type Item = (OwnedPath, Value);
+
+    fn down(&mut self) {
+        self.path_gen.push(EMPTY_PATH);
+    }
+
+    // go one level up in the directory tree
+    fn up(&mut self) {
+        self.path_gen.pop();
+        self.from = &[];
+    }
+
+    // set the current last component of the path.
+    //
+    // this will be called after down()
+    fn set_last(&mut self, component: &[u8]) {
+        self.path_gen.set_last(component);
+        if self.from.get(0) == Some(&component) {
+            self.from = &self.from[1..];
+        } else {
+            self.from = &[];
+        }
+    }
+
+    // get the range when iterating over the directory below the current path
+    fn range(&self, inode: INode) -> RcRange<BlobKey<'a>> {
+        let start = self
+            .from
+            .get(0)
+            .map(|x| (inode, *x))
+            .unwrap_or((inode, EMPTY_PATH));
+        // todo: calling strip_prefix on every item is not efficient
+        let end1 = strip_prefix(self.to, self.path_gen.path().as_ref());
+        match end1 {
+            Some(end) if end.len() == 1 => (start..(inode, end[0])).into(),
+            Some(end) if end.len() > 1 => (start..=(inode, end[0])).into(),
+            _ => (start..(inode + 1, EMPTY_PATH)).into(),
+        }
+    }
+
+    // produce an item, given a value
+    fn item(&self, value: Option<&Value>) -> Option<Self::Item> {
+        if self.from.is_empty() {
+            Some((self.path_gen.path().clone(), *value?))
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum RcRange<T> {
+    Range(std::ops::Range<T>),
+    RangeInclusive(std::ops::RangeInclusive<T>),
+}
+
+impl<T> From<std::ops::Range<T>> for RcRange<T> {
+    fn from(r: std::ops::Range<T>) -> Self {
+        RcRange::Range(r)
+    }
+}
+
+impl<T> From<std::ops::RangeInclusive<T>> for RcRange<T> {
+    fn from(r: std::ops::RangeInclusive<T>) -> Self {
+        RcRange::RangeInclusive(r)
+    }
+}
+
+impl<T> RangeBounds<T> for RcRange<T> {
+    fn start_bound(&self) -> Bound<&T> {
+        match self {
+            RcRange::Range(r) => r.start_bound(),
+            RcRange::RangeInclusive(r) => r.start_bound(),
+        }
+    }
+
+    fn end_bound(&self) -> Bound<&T> {
+        match self {
+            RcRange::Range(r) => r.end_bound(),
+            RcRange::RangeInclusive(r) => r.end_bound(),
+        }
+    }
+}
+
+impl<'a> IterController<'a> for AllPathsIterController {
+    type Item = (OwnedPath, Value);
+
+    fn down(&mut self) {
+        self.path_gen.push(EMPTY_PATH);
+    }
+
+    // go one level up in the directory tree
     fn up(&mut self) {
         self.path_gen.pop();
     }
 
-    fn set(&mut self, component: &[u8]) {
+    // set the current last component of the path.
+    //
+    // this will be called after down()
+    fn set_last(&mut self, component: &[u8]) {
         self.path_gen.set_last(component);
     }
 
-    fn range(&self, inode: INode) -> std::result::Result<redb::Range<'a, BlobKey<'static>, BlobValue>, redb::StorageError> {
-        Ok(self.tables.blobs.range(complete_range(inode))?)
+    // get the range when iterating over the directory below the current path
+    fn range(&self, inode: INode) -> RcRange<BlobKey<'static>> {
+        complete_range(inode).into()
     }
 
-    fn item(&self, value: &Value) -> Self::Item {
-        (self.path_gen.path(), *value)
+    // produce an item, given a value
+    fn item(&self, value: Option<&Value>) -> Option<Self::Item> {
+        Some((self.path_gen.path().clone(), *value?))
     }
+}
 
+/// Next non-prefix path for a given path.
+fn next_non_prefix<'a>(path: &[u8], buffer: &'a mut Vec<u8>) -> Option<&'a [u8]> {
+    buffer.clear();
+    buffer.extend_from_slice(path);
+    while buffer.last() == Some(&0xFF) {
+        buffer.pop();
+    };
+    if let Some(last) = buffer.last_mut() {
+        *last -= 1;
+        Some(buffer.as_slice())
+    } else {
+        None
+    }
+}
+
+/// Increment the path in place. To turn inclusive ranges into exclusive ranges.
+fn inc<'a>(path: &'a [u8], buffer: &'a mut Vec<u8>) -> &'a [u8] {
+    buffer.clear();
+    buffer.extend_from_slice(path);
+    for i in (0..buffer.len()).rev() {
+        if buffer[i] == 0xFF {
+            buffer[i] = 0;
+        } else {
+            buffer[i] += 1;
+            return buffer.as_slice();
+        }
+    }
+    buffer.push(0);
+    buffer.as_slice()
 }
 
 impl TreeStore {
@@ -245,7 +440,10 @@ impl TreeStore {
         let db = redb::Database::builder()
             .create_with_backend(redb::backends::InMemoryBackend::new())
             .unwrap();
-        let mut res = Self { db, current_transaction: CurrentTransaction::None };
+        let mut res = Self {
+            db,
+            current_transaction: CurrentTransaction::None,
+        };
         res.modify(|tables| {
             tables
                 .blobs
@@ -256,84 +454,170 @@ impl TreeStore {
         res
     }
 
-    async fn iter_inner_2<'a, C>(mut controller: C, co: &Co<std::result::Result<C::Item, redb::StorageError>>) -> std::result::Result<(), redb::StorageError>
-        where C: IterController<'a>
+    async fn iter_impl<'a, C>(
+        tables: &'a Tables<'a>,
+        mut controller: C,
+        co: &Co<std::result::Result<C::Item, redb::StorageError>>,
+    ) -> std::result::Result<(), redb::StorageError>
+    where
+        C: IterController<'a>,
     {
-        let range = controller.range(ROOT_INODE)?;
+        let range = tables.blobs.range(complete_range(ROOT_INODE))?;
         let mut stack = vec![range];
         while let Some(current) = stack.last_mut() {
             match current.next() {
                 Some(Ok((k, v))) => {
                     let (_, component) = k.value();
                     let v = v.value();
-                    controller.set(component);
-                    if let Some(value) = v.value.as_ref() {
-                        co.yield_(Ok(controller.item(value))).await;
+                    if stack.len() > 1 {
+                        controller.set_last(component);
+                    }
+                    if let Some(value) = controller.item(v.value.as_ref()) {
+                        co.yield_(Ok(value)).await;
                     }
                     if let Some(dir) = v.dir {
-                        let range = controller.range(dir)?;
+                        let range = controller.range(dir);
+                        let range = tables.blobs.range(range)?;
                         stack.push(range);
                         controller.down();
                     }
                 }
                 Some(Err(e)) => {
                     co.yield_(Err(e)).await;
-                },
+                }
                 None => {
                     stack.pop();
                     controller.up();
-                },
-            }
-        }
-        Ok(())
-    }
-
-
-    async fn iter_inner(tables: &Tables<'_>, co: &Co<std::result::Result<(OwnedPath, Value), redb::StorageError>>) -> std::result::Result<(), redb::StorageError> {
-        let range = tables.blobs.range(complete_range(ROOT_INODE))?;
-        let mut path_gen = PathGenerator::new();
-        let mut stack = vec![range];
-        while let Some(current) = stack.last_mut() {
-            match current.next() {
-                Some(Ok((k, v))) => {
-                    let (_, component) = k.value();
-                    let v = v.value();
-                    path_gen.set_last(component);
-                    if let Some(value) = v.value {
-                        co.yield_(Ok((path_gen.path(), value))).await;
-                    }
-                    if let Some(dir) = v.dir {
-                        let range = tables.blobs.range(complete_range(dir))?;
-                        stack.push(range);
-                        path_gen.push(EMPTY_PATH);
-                    }
                 }
-                Some(Err(e)) => {
-                    co.yield_(Err(e)).await;
-                },
-                None => {
-                    stack.pop();
-                    path_gen.pop();
-                },
             }
         }
         Ok(())
     }
 
-    fn iter2(&mut self) -> std::result::Result<impl IntoIterator<Item = std::result::Result<(OwnedPath, Value), redb::StorageError>> + '_, redb::Error> {
+    fn fingerprint_impl<'a>(
+        tables: &'a mut Tables<'a>,
+        range: std::ops::Range<BlobKey<'a>>,
+    ) -> std::result::Result<Fingerprint, redb::StorageError>
+    {
+        let mut nnp_buf = Vec::new();
+        let range = RcRange::from(complete_range(ROOT_INODE));
+        let mut iter = tables.blobs.range(range.clone())?;
+        let mut fp = Fingerprint::default();
+
+        loop {
+            let Some(item) = iter.next() else {
+                break;
+            };
+            let (k, v) = item?;
+            let path @ (inode, component) = k.value();
+            let nnp: Option<&[u8]> = next_non_prefix(component, &mut nnp_buf);
+
+            let value = v.value();
+            if let Some(value) = value.value {
+                for i in 0..32 {
+                    fp[i] ^= value[i];
+                }
+            }
+            if let Some(dir) = value.dir {
+                let child_fp = Self::fingerprint_impl(tables, todo!())?;
+                for i in 0..32 {
+                    fp[i] ^= child_fp[i];
+                }
+            }
+        }
+        Ok(fp)
+
+    }
+
+
+    fn iter_from<'a>(
+        &'a mut self,
+        from: Path<'a>,
+    ) -> std::result::Result<
+        impl IntoIterator<Item = std::result::Result<(OwnedPath, Value), redb::StorageError>> + '_,
+        redb::Error,
+    > {
         let tables = self.tables()?;
-        let controller = AllPathsIterController { path_gen: PathGenerator::new(), tables };
+        let controller = RangeFromIterController {
+            path_gen: PathGenerator::new(),
+            from,
+        };
         Ok(Gen::new(|co| async move {
-            if let Err(cause) = Self::iter_inner_2(controller, &co).await {
+            if let Err(cause) = Self::iter_impl(tables, controller, &co).await {
                 co.yield_(Err(cause)).await;
             }
         }))
     }
 
-    fn iter(&mut self) -> std::result::Result<impl IntoIterator<Item = std::result::Result<(OwnedPath, Value), redb::StorageError>> + '_, redb::Error> {
+    fn iter_from_to<'a>(
+        &'a mut self,
+        from: Path<'a>,
+        to: Path<'a>,
+    ) -> std::result::Result<
+        impl IntoIterator<Item = std::result::Result<(OwnedPath, Value), redb::StorageError>> + '_,
+        redb::Error,
+    > {
         let tables = self.tables()?;
+        let controller = RangeFromToIterController {
+            path_gen: PathGenerator::new(),
+            from,
+            to,
+        };
         Ok(Gen::new(|co| async move {
-            if let Err(cause) = Self::iter_inner(tables, &co).await {
+            if let Err(cause) = Self::iter_impl(tables, controller, &co).await {
+                co.yield_(Err(cause)).await;
+            }
+        }))
+    }
+
+    fn iter_to<'a>(
+        &'a mut self,
+        to: Path<'a>,
+    ) -> std::result::Result<
+        impl IntoIterator<Item = std::result::Result<(OwnedPath, Value), redb::StorageError>> + '_,
+        redb::Error,
+    > {
+        let tables = self.tables()?;
+        let controller = RangeFromToIterController {
+            path_gen: PathGenerator::new(),
+            from: &[],
+            to,
+        };
+        Ok(Gen::new(|co| async move {
+            if let Err(cause) = Self::iter_impl(tables, controller, &co).await {
+                co.yield_(Err(cause)).await;
+            }
+        }))
+    }
+
+    fn fingerprint_reference(&mut self, range: std::ops::Range<Path>) -> Result<Fingerprint, redb::Error> {
+        let mut res = Fingerprint::default();
+        for item in self.iter_from_to(range.start, range.end)?.into_iter() {
+            let (_, value) = item?;
+            for i in 0..32 {
+                res[i] ^= value[i];
+            }
+        }
+        Ok(res)
+    }
+
+    fn fingerprint(&mut self, range: std::ops::Range<Path>) -> Result<Fingerprint, redb::Error> {
+        let mut res = Fingerprint::default();
+        todo!()
+    }
+
+    fn iter(
+        &mut self,
+    ) -> std::result::Result<
+        impl IntoIterator<Item = std::result::Result<(OwnedPath, Value), redb::StorageError>> + '_,
+        redb::Error,
+    > {
+        let tables = self.tables()?;
+        let controller = AllPathsIterController {
+            path_gen: PathGenerator::new(),
+        };
+        Ok(Gen::new(|co| async move {
+            if let Err(cause) = Self::iter_impl(tables, controller, &co).await {
                 co.yield_(Err(cause)).await;
             }
         }))
@@ -346,9 +630,7 @@ impl TreeStore {
                 let tx = self.db.begin_write()?;
                 TransactionAndTables::new(tx)?
             }
-            CurrentTransaction::Write(w) => {
-                w
-            }
+            CurrentTransaction::Write(w) => w,
         };
         *guard = CurrentTransaction::Write(tables);
         match guard {
@@ -391,7 +673,7 @@ impl TreeStore {
         Ok(k.value().0 + 1)
     }
 
-    fn get(&mut self, path: &[&[u8]]) -> Result<Option<Value>, redb::Error> {
+    pub fn get(&mut self, path: &[&[u8]]) -> Result<Option<Value>, redb::Error> {
         let tables = self.tables()?;
         let mut current = tables.blobs.get((ROOT_INODE, EMPTY_PATH))?.unwrap().value();
         for component in path {
@@ -416,11 +698,14 @@ impl TreeStore {
         value: BlobValue,
     ) -> Result<(), redb::Error> {
         tables.blobs.insert(path, value)?;
-        tables.fingerprints.remove((path.0, EMPTY_PATH))?;
+        let (path_inode, path_path) = path;
+        let fp_range = (path_inode, EMPTY_PATH)..= path;
+        // Remove all fingerprints that are prefixes of the new path.
+        tables.fingerprints.retain_in(fp_range, |(_, fp_path), _| !path_path.starts_with(fp_path))?;
         Ok(())
     }
 
-    fn insert(&mut self, path: &[&[u8]], value: Value) -> Result<(), redb::Error> {
+    pub fn insert(&mut self, path: &[&[u8]], value: Value) -> Result<(), redb::Error> {
         self.modify(|tables| {
             let mut parent = (ROOT_INODE, EMPTY_PATH);
             let mut current = tables.blobs.get(parent)?.unwrap().value();
@@ -460,20 +745,27 @@ impl TreeStore {
 
 fn main() -> std::result::Result<(), redb::Error> {
     let mut store = TreeStore::memory();
-    for i in 0..3u64 {
-        for j in 0..3u64 {
-            store
-                .insert(&[&i.to_be_bytes(), &j.to_be_bytes()], [0u8; 32])?;
+    let v = [0u8; 32];
+    for i in 0..10u64 {
+        for j in 0..10u64 {
+            store.insert(&[&i.to_be_bytes(), &j.to_be_bytes()], v)?;
         }
     }
-    store
-        .insert(&[b"this", b"is", b"a", b"test"], [0u8; 32])?;
+    store.insert(&[b"this", b"is"], v)?;
+    store.insert(&[b"this", b"is", b"a"], v)?;
+    store.insert(&[b"this", b"is", b"a", b"test"], v)?;
     store.dump().unwrap();
     for item in store.iter()? {
         let (path, value) = item?;
         println!("{:?} => {:?}", path, value);
     }
-    for item in store.iter2()? {
+    println!("this / is / a");
+    for item in store.iter_from(&[b"this", b"is", b"a"])? {
+        let (path, value) = item?;
+        println!("{:?} => {:?}", path, value);
+    }
+    println!("this / is / a .. this / is / a / test");
+    for item in store.iter_from_to(&[b"this", b"is", b"a"], &[b"this", b"is", b"a", b"test"])? {
         let (path, value) = item?;
         println!("{:?} => {:?}", path, value);
     }
