@@ -1,8 +1,5 @@
 use std::{
-    fmt::Debug,
-    ops::{Bound, RangeBounds},
-    path::Component,
-    sync::Arc,
+    cmp::Ordering, fmt::{Debug, Display}, ops::{Bound, RangeBounds}, sync::Arc
 };
 
 use bytes::{Bytes, BytesMut};
@@ -17,7 +14,6 @@ trait Config {
 
 type INode = u64;
 type Value = [u8; 32];
-type Fingerprint = [u8; 32];
 type BlobKey<'a> = (INode, &'a [u8]);
 type FingerprintKey<'a> = (INode, &'a [u8]);
 const BLOBS_TABLE: redb::TableDefinition<BlobKey<'static>, BlobValue> =
@@ -26,6 +22,62 @@ const FINGERPRINTS_TABLE: redb::TableDefinition<FingerprintKey<'static>, Fingerp
     redb::TableDefinition::new("fingerprints-v0");
 
 type Path<'a> = &'a [&'a [u8]];
+
+#[derive(Clone, Copy, Default)]
+struct Fingerprint([u8; 32]);
+
+impl From<Value> for Fingerprint {
+    fn from(value: Value) -> Self {
+        Self(value)
+    }
+}
+
+impl Debug for Fingerprint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Fingerprint({})", hex::encode(&self.0))
+    }
+}
+
+impl Display for Fingerprint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", hex::encode(&self.0))
+    }
+}
+
+impl std::ops::BitXorAssign for Fingerprint {
+    fn bitxor_assign(&mut self, rhs: Self) {
+        for i in 0..32 {
+            self.0[i] ^= rhs.0[i];
+        }
+    }
+}
+
+impl redb::Value for Fingerprint {
+    type SelfType<'a> = Self;
+
+    type AsBytes<'a> = [u8; 32];
+
+    fn fixed_width() -> Option<usize> {
+        Some(32)
+    }
+
+    fn from_bytes<'a>(data: &'a [u8]) -> Self::SelfType<'a>
+    where
+        Self: 'a {
+        Self(data.try_into().unwrap())
+    }
+
+    fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> Self::AsBytes<'a>
+    where
+        Self: 'a,
+        Self: 'b {
+        value.0
+    }
+
+    fn type_name() -> redb::TypeName {
+        redb::TypeName::new("Fingerprint")
+    }
+}
 
 #[derive(Clone, Default)]
 struct OwnedPath(Arc<Vec<Bytes>>);
@@ -50,10 +102,20 @@ impl OwnedPath {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
+#[derive(Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 struct BlobValue {
     value: Option<Value>,
     dir: Option<INode>,
+}
+
+impl Debug for BlobValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlobValue")
+            .field("value", &self.value.map(hex::encode))
+            .field("dir", &self.dir)
+            .finish()
+    }
+
 }
 
 impl<'x> redb::Value for BlobValue {
@@ -439,28 +501,111 @@ fn inc<'a>(path: &'a [u8], buffer: &'a mut Vec<u8>) -> &'a [u8] {
     buffer.as_slice()
 }
 
-struct Fingerprinter {
-    result: Fingerprint,
+fn get_level_range<'a>(dir: INode, range: &'a std::ops::Range<Path<'a>>, buf: &'a mut Vec<u8>) -> std::ops::Range<BlobKey<'a>> {
+    if dir == ROOT_INODE {
+        complete_range(dir)
+    } else {
+        // if start is not set, use (dir, EMPTY_PATH), which is the lowest possible path for the given dir, inclusive.
+        let start = match range.start.first() {
+            Some(component) => (dir, *component),
+            None => (dir, EMPTY_PATH),
+        };
+        // if end is not set, use (dir + 1, EMPTY_PATH), which is the lowest possible path for the next dir, exclusive.
+        let end = match range.end.first() {
+            Some(component) if range.end.len() == 1 => (dir, *component),
+            Some(component) => {
+                let component_exclusive = inc(component, buf);
+                (dir, component_exclusive)
+            }
+            None => (dir + 1, EMPTY_PATH),
+        };
+        start..end
+    }
 }
 
-impl Fingerprinter {
     fn fingerprint(
-        tables: &Tables,
+        tables: &mut Tables,
         range: std::ops::Range<Path>,
-    ) -> Result<(), redb::StorageError> {
-        let mut this = Self {
-            result: Fingerprint::default(),
-        };
+    ) -> Result<Fingerprint, redb::StorageError> {
         assert!(range.start < range.end);
-        this.fingerprint_rec(tables, ROOT_INODE, range)
+        let mut to_store = Vec::new();
+        let res = fingerprint_rec(tables, ROOT_INODE, range, &mut to_store)?;
+        for (path, fp) in to_store {
+            println!("storing fingerprint");
+            tables.fingerprints.insert(path, fp)?;
+            // insert an empty blob for the path to mark that we have a fingerprint for it.
+            if tables.blobs.get(path)?.is_none() {
+                tables.blobs.insert(path, BlobValue::default())?;
+            }
+        }
+        Ok(res.0)
     }
 
     fn fingerprint_rec(
-        &mut self,
         tables: &Tables,
         dir: INode,
         range: std::ops::Range<Path>,
-    ) -> Result<(), redb::StorageError> {
+        to_store: &mut Vec<(BlobKey, Fingerprint)>
+    ) -> Result<(Fingerprint, bool), redb::StorageError> {
+        let mut res = Fingerprint::default();
+        let mut buf = Vec::new();
+        let mut buf2 = Vec::new();
+        let current_range = get_level_range(dir, &range, &mut buf);
+        let unrestricted = current_range.start.1 == EMPTY_PATH && current_range.start.0 != current_range.end.0;
+        let current_range_end = current_range.end;
+        let mut iter = tables.blobs.range(current_range)?;
+        while let Some(item) = iter.next() {
+            let (k, v) = item?;
+            let path@(_, component) = k.value();
+            if let Some(fp) = tables.fingerprints.get(path)? {
+                // we have a fingerprint for this path, check if it fits into the current range.
+                let fingerprint_end = next_non_prefix(component, &mut buf2).map(|x| (dir, x)).unwrap_or((dir + 1, EMPTY_PATH));
+                match fingerprint_end.cmp(&current_range_end) {
+                    Ordering::Less => {
+                        println!("using fingerprint");
+                        res ^= fp.value();
+                        iter = tables.blobs.range(fingerprint_end..current_range_end)?;
+                    }
+                    Ordering::Equal => {
+                        println!("using fingerprint until end");
+                        // the fingerprint is exactly the current range
+                        res ^= fp.value();
+                        // we could just create the iter, but it would be empty, so we can immediately exit the loop.
+                        break;
+                    }
+                    Ordering::Greater => {
+                        // the fingerprint is not in the current range
+                    }
+                }
+            }
+            let v = v.value();
+            if let Some(value) = v.value {
+                res ^= Fingerprint::from(value);
+            }
+            if let Some(subdir) = v.dir {
+                if dir == ROOT_INODE {
+                    // special case for the root directory, 
+                    res ^= fingerprint_rec(tables, subdir, range.clone(), to_store)?.0;
+                } else {
+                    let start = range.start.strip_prefix(&[component]).unwrap_or_default();
+                    let end = range.end.strip_prefix(&[component]).unwrap_or_default();
+                    let (child_fp, unrestricted) = fingerprint_rec(tables, subdir, start..end, to_store)?;
+                    if unrestricted && !tables.fingerprints.get((subdir, EMPTY_PATH))?.is_some() {
+                        to_store.push(((subdir, EMPTY_PATH), child_fp));
+                    }
+                    res ^= child_fp;
+                }
+            }
+        }
+        Ok((res, unrestricted))
+    }
+
+    fn fingerprint_rec_reference(
+        tables: &Tables,
+        dir: INode,
+        range: std::ops::Range<Path>,
+    ) -> Result<Fingerprint, redb::StorageError> {
+        let mut res = Fingerprint::default();
         let mut buf = Vec::new();
         let current_range = if dir == ROOT_INODE {
             complete_range(dir)
@@ -487,18 +632,29 @@ impl Fingerprinter {
             let (_, component) = k.value();
             let v = v.value();
             if let Some(value) = v.value {
-                for i in 0..32 {
-                    self.result[i] ^= value[i];
+                res ^= Fingerprint::from(value);
+            }
+            if let Some(subdir) = v.dir {
+                if dir == ROOT_INODE {
+                    // special case for the root directory, 
+                    res ^= fingerprint_rec_reference(tables, subdir, range.clone())?;
+                } else {
+                    let start = range.start.strip_prefix(&[component]).unwrap_or_default();
+                    let end = range.end.strip_prefix(&[component]).unwrap_or_default();
+                    res ^= fingerprint_rec_reference(tables, subdir, start..end)?;
                 }
             }
-            if let Some(dir) = v.dir {
-                let start = range.start.strip_prefix(&[component]).unwrap_or_default();
-                let end = range.end.strip_prefix(&[component]).unwrap_or_default();
-                self.fingerprint_rec(tables, dir, start..end)?;
-            }
         }
-        Ok(())
+        Ok(res)
     }
+
+fn to_ref(path: &[impl AsRef<[u8]>]) -> Vec<&[u8]>
+{
+    let mut t = Vec::with_capacity(path.len());
+    for p in path {
+        t.push(p.as_ref());
+    }
+    t
 }
 
 impl TreeStore {
@@ -558,39 +714,6 @@ impl TreeStore {
             }
         }
         Ok(())
-    }
-
-    fn fingerprint_impl<'a>(
-        tables: &'a mut Tables<'a>,
-        range: std::ops::Range<BlobKey<'a>>,
-    ) -> std::result::Result<Fingerprint, redb::StorageError> {
-        let mut nnp_buf = Vec::new();
-        let range = RcRange::from(complete_range(ROOT_INODE));
-        let mut iter = tables.blobs.range(range.clone())?;
-        let mut fp = Fingerprint::default();
-
-        loop {
-            let Some(item) = iter.next() else {
-                break;
-            };
-            let (k, v) = item?;
-            let path @ (inode, component) = k.value();
-            let nnp: Option<&[u8]> = next_non_prefix(component, &mut nnp_buf);
-
-            let value = v.value();
-            if let Some(value) = value.value {
-                for i in 0..32 {
-                    fp[i] ^= value[i];
-                }
-            }
-            if let Some(dir) = value.dir {
-                let child_fp = Self::fingerprint_impl(tables, todo!())?;
-                for i in 0..32 {
-                    fp[i] ^= child_fp[i];
-                }
-            }
-        }
-        Ok(fp)
     }
 
     fn iter_from<'a>(
@@ -653,6 +776,12 @@ impl TreeStore {
         }))
     }
 
+    fn fingerprint(&mut self, range: std::ops::Range<Path>) -> Result<Fingerprint, redb::Error> {
+        self.modify(|tables| {
+            Ok(fingerprint(tables, range)?)
+        })
+    }
+
     fn fingerprint_reference(
         &mut self,
         range: std::ops::Range<Path>,
@@ -660,16 +789,9 @@ impl TreeStore {
         let mut res = Fingerprint::default();
         for item in self.iter_from_to(range.start, range.end)?.into_iter() {
             let (_, value) = item?;
-            for i in 0..32 {
-                res[i] ^= value[i];
-            }
+            res ^= Fingerprint::from(value);
         }
         Ok(res)
-    }
-
-    fn fingerprint(&mut self, range: std::ops::Range<Path>) -> Result<Fingerprint, redb::Error> {
-        let mut res = Fingerprint::default();
-        todo!()
     }
 
     fn iter(
@@ -716,20 +838,25 @@ impl TreeStore {
         Ok(())
     }
 
-    fn modify(
+    fn modify<T>(
         &mut self,
-        f: impl FnOnce(&mut Tables) -> Result<(), redb::Error>,
-    ) -> Result<(), redb::Error> {
-        let txn = self.db.begin_write()?;
-        let mut tables = Tables::new(&txn)?;
-        let res = f(&mut tables);
-        drop(tables);
-        if res.is_ok() {
-            txn.commit()?;
-        } else {
-            txn.abort()?;
+        f: impl FnOnce(&mut Tables) -> Result<T, redb::Error>,
+    ) -> Result<T, redb::Error> {
+        let guard = &mut self.current_transaction;
+        let tables = match std::mem::take(guard) {
+            CurrentTransaction::None => {
+                let tx = self.db.begin_write()?;
+                TransactionAndTables::new(tx)?
+            }
+            CurrentTransaction::Write(w) => w,
+        };
+        *guard = CurrentTransaction::Write(tables);
+        match guard {
+            CurrentTransaction::Write(ref mut tables) => {
+                tables.with_tables_mut(|tables| f(tables))
+            },
+            _ => unreachable!(),
         }
-        res
     }
 
     fn new_inode(
@@ -763,14 +890,33 @@ impl TreeStore {
         path: BlobKey,
         value: BlobValue,
     ) -> Result<(), redb::Error> {
-        tables.blobs.insert(path, value)?;
+        let prev = tables.blobs.insert(path, value)?;
+        if let Some(prev) = prev {
+            if prev.value() == value {
+                return Ok(());
+            }
+        }
         let (path_inode, path_path) = path;
         let fp_range = (path_inode, EMPTY_PATH)..=path;
         // Remove all fingerprints that are prefixes of the new path.
         tables
             .fingerprints
-            .retain_in(fp_range, |(_, fp_path), _| !path_path.starts_with(fp_path))?;
+            .retain_in(fp_range, |fullpath @ (_, fp_path), _| {
+                let keep = !path_path.starts_with(fp_path);
+                if !keep {
+                    println!("removing fingerprint for {:?}", fullpath);
+                }
+                keep
+            })?;
         Ok(())
+    }
+
+    pub fn insert2(&mut self, path: &[impl AsRef<[u8]>], value: Value) -> Result<(), redb::Error> {
+        let mut t = Vec::with_capacity(path.len());
+        for p in path {
+            t.push(p.as_ref());
+        }
+        self.insert(&t, value)
     }
 
     pub fn insert(&mut self, path: &[&[u8]], value: Value) -> Result<(), redb::Error> {
@@ -811,12 +957,23 @@ impl TreeStore {
     }
 }
 
+fn mk_path(i: u64, j: u64) -> [[u8;8];2] {
+    [i.to_be_bytes(), j.to_be_bytes()]
+}
+
+fn mk_value(i: u64, j: u64) -> Value {
+    let mut t = [0u8; 16];
+    t[..8].copy_from_slice(&i.to_be_bytes());
+    t[8..].copy_from_slice(&j.to_be_bytes());
+    blake3::hash(t.as_slice()).into()
+}
+
 fn main() -> std::result::Result<(), redb::Error> {
     let mut store = TreeStore::memory();
     let v = [0u8; 32];
     for i in 0..10u64 {
         for j in 0..10u64 {
-            store.insert(&[&i.to_be_bytes(), &j.to_be_bytes()], v)?;
+            store.insert2(&mk_path(i, j), mk_value(i, j))?;
         }
     }
     store.insert(&[b"this", b"is"], v)?;
@@ -825,17 +982,41 @@ fn main() -> std::result::Result<(), redb::Error> {
     store.dump().unwrap();
     for item in store.iter()? {
         let (path, value) = item?;
-        println!("{:?} => {:?}", path, value);
+        println!("{:?} => {}", path, hex::encode(value));
     }
     println!("this / is / a");
     for item in store.iter_from(&[b"this", b"is", b"a"])? {
         let (path, value) = item?;
-        println!("{:?} => {:?}", path, value);
+        println!("{:?} => {}", path, hex::encode(value));
     }
     println!("this / is / a .. this / is / a / test");
     for item in store.iter_from_to(&[b"this", b"is", b"a"], &[b"this", b"is", b"a", b"test"])? {
         let (path, value) = item?;
-        println!("{:?} => {:?}", path, value);
+        println!("{:?} => {}", path, hex::encode(value));
     }
+    println!("fp");
+    let start = mk_path(0, 1);
+    let end = mk_path(4, 3);
+    let start = to_ref(&start);
+    let end = to_ref(&end);
+    store.insert(&[b"this", b"is", b"a", b"test"], v)?;
+
+    println!("\nfirst call:");
+    println!("fingerprint:\n{}", store.fingerprint(&start .. &end)?);
+    println!("fingerprint reference:\n{}", store.fingerprint_reference(&start .. &end)?);
+
+    println!("\nsecond call:");
+    println!("fingerprint:\n{}", store.fingerprint(&start .. &end)?);
+    println!("fingerprint reference:\n{}", store.fingerprint_reference(&start .. &end)?);
+
+    store.insert(&to_ref(&mk_path(2, 5)), mk_value(2, 1000))?;
+
+    println!("\nfirst call after change:");
+    println!("fingerprint:\n{}", store.fingerprint(&start .. &end)?);
+    println!("fingerprint reference:\n{}", store.fingerprint_reference(&start .. &end)?);
+
+    println!("\nsecond call after change:");
+    println!("fingerprint:\n{}", store.fingerprint(&start .. &end)?);
+    println!("fingerprint reference:\n{}", store.fingerprint_reference(&start .. &end)?);
     Ok(())
 }
