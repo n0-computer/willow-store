@@ -1,5 +1,8 @@
 use std::{
-    fmt::Debug, ops::{Bound, RangeBounds}, path::Component, sync::Arc
+    fmt::Debug,
+    ops::{Bound, RangeBounds},
+    path::Component,
+    sync::Arc,
 };
 
 use bytes::{Bytes, BytesMut};
@@ -195,6 +198,7 @@ struct TreeStore {
 
 const ROOT_INODE: INode = 0;
 const EMPTY_PATH: &'static [u8] = &[];
+const EMPTY_FULL_PATH: Path<'static> = &[];
 
 trait RangeController<'a> {
     // go one level down in the directory tree
@@ -410,7 +414,7 @@ fn next_non_prefix<'a>(path: &[u8], buffer: &'a mut Vec<u8>) -> Option<&'a [u8]>
     buffer.extend_from_slice(path);
     while buffer.last() == Some(&0xFF) {
         buffer.pop();
-    };
+    }
     if let Some(last) = buffer.last_mut() {
         *last -= 1;
         Some(buffer.as_slice())
@@ -433,6 +437,68 @@ fn inc<'a>(path: &'a [u8], buffer: &'a mut Vec<u8>) -> &'a [u8] {
     }
     buffer.push(0);
     buffer.as_slice()
+}
+
+struct Fingerprinter {
+    result: Fingerprint,
+}
+
+impl Fingerprinter {
+    fn fingerprint(
+        tables: &Tables,
+        range: std::ops::Range<Path>,
+    ) -> Result<(), redb::StorageError> {
+        let mut this = Self {
+            result: Fingerprint::default(),
+        };
+        assert!(range.start < range.end);
+        this.fingerprint_rec(tables, ROOT_INODE, range)
+    }
+
+    fn fingerprint_rec(
+        &mut self,
+        tables: &Tables,
+        dir: INode,
+        range: std::ops::Range<Path>,
+    ) -> Result<(), redb::StorageError> {
+        let mut buf = Vec::new();
+        let current_range = if dir == ROOT_INODE {
+            complete_range(dir)
+        } else {
+            // if start is not set, use (dir, EMPTY_PATH), which is the lowest possible path for the given dir, inclusive.
+            let start = match range.start.first() {
+                Some(component) => (dir, *component),
+                None => (dir, EMPTY_PATH),
+            };
+            // if end is not set, use (dir + 1, EMPTY_PATH), which is the lowest possible path for the next dir, exclusive.
+            let end = match range.end.first() {
+                Some(component) if range.end.len() == 1 => (dir, *component),
+                Some(component) => {
+                    let component_exclusive = inc(component, &mut buf);
+                    (dir, component_exclusive)
+                }
+                None => (dir + 1, EMPTY_PATH),
+            };
+            start..end
+        };
+        let mut iter = tables.blobs.range(current_range)?;
+        while let Some(item) = iter.next() {
+            let (k, v) = item?;
+            let (_, component) = k.value();
+            let v = v.value();
+            if let Some(value) = v.value {
+                for i in 0..32 {
+                    self.result[i] ^= value[i];
+                }
+            }
+            if let Some(dir) = v.dir {
+                let start = range.start.strip_prefix(&[component]).unwrap_or_default();
+                let end = range.end.strip_prefix(&[component]).unwrap_or_default();
+                self.fingerprint_rec(tables, dir, start..end)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl TreeStore {
@@ -497,8 +563,7 @@ impl TreeStore {
     fn fingerprint_impl<'a>(
         tables: &'a mut Tables<'a>,
         range: std::ops::Range<BlobKey<'a>>,
-    ) -> std::result::Result<Fingerprint, redb::StorageError>
-    {
+    ) -> std::result::Result<Fingerprint, redb::StorageError> {
         let mut nnp_buf = Vec::new();
         let range = RcRange::from(complete_range(ROOT_INODE));
         let mut iter = tables.blobs.range(range.clone())?;
@@ -526,9 +591,7 @@ impl TreeStore {
             }
         }
         Ok(fp)
-
     }
-
 
     fn iter_from<'a>(
         &'a mut self,
@@ -590,7 +653,10 @@ impl TreeStore {
         }))
     }
 
-    fn fingerprint_reference(&mut self, range: std::ops::Range<Path>) -> Result<Fingerprint, redb::Error> {
+    fn fingerprint_reference(
+        &mut self,
+        range: std::ops::Range<Path>,
+    ) -> Result<Fingerprint, redb::Error> {
         let mut res = Fingerprint::default();
         for item in self.iter_from_to(range.start, range.end)?.into_iter() {
             let (_, value) = item?;
@@ -699,9 +765,11 @@ impl TreeStore {
     ) -> Result<(), redb::Error> {
         tables.blobs.insert(path, value)?;
         let (path_inode, path_path) = path;
-        let fp_range = (path_inode, EMPTY_PATH)..= path;
+        let fp_range = (path_inode, EMPTY_PATH)..=path;
         // Remove all fingerprints that are prefixes of the new path.
-        tables.fingerprints.retain_in(fp_range, |(_, fp_path), _| !path_path.starts_with(fp_path))?;
+        tables
+            .fingerprints
+            .retain_in(fp_range, |(_, fp_path), _| !path_path.starts_with(fp_path))?;
         Ok(())
     }
 
