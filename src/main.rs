@@ -968,6 +968,16 @@ fn mk_value(i: u64, j: u64) -> Value {
     blake3::hash(t.as_slice()).into()
 }
 
+fn format_path(path: Path) -> String {
+    let parts = path.iter().map(|x| format!("{}", hex::encode(x))).collect::<Vec<_>>();
+    format!("[{}]", parts.join(","))
+}
+
+fn format_range(range: std::ops::Range<Path>) -> String {
+    format!("range: {} .. {}", format_path(range.start), format_path(range.end))
+}
+
+
 fn main() -> std::result::Result<(), redb::Error> {
     let mut store = TreeStore::memory();
     let v = [0u8; 32];
@@ -1001,7 +1011,7 @@ fn main() -> std::result::Result<(), redb::Error> {
     let end = to_ref(&end);
     store.insert(&[b"this", b"is", b"a", b"test"], v)?;
 
-    println!("\nfirst call:");
+    println!("\nfirst call: {}", format_range(&start..&end));
     println!("fingerprint:\n{}", store.fingerprint(&start .. &end)?);
     println!("fingerprint reference:\n{}", store.fingerprint_reference(&start .. &end)?);
 
