@@ -4,6 +4,12 @@ use bytes::Bytes;
 use redb::{AccessGuard, ReadableTable, WriteTransaction};
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
+trait StoreParams {
+    type Value;
+    type Key;
+    type Summary;
+}
+
 const EMPTY_PATH: &'static [u8] = &[];
 const ROOT_INODE: u64 = 0;
 
@@ -182,7 +188,7 @@ impl RedbStore {
     fn tables(&mut self) -> std::result::Result<&Tables, redb::Error> {
         let guard = &mut self.current_transaction;
         let tables = match std::mem::take(guard) {
-            CurrentTransaction::None => {
+            CurrentTransaction::None | CurrentTransaction::Read(_) => {
                 let tx = self.db.begin_write()?;
                 TransactionAndTables::new(tx)?
             }
@@ -201,7 +207,7 @@ impl RedbStore {
     ) -> Result<T, redb::Error> {
         let guard = &mut self.current_transaction;
         let tables = match std::mem::take(guard) {
-            CurrentTransaction::None => {
+            CurrentTransaction::None | CurrentTransaction::Read(_) => {
                 let tx = self.db.begin_write()?;
                 TransactionAndTables::new(tx)?
             }
@@ -298,11 +304,6 @@ impl Entry {
 }
 
 impl RedbStore {
-    fn get(&mut self, path: &[&[u8]]) -> Result<Option<Value>, redb::Error> {
-        let path = escape(path);
-        self.get_raw(&path)
-    }
-
     fn get_raw(&mut self, path: &[u8]) -> Result<Option<Value>, redb::Error> {
         let root = NonZeroU64::new(1).unwrap();
         self.get_rec(root, path)
@@ -335,8 +336,22 @@ impl RedbStore {
         Ok(None)
     }
 
-    fn insert(&mut self, path: &[&[u8]], value: Value) -> Result<(), redb::Error> {
+    fn get<P, C>(&mut self, path: P) -> Result<Option<Value>, redb::Error>
+    where
+        P: AsRef<[C]>,
+        C: AsRef<[u8]>,
+    {
         let path = escape(path);
+        self.get_raw(&path)
+    }
+
+    fn insert<P, C>(&mut self, path: P, value: Value) -> Result<(), redb::Error>
+    where
+        P: AsRef<[C]>,
+        C: AsRef<[u8]>,
+    {
+        let path = escape(path);
+        tracing::info!("insert {:?}", hex::encode(&path));
         self.insert_raw(&path, value)
     }
 
@@ -771,6 +786,9 @@ struct Value {
     size: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RawValue<const C: usize = 48>([u8; C]);
+
 type INode = u64;
 type PathKey<'a> = (u64, &'a [u8]);
 
@@ -784,6 +802,14 @@ struct Tables<'txn> {
     values: redb::Table<'txn, u64, Value>,
     summaries: redb::Table<'txn, u64, Summary>,
     prefixes: redb::Table<'txn, u64, &'static [u8]>,
+}
+
+#[derive(Debug)]
+struct ReadonlyTables {
+    paths: redb::ReadOnlyTable<u64, &'static [u8]>,
+    values: redb::ReadOnlyTable<u64, Value>,
+    summaries: redb::ReadOnlyTable<u64, Summary>,
+    prefixes: redb::ReadOnlyTable<u64, &'static [u8]>,
 }
 
 impl<'a> Tables<'a> {
@@ -840,6 +866,7 @@ enum CurrentTransaction {
     #[default]
     None,
     Write(TransactionAndTables),
+    Read(ReadonlyTables),
 }
 
 // common prefix of two slices.
@@ -847,10 +874,10 @@ fn common_prefix<'a, T: Eq>(a: &'a [T], b: &'a [T]) -> usize {
     a.iter().zip(b).take_while(|(a, b)| a == b).count()
 }
 
-fn escape<T, U>(path: T) -> Vec<u8>
+fn escape<P, C>(path: P) -> Vec<u8>
 where
-    T: AsRef<[U]>,
-    U: AsRef<[u8]>,
+    P: AsRef<[C]>,
+    C: AsRef<[u8]>,
 {
     let mut result = Vec::new();
     for segment in path.as_ref() {
@@ -941,4 +968,104 @@ fn main() {
     }
     println!("get {} {}", n, t0.elapsed().as_secs_f64());
     // store.dump().unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use proptest::prelude::*;
+    use rand::SeedableRng;
+    use test_strategy::proptest;
+
+    use crate::{RawValue, RedbStore, Value};
+
+    #[derive(Debug)]
+    struct RawPath(Vec<u8>);
+
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+    struct Path(Vec<Vec<u8>>);
+
+    fn arb_raw_path(max_size: usize) -> impl Strategy<Value = RawPath> {
+        prop::collection::vec(0u8..4u8, 0..max_size).prop_map(RawPath)
+    }
+
+    fn arb_path(max_components: usize, max_component_size: usize) -> impl Strategy<Value = Path> {
+        prop::collection::vec(
+            prop::collection::vec(0u8..4u8, 0..max_component_size),
+            0..max_components,
+        )
+        .prop_map(Path)
+    }
+
+    impl Arbitrary for RawPath {
+        type Parameters = ();
+        type Strategy = BoxedStrategy<Self>;
+
+        fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
+            arb_raw_path(32).boxed()
+        }
+    }
+
+    impl Arbitrary for Value {
+        type Parameters = ();
+        type Strategy = BoxedStrategy<Self>;
+
+        fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
+            arb_value().boxed()
+        }
+    }
+
+    impl Arbitrary for Path {
+        type Parameters = ();
+        type Strategy = BoxedStrategy<Self>;
+
+        fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
+            arb_path(4, 4).boxed()
+        }
+    }
+
+    fn arb_raw_value() -> impl Strategy<Value = RawValue> {
+        any::<u64>().prop_map(|seed| {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            let mut data = [0u8; 48];
+            rng.fill_bytes(&mut data);
+            RawValue(data)
+        })
+    }
+
+    fn arb_value() -> impl Strategy<Value = Value> {
+        (any::<u64>(), any::<[u8; 32]>(), any::<u64>()).prop_map(
+            |(timestamp, fingerprint, size)| Value {
+                timestamp,
+                fingerprint,
+                size,
+            },
+        )
+    }
+
+    #[proptest]
+    fn test_escape_roundtrip(path: Path) {
+        let path = path.0;
+        let escaped = crate::escape(&path);
+        let unescaped = crate::unescape(&escaped);
+        assert_eq!(path, unescaped);
+    }
+
+    #[proptest]
+    fn test_escape_preserves_order(a: Path, b: Path) {
+        let ae = crate::escape(&a.0);
+        let be = crate::escape(&b.0);
+        assert_eq!(ae.cmp(&be), a.cmp(&b));
+    }
+
+    #[proptest]
+    fn test_insert_get(paths: Vec<(Path, Value)>) {
+        tracing_subscriber::fmt::try_init().ok();
+        let mut store = RedbStore::memory();
+        for (path, value) in paths {
+            let path = path.0;
+            store.insert(&path, value).unwrap();
+            let got = store.get(&path).unwrap().unwrap();
+            assert_eq!(got, value);
+        }
+    }
 }
