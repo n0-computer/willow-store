@@ -1,8 +1,11 @@
-use std::{marker::PhantomData, num::NonZeroU64, ops::Deref};
+use std::{borrow::Borrow, marker::PhantomData, num::NonZeroU64, ops::Deref, sync::Arc};
 
 use bytes::Bytes;
-use redb::{AccessGuard, ReadableTable, WriteTransaction};
+use redb::{AccessGuard, ReadTransaction, ReadableTable, WriteTransaction};
+use tracing::{info, trace};
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
+
+type RedbResult<T> = std::result::Result<T, redb::Error>;
 
 trait StoreParams {
     type Value;
@@ -37,10 +40,15 @@ type Id = [u8; 8];
 #[repr(C)]
 #[derive(Clone, Copy, Default, FromZeroes, FromBytes, AsBytes, PartialEq, Eq)]
 struct Entry {
+    // first character of the prefix, for cheap lookup in case prefix is not inlined
     first_char: u8,
+    // if prefix_len <= 8, the prefix is stored inline, otherwise it is an id
     prefix_len: u8,
+    // if has_value is 1, the entry has a value
     has_value: u8,
+    // inline prefix or prefix id
     prefix: Id,
+    // children id
     children: Id,
 }
 
@@ -57,6 +65,9 @@ impl std::fmt::Debug for Entry {
     }
 }
 
+/// For each directory, there can be at most 256 children, each of which can
+/// have a value. So we compute the value id from the directory id and the
+/// first character of the prefix.
 fn value_id(dir: NonZeroU64, first_char: u8) -> NonZeroU64 {
     NonZeroU64::new(dir.get() * 256 + first_char as u64).unwrap()
 }
@@ -100,8 +111,6 @@ struct RedbStore {
     db: redb::Database,
     current_transaction: CurrentTransaction,
     next_dir_id: NonZeroU64,
-    entry_buf: Vec<Entry>,
-    path_buf: Vec<u8>,
 }
 
 impl RedbStore {
@@ -113,8 +122,6 @@ impl RedbStore {
             db,
             current_transaction: CurrentTransaction::None,
             next_dir_id: NonZeroU64::new(1).unwrap(),
-            entry_buf: Vec::new(),
-            path_buf: Vec::new(),
         };
         res.modify(|tables| {
             tables.paths.insert(1, EMPTY_PATH)?;
@@ -137,11 +144,11 @@ impl RedbStore {
         res
     }
 
-    fn traverse(&mut self) -> Result<(), redb::Error> {
+    fn traverse(&mut self) -> RedbResult<()> {
         self.traverse_rec(NonZeroU64::new(1).unwrap(), &[])
     }
 
-    fn traverse_rec(&mut self, dir: NonZeroU64, path: &[u8]) -> Result<(), redb::Error> {
+    fn traverse_rec(&mut self, dir: NonZeroU64, path: &[u8]) -> RedbResult<()> {
         let entries = self.get_dir(dir)?.into_owned();
         let mut buf = Vec::new();
         for entry in entries {
@@ -162,21 +169,25 @@ impl RedbStore {
         Ok(())
     }
 
-    fn dump(&mut self) -> Result<(), redb::Error> {
+    fn dump(&mut self) -> RedbResult<()> {
         let tables = self.tables()?;
+        println!("paths:");
         for item in tables.paths.iter()? {
             let (k, v) = item?;
             let v = Entry::slice_from(v.value()).unwrap();
             println!("{}: {:?}", k.value(), v);
         }
+        println!("prefixes:");
         for item in tables.prefixes.iter()? {
             let (k, v) = item?;
             println!("{}: {:?}", k.value(), hex::encode(v.value()));
         }
+        println!("values:");
         for item in tables.values.iter()? {
             let (k, v) = item?;
             println!("{}: {:?}", k.value(), v.value());
         }
+        println!("summaries:");
         for item in tables.summaries.iter()? {
             let (k, v) = item?;
             println!("{}: {:?}", k.value(), v.value());
@@ -185,10 +196,26 @@ impl RedbStore {
         Ok(())
     }
 
-    fn tables(&mut self) -> std::result::Result<&Tables, redb::Error> {
+    fn snapshot(&mut self) -> RedbResult<ReadonlyTables> {
+        let guard = &mut self.current_transaction;
+        match std::mem::take(guard) {
+            CurrentTransaction::Read(tx, _tables) => {
+                Ok(ReadonlyTables::new(&tx)?)
+            }
+            CurrentTransaction::Write(w) => {
+                todo!()
+            }
+            CurrentTransaction::None => {
+                let tx = self.db.begin_read()?;
+                Ok(ReadonlyTables::new(&tx)?)
+            }
+        }
+    }
+
+    fn tables(&mut self) -> RedbResult<&Tables> {
         let guard = &mut self.current_transaction;
         let tables = match std::mem::take(guard) {
-            CurrentTransaction::None | CurrentTransaction::Read(_) => {
+            CurrentTransaction::None | CurrentTransaction::Read(_, _) => {
                 let tx = self.db.begin_write()?;
                 TransactionAndTables::new(tx)?
             }
@@ -203,11 +230,11 @@ impl RedbStore {
 
     fn modify<T>(
         &mut self,
-        f: impl FnOnce(&mut Tables) -> Result<T, redb::Error>,
-    ) -> Result<T, redb::Error> {
+        f: impl FnOnce(&mut Tables) -> RedbResult<T>,
+    ) -> RedbResult<T> {
         let guard = &mut self.current_transaction;
         let tables = match std::mem::take(guard) {
-            CurrentTransaction::None | CurrentTransaction::Read(_) => {
+            CurrentTransaction::None | CurrentTransaction::Read(_, _) => {
                 let tx = self.db.begin_write()?;
                 TransactionAndTables::new(tx)?
             }
@@ -293,7 +320,7 @@ impl Entry {
     fn prefix<'a>(
         &self,
         store: &'a mut RedbStore,
-    ) -> std::result::Result<PrefixGuard<'a>, redb::Error> {
+    ) -> RedbResult<PrefixGuard<'a>> {
         if self.prefix_len <= 8 {
             Ok(PrefixGuard(Ok((self.prefix_len, self.prefix))))
         } else {
@@ -303,13 +330,74 @@ impl Entry {
     }
 }
 
+/// Key for iteration of radixtree prefixes
+///
+/// This uses copy on write to allow iterating over all prefixes without allocations, provided that the keys are not stored somewhere.
+#[derive(Debug, Clone, Default)]
+pub struct IterKey(Arc<Vec<u8>>);
+
+impl IterKey {
+    fn new(root: &[u8]) -> Self {
+        Self(Arc::new(root.to_vec()))
+    }
+
+    fn append(&mut self, data: &[u8]) {
+        // for typical iterator use, a reference is not kept for a long time, so this will be very cheap
+        //
+        // in the case a reference is kept, this will make a copy.
+        let elems = Arc::make_mut(&mut self.0);
+        elems.extend_from_slice(data);
+    }
+
+    fn pop(&mut self, n: usize) {
+        let elems = Arc::make_mut(&mut self.0);
+        elems.truncate(elems.len().saturating_sub(n));
+    }
+}
+
+impl AsRef<[u8]> for IterKey {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_ref()
+    }
+}
+
+impl Borrow<[u8]> for IterKey {
+    fn borrow(&self) -> &[u8] {
+        self.0.as_ref()
+    }
+}
+
+impl Deref for IterKey {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref()
+    }
+}
+
+struct KeyValueIter {
+    path: IterKey,
+    tables: ReadonlyTables,
+    stack: Vec<(NonZeroU64, usize)>,
+}
+
+impl KeyValueIter {
+    fn empty(tables: ReadonlyTables) -> Self {
+        Self {
+            stack: Vec::new(),
+            path: IterKey::default(),
+            tables,
+        }
+    }
+}
+
 impl RedbStore {
-    fn get_raw(&mut self, path: &[u8]) -> Result<Option<Value>, redb::Error> {
+    fn get_raw(&mut self, path: &[u8]) -> RedbResult<Option<Value>> {
         let root = NonZeroU64::new(1).unwrap();
         self.get_rec(root, path)
     }
 
-    fn get_rec(&mut self, dir: NonZeroU64, path: &[u8]) -> Result<Option<Value>, redb::Error> {
+    fn get_rec(&mut self, dir: NonZeroU64, path: &[u8]) -> RedbResult<Option<Value>> {
         assert!(!path.is_empty());
         let entries = self.get_dir(dir)?;
         if let Ok(index) = entries.binary_search_by_key(&path[0], |x| x.first_char) {
@@ -336,16 +424,42 @@ impl RedbStore {
         Ok(None)
     }
 
-    fn get<P, C>(&mut self, path: P) -> Result<Option<Value>, redb::Error>
+    fn get<P, C>(&mut self, path: P) -> RedbResult<Option<Value>>
     where
         P: AsRef<[C]>,
         C: AsRef<[u8]>,
     {
         let path = escape(path);
+        info!(get = ?hex::encode(&path));
         self.get_raw(&path)
     }
 
-    fn insert<P, C>(&mut self, path: P, value: Value) -> Result<(), redb::Error>
+    fn range_summary<P, C>(&mut self, start: P, end: Option<P>) -> RedbResult<Summary>
+    where
+        P: AsRef<[C]>,
+        C: AsRef<[u8]>
+    {
+        let start = escape(start);
+        let end = end.map(escape);
+        let mut summary = Summary::default();
+        Ok(summary)
+    }
+
+    fn range_iter<P, C>(&self, start: P, end: Option<P>) -> impl Iterator<Item = RedbResult<(Path, Value)>> + 'static
+    where
+        P: AsRef<[C]>,
+        C: AsRef<[u8]>
+    {
+        std::iter::empty()
+    }
+
+    fn iter(&mut self) -> RedbResult<impl Iterator<Item = RedbResult<(Path, Value)>> + 'static> {
+        let snapshot = self.snapshot().unwrap();
+        let root = NonZeroU64::new(1).unwrap();
+        Ok(std::iter::empty())
+    }
+
+    fn insert<P, C>(&mut self, path: P, value: Value) -> RedbResult<()>
     where
         P: AsRef<[C]>,
         C: AsRef<[u8]>,
@@ -355,7 +469,7 @@ impl RedbStore {
         self.insert_raw(&path, value)
     }
 
-    fn insert_raw(&mut self, path: &[u8], value: Value) -> Result<(), redb::Error> {
+    fn insert_raw(&mut self, path: &[u8], value: Value) -> RedbResult<()> {
         let root = NonZeroU64::new(1).unwrap();
         let mut buffers = Buffers::default();
         self.insert_rec(root, path, value, &mut buffers)?;
@@ -367,7 +481,7 @@ impl RedbStore {
         dir: NonZeroU64,
         entries: EntriesGuard,
         index: usize,
-    ) -> Result<NonZeroU64, redb::Error> {
+    ) -> RedbResult<NonZeroU64> {
         let entry = &entries.as_ref()[index];
         if let Some(dir) = entry.children() {
             return Ok(dir);
@@ -387,7 +501,7 @@ impl RedbStore {
         path: &[u8],
         value: Value,
         buffers: &mut Buffers,
-    ) -> Result<bool, redb::Error> {
+    ) -> RedbResult<bool> {
         assert!(!path.is_empty());
         let entries = self.get_dir(dir)?;
         let res = match entries.binary_search_by_key(&path[0], |x| x.first_char) {
@@ -401,6 +515,10 @@ impl RedbStore {
                     // replace the value
                     drop(entry_prefix);
                     self.put_value(entry.value_id(dir), Some(&value))?;
+                    if entry.has_value == 0 {
+                        entries[index].set_has_value(true);
+                        self.put_children(dir, &entries)?;
+                    }
                     true
                 } else if n == ep.len() {
                     // entry prefix is a prefix of path
@@ -423,10 +541,14 @@ impl RedbStore {
                 } else if n == path.len() {
                     // path is a prefix of entry prefix
                     let mut entry0 = entry;
+                    let src = (dir, entry0.first_char);
                     let entry_prefix = entry_prefix.to_buffer(&mut buffers.entry_path);
                     self.set_prefix(&mut entry0, &entry_prefix[n..])?;
                     let subdir = self.next_dir_id()?;
-                    self.move_child(entry0.first_char, dir, subdir)?;
+                    let tgt = (subdir, entry0.first_char);
+                    if entry0.has_value != 0 {
+                        self.move_child(src, tgt)?;
+                    }
                     self.put_children(subdir, &[entry0])?;
                     entries[index] = self.create_entry(dir, path, Some(&value), Some(subdir))?;
                     self.put_children(dir, &entries)?;
@@ -434,12 +556,16 @@ impl RedbStore {
                 } else {
                     // disjoint prefixes
                     let mut entry0 = entries[index];
+                    let src = (dir, entry0.first_char);
                     let entry_prefix = entry_prefix.to_buffer(&mut buffers.entry_path);
                     let common = &path[..n];
                     let subdir = self.next_dir_id()?;
-                    self.move_child(entry0.first_char, dir, subdir)?;
                     let entry1 = self.create_entry(subdir, &path[n..], Some(&value), None)?;
                     self.set_prefix(&mut entry0, &entry_prefix[n..])?;
+                    let tgt = (subdir, entry0.first_char);
+                    if entry0.has_value != 0 {
+                        self.move_child(src, tgt)?;
+                    }
                     let mut children = [entry0, entry1];
                     children.sort_by_key(|x| x.first_char);
                     self.put_children(subdir, &children)?;
@@ -469,24 +595,24 @@ impl RedbStore {
 
     fn move_child(
         &mut self,
-        first_char: u8,
-        from: NonZeroU64,
-        to: NonZeroU64,
-    ) -> Result<(), redb::Error> {
+        from: (NonZeroU64, u8),
+        to: (NonZeroU64, u8),
+    ) -> RedbResult<()> {
+        let from_id = value_id(from.0, from.1).get();
+        let to_id = value_id(to.0, to.1).get();
+        trace!("move_child {} {}", from_id, to_id);
         self.modify(|tables| {
-            let Some(guard) = tables.values.get(value_id(from, first_char).get())? else {
+            let Some(guard) = tables.values.remove(from_id)? else {
                 return Ok(());
             };
             let value = guard.value();
             drop(guard);
-            tables
-                .values
-                .insert(value_id(to, first_char).get(), value)?;
+            tables.values.insert(to_id, value)?;
             Ok(())
         })
     }
 
-    fn set_prefix(&mut self, entry: &mut Entry, value: &[u8]) -> Result<(), redb::Error> {
+    fn set_prefix(&mut self, entry: &mut Entry, value: &[u8]) -> RedbResult<()> {
         entry.first_char = value[0];
         let old_id = entry.prefix_id().err();
         if value.len() <= 8 {
@@ -506,7 +632,7 @@ impl RedbStore {
         &mut self,
         entry: &mut Entry,
         children: Option<NonZeroU64>,
-    ) -> Result<(), redb::Error> {
+    ) -> RedbResult<()> {
         entry.children = children.map(|x| x.get()).unwrap_or_default().to_le_bytes();
         Ok(())
     }
@@ -517,7 +643,7 @@ impl RedbStore {
         path: &[u8],
         value: Option<&Value>,
         children: Option<NonZeroU64>,
-    ) -> std::result::Result<Entry, redb::Error> {
+    ) -> RedbResult<Entry> {
         let mut res = Entry::default();
         self.set_prefix(&mut res, path)?;
         if let Some(value) = value {
@@ -528,7 +654,7 @@ impl RedbStore {
         Ok(res)
     }
 
-    fn put_children(&mut self, id: NonZeroU64, data: &[Entry]) -> Result<(), redb::Error> {
+    fn put_children(&mut self, id: NonZeroU64, data: &[Entry]) -> RedbResult<()> {
         self.modify(|tables| {
             let data = <[Entry]>::as_bytes(data);
             let mut guard = tables.paths.insert_reserve(id.get(), data.len() as u32)?;
@@ -537,20 +663,20 @@ impl RedbStore {
         })
     }
 
-    fn next_dir_id(&mut self) -> Result<NonZeroU64, redb::Error> {
+    fn next_dir_id(&mut self) -> RedbResult<NonZeroU64> {
         let res = self.next_dir_id;
         self.next_dir_id = NonZeroU64::new(res.get() + 1).unwrap();
         Ok(res)
     }
 
-    fn get_dir(&mut self, id: NonZeroU64) -> Result<EntriesGuard, redb::Error> {
+    fn get_dir(&mut self, id: NonZeroU64) -> RedbResult<EntriesGuard> {
         let Some(value) = self.tables()?.paths.get(id.get())? else {
             return Err(std::io::Error::from(std::io::ErrorKind::NotFound).into());
         };
         Ok(EntriesGuard(value))
     }
 
-    fn rm_dir(&mut self, id: u64) -> Result<(), redb::Error> {
+    fn rm_dir(&mut self, id: u64) -> RedbResult<()> {
         self.modify(|tables| {
             tables.paths.remove(id)?;
             tables.summaries.remove(id)?;
@@ -562,7 +688,7 @@ impl RedbStore {
         &mut self,
         key: Option<NonZeroU64>,
         data: Option<&[u8]>,
-    ) -> Result<Option<NonZeroU64>, redb::Error> {
+    ) -> RedbResult<Option<NonZeroU64>> {
         self.modify(|tables: &mut Tables| match (key, data) {
             (Some(key), Some(data)) => {
                 tables
@@ -590,14 +716,14 @@ impl RedbStore {
         })
     }
 
-    fn get_prefix(&mut self, id: u64) -> Result<PrefixGuard, redb::Error> {
+    fn get_prefix(&mut self, id: u64) -> RedbResult<PrefixGuard> {
         let Some(value) = self.tables()?.prefixes.get(id)? else {
             return Err(std::io::Error::from(std::io::ErrorKind::NotFound).into());
         };
         Ok(PrefixGuard(Err(value)))
     }
 
-    fn del_prefix(&mut self, id: u64) -> Result<(), redb::Error> {
+    fn del_prefix(&mut self, id: u64) -> RedbResult<()> {
         self.modify(|tables: &mut Tables| {
             tables.prefixes.remove(id)?;
             Ok(())
@@ -608,7 +734,8 @@ impl RedbStore {
         &mut self,
         id: NonZeroU64,
         value: Option<&Value>,
-    ) -> Result<PutValueResult, redb::Error> {
+    ) -> RedbResult<PutValueResult> {
+        trace!("put_value {} {:?}", id, value.is_some());
         self.modify(|tables| match (id, value) {
             (id, Some(value)) => {
                 let prev = tables.values.insert(id.get(), value)?;
@@ -630,21 +757,21 @@ impl RedbStore {
         })
     }
 
-    fn get_value(&mut self, id: u64) -> Result<AccessGuard<Value>, redb::Error> {
+    fn get_value(&mut self, id: u64) -> RedbResult<AccessGuard<Value>> {
         let Some(value) = self.tables()?.values.get(id)? else {
             return Err(std::io::Error::from(std::io::ErrorKind::NotFound).into());
         };
         Ok(value)
     }
 
-    fn del_value(&mut self, id: u64) -> Result<(), redb::Error> {
+    fn del_value(&mut self, id: u64) -> RedbResult<()> {
         self.modify(|tables| {
             tables.values.remove(id)?;
             Ok(())
         })
     }
 
-    fn put_summary(&mut self, data: &Summary) -> Result<u64, redb::Error> {
+    fn put_summary(&mut self, data: &Summary) -> RedbResult<u64> {
         self.modify(|tables| {
             let id = tables
                 .summaries
@@ -657,14 +784,14 @@ impl RedbStore {
         })
     }
 
-    fn get_summary(&mut self, id: u64) -> Result<AccessGuard<Summary>, redb::Error> {
+    fn get_summary(&mut self, id: u64) -> RedbResult<AccessGuard<Summary>> {
         let Some(value) = self.tables()?.summaries.get(id)? else {
             return Err(std::io::Error::from(std::io::ErrorKind::NotFound).into());
         };
         Ok(value)
     }
 
-    fn del_summary(&mut self, id: u64) -> Result<(), redb::Error> {
+    fn del_summary(&mut self, id: u64) -> RedbResult<()> {
         self.modify(|tables| {
             tables.summaries.remove(id)?;
             Ok(())
@@ -697,14 +824,46 @@ impl PutValueResult {
         }
     }
 }
-#[derive(Debug, Clone, Default)]
+
+#[derive(Debug, Default)]
 struct Summary {
+    min: [u8; 8],
+    max: [u8; 8],
+}
+
+#[derive(Debug, Clone, Default)]
+struct WillowSummary {
     timestamp_range: std::ops::Range<u64>,
     fingerprint: [u8; 32],
 }
 
 impl redb::Value for Value {
     type SelfType<'a> = Value;
+    type AsBytes<'a> = [u8; 8];
+
+    fn fixed_width() -> Option<usize> {
+        Some(8)
+    }
+
+    fn from_bytes<'a>(data: &'a [u8]) -> Self::SelfType<'a>
+    where
+        Self: 'a,
+    {
+        let data: [u8; 8] = data.try_into().unwrap();
+        Self(data)
+    }
+
+    fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> Self::AsBytes<'a> {
+        value.0
+    }
+
+    fn type_name() -> redb::TypeName {
+        redb::TypeName::new("Value")
+    }
+}
+
+impl redb::Value for WillowValue {
+    type SelfType<'a> = WillowValue;
 
     type AsBytes<'a> = [u8; 48];
 
@@ -744,8 +903,39 @@ impl redb::Value for Value {
     }
 }
 
+
 impl redb::Value for Summary {
     type SelfType<'a> = Summary;
+    type AsBytes<'a> = [u8; 16];
+
+    fn fixed_width() -> Option<usize> {
+        Some(16)
+    }
+
+    fn from_bytes<'a>(data: &'a [u8]) -> Self::SelfType<'a>
+    where
+        Self: 'a,
+    {
+        let data: [u8; 16] = data.try_into().unwrap();
+        let min = data[0..8].try_into().unwrap();
+        let max = data[8..16].try_into().unwrap();
+        Self { min, max }
+    }
+
+    fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> Self::AsBytes<'a> {
+        let mut data = [0; 16];
+        data[0..8].copy_from_slice(&value.min);
+        data[8..16].copy_from_slice(&value.max);
+        data
+    }
+
+    fn type_name() -> redb::TypeName {
+        redb::TypeName::new("Summary")
+    }
+}
+
+impl redb::Value for WillowSummary {
+    type SelfType<'a> = WillowSummary;
     type AsBytes<'a> = [u8; 48];
 
     fn fixed_width() -> Option<usize> {
@@ -780,11 +970,14 @@ impl redb::Value for Summary {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct Value {
+struct WillowValue {
     timestamp: u64,
     fingerprint: [u8; 32],
     size: u64,
 }
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Value([u8; 8]);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RawValue<const C: usize = 48>([u8; C]);
@@ -794,8 +987,9 @@ type PathKey<'a> = (u64, &'a [u8]);
 
 const PATHS_TABLE: redb::TableDefinition<u64, &[u8]> = redb::TableDefinition::new("paths-v0");
 const VALUES_TABLE: redb::TableDefinition<u64, Value> = redb::TableDefinition::new("values-v0");
-const SUMARIES_TABLE: redb::TableDefinition<u64, Summary> =
+const SUMMARIES_TABLE: redb::TableDefinition<u64, Summary> =
     redb::TableDefinition::new("summaries-v0");
+const PREFIXES_TABLE: redb::TableDefinition<u64, &[u8]> = redb::TableDefinition::new("prefixes-v0");
 
 struct Tables<'txn> {
     paths: redb::Table<'txn, u64, &'static [u8]>,
@@ -812,13 +1006,24 @@ struct ReadonlyTables {
     prefixes: redb::ReadOnlyTable<u64, &'static [u8]>,
 }
 
+impl ReadonlyTables {
+    fn new(tx: &ReadTransaction) -> std::result::Result<Self, redb::TableError> {
+        Ok(Self  {
+            paths: tx.open_table(PATHS_TABLE)?,
+            values: tx.open_table(VALUES_TABLE)?,
+            summaries: tx.open_table(SUMMARIES_TABLE)?,
+            prefixes: tx.open_table(PREFIXES_TABLE)?,
+        })
+    }
+}
+
 impl<'a> Tables<'a> {
     fn new(txn: &'a WriteTransaction) -> std::result::Result<Self, redb::TableError> {
         Ok(Self {
             paths: txn.open_table(PATHS_TABLE)?,
             values: txn.open_table(VALUES_TABLE)?,
-            summaries: txn.open_table(SUMARIES_TABLE)?,
-            prefixes: txn.open_table(redb::TableDefinition::new("prefixes-v0"))?,
+            summaries: txn.open_table(SUMMARIES_TABLE)?,
+            prefixes: txn.open_table(PREFIXES_TABLE)?,
         })
     }
 }
@@ -866,7 +1071,7 @@ enum CurrentTransaction {
     #[default]
     None,
     Write(TransactionAndTables),
-    Read(ReadonlyTables),
+    Read(ReadTransaction, ReadonlyTables),
 }
 
 // common prefix of two slices.
@@ -880,6 +1085,7 @@ where
     C: AsRef<[u8]>,
 {
     let mut result = Vec::new();
+    result.push(0);
     for segment in path.as_ref() {
         for &byte in segment.as_ref() {
             match byte {
@@ -897,6 +1103,8 @@ fn unescape(path: &[u8]) -> Vec<Vec<u8>> {
     let mut result = Vec::new();
     let mut segment = Vec::new();
     let mut escape = false;
+    assert!(path.len() > 0 && path[0] == 0);
+    let path = &path[1..];
     for &byte in path {
         if escape {
             segment.push(byte);
@@ -970,27 +1178,44 @@ fn main() {
     // store.dump().unwrap();
 }
 
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
+struct Path(Vec<Vec<u8>>);
+
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use proptest::prelude::*;
     use rand::SeedableRng;
+    use redb::ReadableTableMetadata;
     use test_strategy::proptest;
 
-    use crate::{RawValue, RedbStore, Value};
+    use crate::{RawValue, RedbStore, Value, WillowValue};
+
+    fn init_logging() {
+        tracing_subscriber::fmt::try_init().ok();
+    }
 
     #[derive(Debug)]
     struct RawPath(Vec<u8>);
 
-    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
     struct Path(Vec<Vec<u8>>);
 
+    fn path_value_range() -> std::ops::Range<u8> {
+        // having more than 3 or 4 values does not add much value to the test
+        // 0 and 1 are special values (escape and separator)
+        // 3 and 4 are normal values
+        0..4
+    }
+
     fn arb_raw_path(max_size: usize) -> impl Strategy<Value = RawPath> {
-        prop::collection::vec(0u8..4u8, 0..max_size).prop_map(RawPath)
+        prop::collection::vec(path_value_range(), 0..max_size).prop_map(RawPath)
     }
 
     fn arb_path(max_components: usize, max_component_size: usize) -> impl Strategy<Value = Path> {
         prop::collection::vec(
-            prop::collection::vec(0u8..4u8, 0..max_component_size),
+            prop::collection::vec(path_value_range(), 0..max_component_size),
             0..max_components,
         )
         .prop_map(Path)
@@ -1019,7 +1244,7 @@ mod tests {
         type Strategy = BoxedStrategy<Self>;
 
         fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
-            arb_path(4, 4).boxed()
+            arb_path(4, 12).boxed()
         }
     }
 
@@ -1032,14 +1257,18 @@ mod tests {
         })
     }
 
-    fn arb_value() -> impl Strategy<Value = Value> {
+    fn arb_willow_value() -> impl Strategy<Value = WillowValue> {
         (any::<u64>(), any::<[u8; 32]>(), any::<u64>()).prop_map(
-            |(timestamp, fingerprint, size)| Value {
+            |(timestamp, fingerprint, size)| WillowValue {
                 timestamp,
                 fingerprint,
                 size,
             },
         )
+    }
+
+    fn arb_value() -> impl Strategy<Value = Value> {
+        any::<u64>().prop_map(|v| Value(v.to_le_bytes()))
     }
 
     #[proptest]
@@ -1057,15 +1286,60 @@ mod tests {
         assert_eq!(ae.cmp(&be), a.cmp(&b));
     }
 
-    #[proptest]
-    fn test_insert_get(paths: Vec<(Path, Value)>) {
-        tracing_subscriber::fmt::try_init().ok();
+    fn test_insert_get_impl(paths: Vec<(Path, Value)>) {
         let mut store = RedbStore::memory();
+        let mut reference = BTreeMap::new();
+        // insert all values, overwriting any existing values
         for (path, value) in paths {
-            let path = path.0;
-            store.insert(&path, value).unwrap();
-            let got = store.get(&path).unwrap().unwrap();
-            assert_eq!(got, value);
+            store.insert(&path.0, value.clone()).unwrap();
+            reference.insert(path.clone(), value.clone());
+        }
+        let n = store.tables().unwrap().prefixes.len().unwrap();
+        if n > 0 {
+            println!("prefixes: {n}");
+        }
+        // check that the store basically behaves like a BTreeMap
+        for (path, value) in reference {
+            tracing::trace!("checking path {:?}", path);
+            let got = store.get(&path.0).unwrap();
+            assert_eq!(got, Some(value));
+        }
+    }
+
+    #[proptest]
+    fn prop_insert_get(paths: Vec<(Path, Value)>) {
+        test_insert_get_impl(paths);
+    }
+
+    #[test]
+    fn test_insert_get() {
+        init_logging();
+        let paths = vec![
+            vec![(Path(vec![]), Value::default())],
+            vec![
+                (Path(vec![vec![1]]), Value::default()),
+                (Path(vec![]), Value::default()),
+            ],
+            vec![
+                (Path(vec![]), Value::default()),
+                (Path(vec![vec![1]]), Value::default()),
+            ],
+            vec![
+                (Path(vec![vec![]]), Value::default()),
+                (Path(vec![vec![0]]), Value::default()),
+            ],
+            vec![
+                (Path(vec![vec![0]]), Value::default()),
+                (Path(vec![vec![]]), Value::default()),
+            ],
+            vec![
+                (Path(vec![vec![]]), Value::default()),
+                (Path(vec![vec![0]]), Value::default()),
+                (Path(vec![]), Value::default()),
+            ],
+        ];
+        for paths in paths {
+            test_insert_get_impl(paths);
         }
     }
 }
