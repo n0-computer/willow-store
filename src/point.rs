@@ -212,7 +212,11 @@ impl<K: KeyParams> Point<K> {
     }
 
     pub fn cmp_at_rank(&self, other: &Self, rank: u8) -> std::cmp::Ordering {
-        match SortOrder::from(rank) {
+        self.cmp_with_order(other, SortOrder::from(rank))
+    }
+
+    pub fn cmp_with_order(&self, other: &Self, order: SortOrder) -> std::cmp::Ordering {
+        match order {
             SortOrder::ZXY => self.cmp_zxy(other),
             SortOrder::YZX => self.cmp_yzx(other),
             SortOrder::XYZ => self.cmp_xyz(other),

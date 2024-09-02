@@ -12,6 +12,7 @@ blake3 = "1.5.1"
 bytes = "1.6.0"
 genawaiter = "0.99.1"
 hex = "0.4.3"
+itertools = "0.13.0"
 postcard = { version = "1.0.8", features = ["use-std"] }
 proptest = "1.5.0"
 rand = "0.8.5"

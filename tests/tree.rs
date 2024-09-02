@@ -5,7 +5,8 @@ use proptest::prelude::*;
 use test_strategy::proptest;
 use testresult::TestResult;
 use willow_store::{
-    KeyParams, LiftingCommutativeMonoid, Point, QueryRange, QueryRange3d, Store, TreeParams,
+    KeyParams, LiftingCommutativeMonoid, Point, QueryRange, QueryRange3d, SortOrder, Store,
+    TreeParams,
 };
 
 type TPoint = Point<TestParams>;
@@ -47,11 +48,19 @@ fn point() -> impl Strategy<Value = TPoint> {
 }
 
 fn treecontents() -> impl Strategy<Value = Vec<(TPoint, u64)>> {
-    prop::collection::vec((point(), 0..100u64), 1..100).prop_map(|mut m| {
+    prop::collection::vec((point(), 0..100u64), 1..1000).prop_map(|mut m| {
         let mut keys = BTreeSet::new();
         m.retain(|(p, _)| keys.insert(p.clone().xyz()));
         m
     })
+}
+
+fn sortorder() -> impl Strategy<Value = SortOrder> {
+    prop_oneof![
+        Just(SortOrder::XYZ),
+        Just(SortOrder::YZX),
+        Just(SortOrder::ZXY)
+    ]
 }
 
 fn query() -> impl Strategy<Value = TQuery> {
@@ -80,6 +89,10 @@ fn query() -> impl Strategy<Value = TQuery> {
         })
 }
 
+/// Tests that creating a tree from unique points works.
+/// 
+/// The tree should conform to the invariants of the tree structure,
+/// and contain all the points that were inserted.
 fn tree_creation_impl(items: Vec<(TPoint, u64)>) -> TestResult<()> {
     let (store, id) = willow_store::Node::from_iter(items.clone())?;
     let tree = store.get(&id)?;
@@ -110,6 +123,10 @@ fn test_tree_creation() -> TestResult<()> {
     Ok(())
 }
 
+/// Test the `query_unordered` method of the tree.
+/// 
+/// The method should return all the points that are contained in the query.
+/// This is tested by comparing with a brute-force implementation.
 fn tree_query_unordered_impl(items: Vec<(TPoint, u64)>, query: TQuery) -> TestResult<()> {
     let (store, id) = willow_store::Node::from_iter(items.clone())?;
     let tree = store.get(&id)?;
@@ -131,6 +148,40 @@ fn tree_query_unordered_impl(items: Vec<(TPoint, u64)>, query: TQuery) -> TestRe
     Ok(())
 }
 
+/// Test the `query_ordered` method of the tree.
+///
+/// The method should return all the points that are contained in the query,
+/// ordered according to the given ordering.
+///
+/// This is tested by comparing with a brute-force implementation.
+fn tree_query_ordered_impl(
+    items: Vec<(TPoint, u64)>,
+    query: TQuery,
+    ordering: SortOrder,
+) -> TestResult<()> {
+    let (store, id) = willow_store::Node::from_iter(items.clone())?;
+    let tree = store.get(&id)?;
+    let actual = tree
+        .query_ordered(&query, ordering, &store)
+        .into_iter()
+        .map(|x| x.unwrap())
+        .collect::<Vec<_>>();
+    let mut expected = items
+        .iter()
+        .filter(|(p, _)| query.contains(p))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    expected.sort_by(|(ak, _), (bk, _)| ak.cmp_with_order(bk, ordering));
+    println!("{} {} {}", items.len(), actual.len(), expected.len());
+    assert_eq!(actual, expected);
+    Ok(())
+}
+
+/// Test the `summary` method of the tree.
+/// 
+/// The method should return the summary of the values of all the points in the query.
+/// This is tested by comparing with a brute-force implementation.
 fn tree_summary_impl(items: Vec<(TPoint, u64)>, query: TQuery) -> TestResult<()> {
     let (store, id) = willow_store::Node::from_iter(items.clone())?;
     let tree = store.get(&id)?;
@@ -154,17 +205,26 @@ fn prop_tree_query_unordered(
     tree_query_unordered_impl(items, query).unwrap();
 }
 
+#[proptest]
+fn prop_tree_query_ordered(
+    #[strategy(treecontents())] items: Vec<(TPoint, u64)>,
+    #[strategy(query())] query: TQuery,
+    #[strategy(sortorder())] ordering: SortOrder,
+) {
+    tree_query_ordered_impl(items, query, ordering).unwrap();
+}
+
 #[test]
 fn test_tree_summary() -> TestResult<()> {
     let cases = vec![
-        // (
-        //     vec![(TPoint::new(0, 0, 0), 0), (TPoint::new(0, 0, 1), 1)],
-        //     TQuery::new(
-        //         QueryRange::new(0, Some(1)),
-        //         QueryRange::new(0, Some(1)),
-        //         QueryRange::new(0, Some(1)),
-        //     ),
-        // ),
+        (
+            vec![(TPoint::new(0, 0, 0), 0), (TPoint::new(0, 0, 1), 1)],
+            TQuery::new(
+                QueryRange::new(0, Some(1)),
+                QueryRange::new(0, Some(1)),
+                QueryRange::new(0, Some(1)),
+            ),
+        ),
         (
             vec![
                 (TPoint::new(3, 43, 0), 0),

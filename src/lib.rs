@@ -3,12 +3,14 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::{Debug, Display},
     future::Future,
+    iter,
     ops::RangeBounds,
 };
 
 use anyhow::Result;
 use genawaiter::sync::{Co, Gen};
 use point::{XYZ, YZX, ZXY};
+use redb::Key;
 use serde::Serialize;
 
 mod point;
@@ -139,6 +141,37 @@ impl<P: KeyParams> QueryRange3d<P> {
 
     pub fn contains(&self, point: &Point<P>) -> bool {
         self.x.contains(&point.x) && self.y.contains(&point.y) && self.z.contains(&point.z)
+    }
+
+    pub fn overlaps_left(&self, key: &Point<P>, rank: u8) -> bool {
+        match SortOrder::from(rank) {
+            SortOrder::XYZ => self.x.min <= key.x,
+            SortOrder::YZX => self.y.min <= key.y,
+            SortOrder::ZXY => self.z.min <= key.z,
+        }
+    }
+
+    pub fn overlaps_right(&self, key: &Point<P>, rank: u8) -> bool {
+        match SortOrder::from(rank) {
+            SortOrder::XYZ => !self
+                .x
+                .max
+                .as_ref()
+                .map(|x_max| x_max < &key.x)
+                .unwrap_or_default(),
+            SortOrder::YZX => !self
+                .y
+                .max
+                .as_ref()
+                .map(|y_max| y_max < &key.y)
+                .unwrap_or_default(),
+            SortOrder::ZXY => !self
+                .z
+                .max
+                .as_ref()
+                .map(|z_max| z_max < &key.z)
+                .unwrap_or_default(),
+        }
     }
 }
 
@@ -528,6 +561,19 @@ impl<P: TreeParams> Node<P> {
         })
     }
 
+    pub fn query_ordered<'a>(
+        self,
+        query: &'a QueryRange3d<P>,
+        ordering: SortOrder,
+        store: &'a impl Store<P>,
+    ) -> impl IntoIterator<Item = Result<(Point<P>, P::V)>> + 'a {
+        Gen::new(|co| async move {
+            if let Err(cause) = self.query_ordered0(query, ordering, store, &co).await {
+                co.yield_(Err(cause)).await;
+            }
+        })
+    }
+
     pub fn summary(&self, query: &QueryRange3d<P>, store: &impl Store<P>) -> Result<P::M> {
         let bbox = BBox::all();
         self.summary0(query, &bbox, store)
@@ -547,22 +593,23 @@ impl<P: TreeParams> Node<P> {
             }
         }
         if bbox.contained_in(&query) {
-            println!("bbox contained in query");
-            println!("bbox: {}", bbox);
-            println!("query: {}", query);
             return Ok(self.summary.clone());
         }
         let mut summary = P::M::zero();
-        if let Some(left) = self.left.map(|id| store.get(&id)).transpose()? {
-            let left_bbox = bbox.split_left(&self.key, self.rank);
-            summary = summary.combine(&left.summary0(query, &left_bbox, store)?);
+        if query.overlaps_left(&self.key, self.rank) {
+            if let Some(left) = self.left.map(|id| store.get(&id)).transpose()? {
+                let left_bbox = bbox.split_left(&self.key, self.rank);
+                summary = summary.combine(&left.summary0(query, &left_bbox, store)?);
+            }
         }
         if query.contains(&self.key) {
             summary = summary.combine(&P::M::lift((self.key.clone(), self.value.clone())));
         }
-        if let Some(right) = self.right.map(|id| store.get(&id)).transpose()? {
-            let right_bbox = bbox.split_right(&self.key, self.rank);
-            summary = summary.combine(&right.summary0(query, &right_bbox, store)?);
+        if query.overlaps_right(&self.key, self.rank) {
+            if let Some(right) = self.right.map(|id| store.get(&id)).transpose()? {
+                let right_bbox = bbox.split_right(&self.key, self.rank);
+                summary = summary.combine(&right.summary0(query, &right_bbox, store)?);
+            }
         }
         Ok(summary)
     }
@@ -573,43 +620,73 @@ impl<P: TreeParams> Node<P> {
         store: &impl Store<P>,
         co: &Co<Result<(Point<P>, P::V)>>,
     ) -> Result<()> {
-        if let Some(left) = self.left.map(|id| store.get(&id)).transpose()? {
-            let overlap = match self.sort_order() {
-                SortOrder::XYZ => query.x.min <= self.key.x,
-                SortOrder::YZX => query.y.min <= self.key.y,
-                SortOrder::ZXY => query.z.min <= self.key.z,
-            };
-            if overlap {
+        if query.overlaps_left(&self.key, self.rank) {
+            if let Some(left) = self.left.map(|id| store.get(&id)).transpose()? {
                 Box::pin(left.query_unordered0(query, store, co)).await?;
             }
         }
         if query.contains(&self.key) {
             co.yield_(Ok((self.key.clone(), self.value.clone()))).await;
         }
-        if let Some(right) = self.right.map(|id| store.get(&id)).transpose()? {
-            let overlap = match self.sort_order() {
-                SortOrder::XYZ => !query
-                    .x
-                    .max
-                    .as_ref()
-                    .map(|x_max| x_max < &self.key.x)
-                    .unwrap_or_default(),
-                SortOrder::YZX => !query
-                    .y
-                    .max
-                    .as_ref()
-                    .map(|y_max| y_max < &self.key.y)
-                    .unwrap_or_default(),
-                SortOrder::ZXY => !query
-                    .z
-                    .max
-                    .as_ref()
-                    .map(|z_max| z_max < &self.key.z)
-                    .unwrap_or_default(),
-            };
-            if overlap {
+        if query.overlaps_right(&self.key, self.rank) {
+            if let Some(right) = self.right.map(|id| store.get(&id)).transpose()? {
                 Box::pin(right.query_unordered0(query, store, co)).await?;
             }
+        }
+        Ok(())
+    }
+
+    async fn query_ordered0(
+        &self,
+        query: &QueryRange3d<P>,
+        ordering: SortOrder,
+        store: &impl Store<P>,
+        co: &Co<Result<(Point<P>, P::V)>>,
+    ) -> Result<()> {
+        // we know that the node partitions the space in the correct way, so
+        // we can just concatenate the results from the left, self and right
+        if self.sort_order() == ordering {
+            if query.overlaps_left(&self.key, self.rank) {
+                if let Some(left) = self.left.map(|id| store.get(&id)).transpose()? {
+                    Box::pin(left.query_ordered0(query, ordering, store, co)).await?;
+                }
+            }
+            if query.contains(&self.key) {
+                co.yield_(Ok((self.key.clone(), self.value.clone()))).await;
+            }
+            if query.overlaps_right(&self.key, self.rank) {
+                if let Some(right) = self.right.map(|id| store.get(&id)).transpose()? {
+                    Box::pin(right.query_ordered0(query, ordering, store, co)).await?;
+                }
+            }
+        } else {
+            // the node does not partition the space in the correct way, so we
+            // need to merge the results from the left, self and right
+            // still better than a full sort!
+            let iter1 = if query.overlaps_left(&self.key, self.rank) {
+                if let Some(left) = self.left.map(|id| store.get(&id)).transpose()? {
+                    itertools::Either::Left(left.query_ordered(query, ordering, store).into_iter())
+                } else {
+                    itertools::Either::Right(std::iter::empty())
+                }
+            } else {
+                itertools::Either::Right(std::iter::empty())
+            };
+            let iter2 = if query.contains(&self.key) {
+                itertools::Either::Left(std::iter::once(Ok((self.key.clone(), self.value.clone()))))
+            } else {
+                itertools::Either::Right(std::iter::empty())
+            };
+            let iter3 = if query.overlaps_right(&self.key, self.rank) {
+                if let Some(right) = self.right.map(|id| store.get(&id)).transpose()? {
+                    itertools::Either::Left(right.query_ordered(query, ordering, store).into_iter())
+                } else {
+                    itertools::Either::Right(std::iter::empty())
+                }
+            } else {
+                itertools::Either::Right(std::iter::empty())
+            };
+            merge3(iter1, iter2, iter3, ordering, co).await?;
         }
         Ok(())
     }
@@ -808,7 +885,81 @@ fn count_trailing_zeros(hash: &[u8; 32]) -> u8 {
     rank
 }
 
-#[derive(Debug)]
+async fn merge3<P: TreeParams>(
+    a: impl Iterator<Item = Result<(Point<P>, P::V)>>,
+    b: impl Iterator<Item = Result<(Point<P>, P::V)>>,
+    c: impl Iterator<Item = Result<(Point<P>, P::V)>>,
+    ordering: SortOrder,
+    co: &Co<Result<(Point<P>, P::V)>>,
+) -> Result<()> {
+    enum Smallest {
+        A,
+        B,
+        C,
+    }
+    use Smallest::*;
+    let mut a = a.peekable();
+    let mut b = b.peekable();
+    let mut c = c.peekable();
+    let cmp = |a: &Result<(Point<P>, P::V)>, b: &Result<(Point<P>, P::V)>| match (a, b) {
+        (Ok((ak, _)), Ok((bk, _))) => ak.cmp_with_order(&bk, ordering),
+        (Err(_), Ok(_)) => Ordering::Less,
+        (Ok(_), Err(_)) => Ordering::Greater,
+        (Err(_), Err(_)) => Ordering::Equal,
+    };
+    loop {
+        let min = match (a.peek(), b.peek(), c.peek()) {
+            (Some(a), Some(b), Some(c)) => {
+                if cmp(a, b) == Ordering::Less {
+                    if cmp(a, c) == Ordering::Less {
+                        A
+                    } else {
+                        C
+                    }
+                } else {
+                    if cmp(b, c) == Ordering::Less {
+                        B
+                    } else {
+                        C
+                    }
+                }
+            }
+            (Some(a), Some(b), None) => {
+                if cmp(a, b) == Ordering::Less {
+                    A
+                } else {
+                    B
+                }
+            }
+            (Some(a), None, Some(c)) => {
+                if cmp(a, c) == Ordering::Less {
+                    A
+                } else {
+                    C
+                }
+            }
+            (None, Some(b), Some(c)) => {
+                if cmp(b, c) == Ordering::Less {
+                    B
+                } else {
+                    C
+                }
+            }
+            (Some(_), None, None) => A,
+            (None, Some(_), None) => B,
+            (None, None, Some(_)) => C,
+            (None, None, None) => break,
+        };
+        match min {
+            Smallest::A => co.yield_(a.next().unwrap()).await,
+            Smallest::B => co.yield_(b.next().unwrap()).await,
+            Smallest::C => co.yield_(c.next().unwrap()).await,
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum SortOrder {
     XYZ,
     YZX,

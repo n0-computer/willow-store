@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc c9fde2f5c82187b6bb4eebde678f0d9a09d9a3cfbbc1c68491110e0123241c23 # shrinks to input = _PropTreeSummaryArgs { items: [((3, 43, 0), 0), ((54, 20, 0), 0), ((45, 20, 13), 0), ((40, 8, 6), 0), ((92, 86, 54), 0), ((71, 33, 42), 1)], query: QueryRange3d { x: QueryRange { min: 7, max: None }, y: QueryRange { min: 66, max: None }, z: QueryRange { min: 3, max: Some(55) } } }
+cc 2d829d463d1aabb33ba1e9e6e6036ce6c499edcbf1e0a6f7606d339183fff507 # shrinks to input = _PropTreeQueryOrderedArgs { items: [((36, 37, 72), 0), ((37, 31, 72), 0)], query: QueryRange3d { x: QueryRange { min: 0, max: Some(38) }, y: QueryRange { min: 27, max: Some(38) }, z: QueryRange { min: 9, max: Some(73) } }, ordering: YZX }
