@@ -4,4 +4,4 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
-cc 1ac0b886eb2f2ae9ebd041365f660f1c0fba2c33c8c095bbaecb3c97365e59c1 # shrinks to input = _TestInsertGetArgs { paths: [(Path([]), Value { timestamp: 0, fingerprint: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], size: 0 })] }
+cc eaa89ef29a9b189a1f0a234cdd96e6152c65056b85ea5579304460a60756ce56 # shrinks to input = _PropTreeCreationArgs { items: [(Point { x: 0, y: 0, z: 0 }, 1476969706804695209), (Point { x: 0, y: 0, z: 1 }, 16969774366904856407)] }
