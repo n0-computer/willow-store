@@ -1,9 +1,15 @@
+use std::collections::BTreeSet;
+
+use prop::strategy;
 use proptest::prelude::*;
 use test_strategy::proptest;
 use testresult::TestResult;
-use willow_store::{KeyParams, LiftingCommutativeMonoid, Point, Store, TreeParams};
+use willow_store::{
+    KeyParams, LiftingCommutativeMonoid, Point, QueryRange, QueryRange3d, Store, TreeParams,
+};
 
 type TPoint = Point<TestParams>;
+type TQuery = QueryRange3d<TestParams>;
 
 #[derive(Debug)]
 struct TestParams;
@@ -16,19 +22,19 @@ impl KeyParams for TestParams {
 
 impl TreeParams for TestParams {
     type V = u64;
-    type S = ValueSum;
+    type M = ValueSum;
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 struct ValueSum(u64);
 
-impl LiftingCommutativeMonoid<u64> for ValueSum {
+impl LiftingCommutativeMonoid<(Point<TestParams>, u64)> for ValueSum {
     fn zero() -> Self {
         ValueSum(0)
     }
 
-    fn lift(v: u64) -> Self {
-        ValueSum(v)
+    fn lift(v: (Point<TestParams>, u64)) -> Self {
+        ValueSum(v.1)
     }
 
     fn combine(&self, other: &Self) -> Self {
@@ -41,15 +47,53 @@ fn point() -> impl Strategy<Value = TPoint> {
 }
 
 fn treecontents() -> impl Strategy<Value = Vec<(TPoint, u64)>> {
-    prop::collection::vec((point(), 0..100u64), 1..100)
+    prop::collection::vec((point(), 0..100u64), 1..100).prop_map(|mut m| {
+        let mut keys = BTreeSet::new();
+        m.retain(|(p, _)| keys.insert(p.clone().xyz()));
+        m
+    })
+}
+
+fn query() -> impl Strategy<Value = TQuery> {
+    (
+        0..100u64,
+        1..=100u64,
+        0..100u64,
+        1..=100u64,
+        0..100u64,
+        1..=100u64,
+    )
+        .prop_map(|(x0, dx, y0, dy, z0, dz)| {
+            fn end(a: u64, b: u64) -> Option<u64> {
+                let r = a + b;
+                if r > 100 {
+                    None
+                } else {
+                    Some(r)
+                }
+            }
+            TQuery::new(
+                QueryRange::new(x0, end(x0, dx)),
+                QueryRange::new(y0, end(y0, dy)),
+                QueryRange::new(z0, end(z0, dz)),
+            )
+        })
 }
 
 fn tree_creation_impl(items: Vec<(TPoint, u64)>) -> TestResult<()> {
-    let (store, id) = willow_store::Node::from_iter(items)?;
+    let (store, id) = willow_store::Node::from_iter(items.clone())?;
     let tree = store.get(&id)?;
-    tree.dump(&store)?;
+    // tree.dump(&store)?;
     tree.assert_invariants(&store)?;
-
+    let mut actual = tree
+        .iter_unordered(&store)
+        .into_iter()
+        .map(|x| x.unwrap())
+        .collect::<Vec<_>>();
+    let mut expected = items;
+    actual.sort_by_key(|(p, _)| p.clone().xyz());
+    expected.sort_by_key(|(p, _)| p.clone().xyz());
+    assert_eq!(actual, expected);
     Ok(())
 }
 
@@ -64,4 +108,90 @@ fn test_tree_creation() -> TestResult<()> {
     tree_creation_impl(items)?;
 
     Ok(())
+}
+
+fn tree_query_unordered_impl(items: Vec<(TPoint, u64)>, query: TQuery) -> TestResult<()> {
+    let (store, id) = willow_store::Node::from_iter(items.clone())?;
+    let tree = store.get(&id)?;
+    let mut actual = tree
+        .query_unordered(&query, &store)
+        .into_iter()
+        .map(|x| x.unwrap())
+        .collect::<Vec<_>>();
+    let mut expected = items
+        .iter()
+        .filter(|(p, _)| query.contains(p))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    actual.sort_by_key(|(p, _)| p.clone().xyz());
+    expected.sort_by_key(|(p, _)| p.clone().xyz());
+    println!("{} {} {}", items.len(), actual.len(), expected.len());
+    assert_eq!(actual, expected);
+    Ok(())
+}
+
+fn tree_summary_impl(items: Vec<(TPoint, u64)>, query: TQuery) -> TestResult<()> {
+    let (store, id) = willow_store::Node::from_iter(items.clone())?;
+    let tree = store.get(&id)?;
+    tree.dump(&store)?;
+    let actual = tree.summary(&query, &store)?;
+    let mut expected = ValueSum::zero();
+    for (key, value) in &items {
+        if query.contains(key) {
+            expected = expected.combine(&ValueSum::lift((key.clone(), *value)));
+        }
+    }
+    assert_eq!(actual, expected);
+    Ok(())
+}
+
+#[proptest]
+fn prop_tree_query_unordered(
+    #[strategy(treecontents())] items: Vec<(TPoint, u64)>,
+    #[strategy(query())] query: TQuery,
+) {
+    tree_query_unordered_impl(items, query).unwrap();
+}
+
+#[test]
+fn test_tree_summary() -> TestResult<()> {
+    let cases = vec![
+        // (
+        //     vec![(TPoint::new(0, 0, 0), 0), (TPoint::new(0, 0, 1), 1)],
+        //     TQuery::new(
+        //         QueryRange::new(0, Some(1)),
+        //         QueryRange::new(0, Some(1)),
+        //         QueryRange::new(0, Some(1)),
+        //     ),
+        // ),
+        (
+            vec![
+                (TPoint::new(3, 43, 0), 0),
+                (TPoint::new(54, 20, 0), 0),
+                (TPoint::new(45, 20, 13), 0),
+                (TPoint::new(40, 8, 6), 0),
+                (TPoint::new(92, 86, 54), 0),
+                (TPoint::new(71, 33, 42), 1),
+            ],
+            TQuery::new(
+                QueryRange::new(7, None),
+                QueryRange::new(66, None),
+                QueryRange::new(3, Some(55)),
+            ),
+        ),
+    ];
+    for (items, query) in cases {
+        tree_summary_impl(items, query)?;
+    }
+
+    Ok(())
+}
+
+#[proptest]
+fn prop_tree_summary(
+    #[strategy(treecontents())] items: Vec<(TPoint, u64)>,
+    #[strategy(query())] query: TQuery,
+) {
+    tree_summary_impl(items, query).unwrap();
 }
