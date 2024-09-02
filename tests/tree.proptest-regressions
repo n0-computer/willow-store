@@ -4,4 +4,4 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
-cc eaa89ef29a9b189a1f0a234cdd96e6152c65056b85ea5579304460a60756ce56 # shrinks to input = _PropTreeCreationArgs { items: [(Point { x: 0, y: 0, z: 0 }, 1476969706804695209), (Point { x: 0, y: 0, z: 1 }, 16969774366904856407)] }
+cc d53d9727efce112d05ed1609bf8ccbdf2dacd8846a54cfe5c2d7bdc16f002de0 # shrinks to input = _PropTreeCreationArgs { items: [(Point { x: 83, y: 0, z: 0 }, 0), (Point { x: 0, y: 0, z: 1 }, 0)] }

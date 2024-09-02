@@ -11,15 +11,27 @@ use serde::Serialize;
 mod point;
 pub use point::Point;
 
+macro_rules! assert_lt {
+    ($left:expr, $right:expr) => {
+        assert!($left < $right, "{:?} < {:?}", $left, $right)
+    };
+}
+
+macro_rules! assert_gt {
+    ($left:expr, $right:expr) => {
+        assert!($left > $right, "{:?} > {:?}", $left, $right)
+    };
+}
+
 ///
 pub trait CoordParams: Ord + PartialEq + Eq + Serialize + Clone + Debug {}
 
 impl<T: Ord + PartialEq + Eq + Serialize + Clone + Debug> CoordParams for T {}
 
 ///
-pub trait ValueParams: PartialEq + Eq + Serialize + Clone {}
+pub trait ValueParams: PartialEq + Eq + Serialize + Clone + Debug {}
 
-impl<T: PartialEq + Eq + Serialize + Clone> ValueParams for T {}
+impl<T: PartialEq + Eq + Serialize + Clone + Debug> ValueParams for T {}
 
 pub trait KeyParams {
     type X: CoordParams;
@@ -296,7 +308,11 @@ impl<P: TreeParams> Node<P> {
         let mut uniques = BTreeSet::new();
         nodes.retain(|node| uniques.insert(node.key.clone().xyz()));
         // if rank is equal, compare keys at rank
-        nodes.sort_by(|p1, p2| p2.rank.cmp(&p1.rank).then(p1.key.cmp_at_rank(&p2.key, p1.rank)));
+        nodes.sort_by(|p1, p2| {
+            p2.rank
+                .cmp(&p1.rank)
+                .then(p1.key.cmp_at_rank(&p2.key, p1.rank))
+        });
         let mut store = MemStore::new();
         let mut root = nodes.remove(0);
         let root_id = store.put(&root)?;
@@ -313,12 +329,38 @@ impl<P: TreeParams> Node<P> {
         Ok((store, root_id))
     }
 
+    pub fn dump(&self, store: &impl Store<P>) -> Result<()> {
+        self.dump0("".into(), store)
+    }
+
+    fn dump0(&self, prefix: String, store: &impl Store<P>) -> Result<()> {
+        println!(
+            "{}{:?} rank={} order={:?} value={:?}",
+            prefix,
+            self.key,
+            self.rank,
+            SortOrder::from(self.rank),
+            self.value
+        );
+        if let Some(left) = self.left {
+            println!("{} left:", prefix);
+            let left = store.get(&left)?;
+            left.dump0(format!("{}  ", prefix), store)?;
+        }
+        if let Some(right) = self.right {
+            println!("{} right:", prefix);
+            let right = store.get(&right)?;
+            right.dump0(format!("{}  ", prefix), store)?;
+        }
+        Ok(())
+    }
+
     pub fn assert_invariants(&self, store: &impl Store<P>) -> Result<AssertInvariantsRes<P>> {
         let Node {
             key,
             rank,
-            value,
-            summary,
+            value: _,
+            summary: _,
             left,
             right,
         } = self;
@@ -338,32 +380,31 @@ impl<P: TreeParams> Node<P> {
         if let Some(ref right) = right_res {
             assert!(right.rank <= *rank);
         }
-        match rank % 3 {
-            0 => {
+        match SortOrder::from(*rank) {
+            SortOrder::XYZ => {
                 if let Some(ref left) = left_res {
-                    assert!(left.xyz.max < key.clone().xyz());
+                    assert_lt!(left.xyz.max, key.clone().xyz());
                 }
                 if let Some(ref right) = right_res {
-                    assert!(right.xyz.min > key.clone().xyz());
+                    assert_gt!(right.xyz.min, key.clone().xyz());
                 }
             }
-            1 => {
+            SortOrder::YZX => {
                 if let Some(ref left) = left_res {
-                    assert!(left.yzx.max < key.clone().yzx());
+                    assert_lt!(left.yzx.max, key.clone().yzx());
                 }
                 if let Some(ref right) = right_res {
-                    assert!(right.yzx.min > key.clone().yzx());
+                    assert_gt!(right.yzx.min, key.clone().yzx());
                 }
             }
-            2 => {
+            SortOrder::ZXY => {
                 if let Some(ref left) = left_res {
-                    assert!(left.zxy.max < key.clone().zxy());
+                    assert_lt!(left.zxy.max, key.clone().zxy());
                 }
                 if let Some(ref right) = right_res {
-                    assert!(right.zxy.min > key.clone().zxy());
+                    assert_gt!(right.zxy.min, key.clone().zxy());
                 }
             }
-            _ => unreachable!(),
         }
         let mut res = AssertInvariantsRes::single(key.clone(), *rank);
         if let Some(left) = left_res {
@@ -431,4 +472,22 @@ fn count_trailing_zeros(hash: &[u8; 32]) -> u8 {
         }
     }
     rank
+}
+
+#[derive(Debug)]
+pub enum SortOrder {
+    XYZ,
+    YZX,
+    ZXY,
+}
+
+impl From<u8> for SortOrder {
+    fn from(rank: u8) -> Self {
+        match rank % 3 {
+            2 => SortOrder::XYZ,
+            1 => SortOrder::YZX,
+            0 => SortOrder::ZXY,
+            _ => unreachable!(),
+        }
+    }
 }

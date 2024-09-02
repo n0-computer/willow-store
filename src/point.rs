@@ -1,20 +1,35 @@
-use crate::KeyParams;
+use crate::{KeyParams, SortOrder};
 use serde::Serialize;
-use std::cmp::Ordering;
+use std::{cmp::Ordering, fmt::Debug};
 
 /// A point in 3D space, serving as a key for a tree.
 ///
 /// This does not implement `Ord` or `PartialOrd` because there are multiple
 /// orderings that are equally valid.
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 pub struct Point<K: KeyParams> {
     pub x: K::X,
     pub y: K::Y,
     pub z: K::Z,
 }
 
-#[derive(Debug)]
+impl<K: KeyParams> std::fmt::Debug for Point<K> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("")
+            .field(&self.x)
+            .field(&self.y)
+            .field(&self.z)
+            .finish()
+    }
+}
+
 pub struct XYZ<K: KeyParams>(Point<K>);
+
+impl<K: KeyParams> Debug for XYZ<K> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("XYZ").field(&self.0).finish()
+    }
+}
 
 impl<K: KeyParams> Clone for XYZ<K> {
     fn clone(&self) -> Self {
@@ -48,8 +63,13 @@ impl<K: KeyParams> Ord for XYZ<K> {
     }
 }
 
-#[derive(Debug)]
 pub struct YZX<K: KeyParams>(Point<K>);
+
+impl<K: KeyParams> Debug for YZX<K> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("YZX").field(&self.0).finish()
+    }
+}
 
 impl<K: KeyParams> Clone for YZX<K> {
     fn clone(&self) -> Self {
@@ -79,12 +99,17 @@ impl<K: KeyParams> PartialOrd for YZX<K> {
 
 impl<K: KeyParams> Ord for YZX<K> {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.0.cmp_xyz(&other.0)
+        self.0.cmp_yzx(&other.0)
     }
 }
 
-#[derive(Debug)]
 pub struct ZXY<K: KeyParams>(Point<K>);
+
+impl<K: KeyParams> Debug for ZXY<K> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ZXY").field(&self.0).finish()
+    }
+}
 
 impl<K: KeyParams> Clone for ZXY<K> {
     fn clone(&self) -> Self {
@@ -187,11 +212,10 @@ impl<K: KeyParams> Point<K> {
     }
 
     pub fn cmp_at_rank(&self, other: &Self, rank: u8) -> std::cmp::Ordering {
-        match rank % 3 {
-            0 => self.cmp_zxy(other),
-            1 => self.cmp_yzx(other),
-            2 => self.cmp_xyz(other),
-            _ => unreachable!(),
+        match SortOrder::from(rank) {
+            SortOrder::ZXY => self.cmp_zxy(other),
+            SortOrder::YZX => self.cmp_yzx(other),
+            SortOrder::XYZ => self.cmp_xyz(other),
         }
     }
 }

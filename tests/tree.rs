@@ -37,35 +37,31 @@ impl LiftingCommutativeMonoid<u64> for ValueSum {
 }
 
 fn point() -> impl Strategy<Value = TPoint> {
-    (
-        0..100u64,
-        0..100u64,
-        0..100u64,
-    )
-        .prop_map(|(x, y, z)| TPoint::new(x, y, z))
+    (0..100u64, 0..100u64, 0..100u64).prop_map(|(x, y, z)| TPoint::new(x, y, z))
 }
 
 fn treecontents() -> impl Strategy<Value = Vec<(TPoint, u64)>> {
     prop::collection::vec((point(), 0..100u64), 1..100)
 }
 
+fn tree_creation_impl(items: Vec<(TPoint, u64)>) -> TestResult<()> {
+    let (store, id) = willow_store::Node::from_iter(items)?;
+    let tree = store.get(&id)?;
+    tree.dump(&store)?;
+    tree.assert_invariants(&store)?;
+
+    Ok(())
+}
+
 #[proptest]
 fn prop_tree_creation(#[strategy(treecontents())] items: Vec<(TPoint, u64)>) {
-    let (store, id) = willow_store::Node::from_iter(items).unwrap();
-    let tree = store.get(&id).unwrap();
-    tree.assert_invariants(&store).unwrap();
+    tree_creation_impl(items).unwrap();
 }
 
 #[test]
 fn test_tree_creation() -> TestResult<()> {
-    let items = vec![
-        (TPoint::new(1, 2, 3), 1),
-        (TPoint::new(4, 5, 6), 2),
-        (TPoint::new(7, 8, 9), 3),
-    ];
-    let (store, id) = willow_store::Node::from_iter(items)?;
-    let tree = store.get(&id)?;
-    tree.assert_invariants(&store)?;
+    let items = vec![(TPoint::new(83, 0, 0), 0), (TPoint::new(0, 0, 1), 2)];
+    tree_creation_impl(items)?;
 
     Ok(())
 }
