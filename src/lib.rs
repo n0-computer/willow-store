@@ -4,6 +4,7 @@ use std::{
     fmt::{Debug, Display},
     future::Future,
     iter,
+    num::NonZeroU64,
     ops::RangeBounds,
 };
 
@@ -32,11 +33,6 @@ macro_rules! assert_gt {
 pub trait CoordParams: Ord + PartialEq + Eq + Serialize + Clone + Debug + Display {}
 
 impl<T: Ord + PartialEq + Eq + Serialize + Clone + Debug + Display> CoordParams for T {}
-
-///
-pub trait ValueParams: PartialEq + Eq + Serialize + Clone + Debug {}
-
-impl<T: PartialEq + Eq + Serialize + Clone + Debug> ValueParams for T {}
 
 pub trait KeyParams {
     type X: CoordParams;
@@ -443,6 +439,11 @@ impl<P: KeyParams> BBox<P> {
     }
 }
 
+///
+pub trait ValueParams: PartialEq + Eq + Serialize + Clone + Debug {}
+
+impl<T: PartialEq + Eq + Serialize + Clone + Debug> ValueParams for T {}
+
 /// Tree params for a 3D tree. This extends `KeyParams` with a value and
 /// summary type.
 pub trait TreeParams: KeyParams + Sized {
@@ -455,6 +456,29 @@ pub trait Store<P: TreeParams> {
     fn put(&mut self, node: &Node<P>) -> Result<NodeId>;
     fn update(&mut self, id: &NodeId, node: &Node<P>) -> Result<()>;
     fn get(&self, id: &NodeId) -> Result<Node<P>>;
+
+    /// Get a node by id, returning None if the id is None.
+    ///
+    /// This is just a convenience method for the common case where you have an
+    /// optional id and want to get the node if it exists.
+    fn get_opt(&self, id: &Option<NodeId>) -> Result<Option<Node<P>>> {
+        match id {
+            Some(id) => Ok(Some(self.get(id)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Get a node by id, returning None if the id is None.
+    /// Also return the id along with the node.
+    fn get_opt_with_id(&self, id: &Option<NodeId>) -> Result<Option<(NodeId, Node<P>)>> {
+        match id {
+            Some(id) => {
+                let node = self.get(id)?;
+                Ok(Some((*id, node)))
+            }
+            None => Ok(None),
+        }
+    }
 }
 
 pub struct MemStore<P: TreeParams> {
@@ -471,7 +495,7 @@ impl<P: TreeParams> MemStore<P> {
 
 impl<P: TreeParams> Store<P> for MemStore<P> {
     fn put(&mut self, node: &Node<P>) -> Result<NodeId> {
-        let id = self.nodes.len() as NodeId;
+        let id = NodeId::new((self.nodes.len() as u64) + 1).unwrap();
         self.nodes.insert(id, node.clone());
         Ok(id)
     }
@@ -489,7 +513,7 @@ impl<P: TreeParams> Store<P> for MemStore<P> {
     }
 }
 
-pub type NodeId = u64;
+pub type NodeId = NonZeroU64;
 
 pub struct Node<P: TreeParams> {
     key: Point<P>,
@@ -539,11 +563,11 @@ impl<P: TreeParams> Node<P> {
         store: &impl Store<P>,
         co: &Co<Result<(Point<P>, P::V)>>,
     ) -> Result<()> {
-        if let Some(left) = self.left.map(|id| store.get(&id)).transpose()? {
+        if let Some(left) = store.get_opt(&self.left)? {
             Box::pin(left.iter_unordered0(store, co)).await?;
         }
         co.yield_(Ok((self.key.clone(), self.value.clone()))).await;
-        if let Some(right) = self.right.map(|id| store.get(&id)).transpose()? {
+        if let Some(right) = store.get_opt(&self.right)? {
             Box::pin(right.iter_unordered0(store, co)).await?;
         }
         Ok(())
@@ -597,7 +621,7 @@ impl<P: TreeParams> Node<P> {
         }
         let mut summary = P::M::zero();
         if query.overlaps_left(&self.key, self.rank) {
-            if let Some(left) = self.left.map(|id| store.get(&id)).transpose()? {
+            if let Some(left) = store.get_opt(&self.left)? {
                 let left_bbox = bbox.split_left(&self.key, self.rank);
                 summary = summary.combine(&left.summary0(query, &left_bbox, store)?);
             }
@@ -606,7 +630,7 @@ impl<P: TreeParams> Node<P> {
             summary = summary.combine(&P::M::lift((self.key.clone(), self.value.clone())));
         }
         if query.overlaps_right(&self.key, self.rank) {
-            if let Some(right) = self.right.map(|id| store.get(&id)).transpose()? {
+            if let Some(right) = store.get_opt(&self.right)? {
                 let right_bbox = bbox.split_right(&self.key, self.rank);
                 summary = summary.combine(&right.summary0(query, &right_bbox, store)?);
             }
@@ -621,7 +645,7 @@ impl<P: TreeParams> Node<P> {
         co: &Co<Result<(Point<P>, P::V)>>,
     ) -> Result<()> {
         if query.overlaps_left(&self.key, self.rank) {
-            if let Some(left) = self.left.map(|id| store.get(&id)).transpose()? {
+            if let Some(left) = store.get_opt(&self.left)? {
                 Box::pin(left.query_unordered0(query, store, co)).await?;
             }
         }
@@ -629,7 +653,7 @@ impl<P: TreeParams> Node<P> {
             co.yield_(Ok((self.key.clone(), self.value.clone()))).await;
         }
         if query.overlaps_right(&self.key, self.rank) {
-            if let Some(right) = self.right.map(|id| store.get(&id)).transpose()? {
+            if let Some(right) = store.get_opt(&self.right)? {
                 Box::pin(right.query_unordered0(query, store, co)).await?;
             }
         }
@@ -647,7 +671,7 @@ impl<P: TreeParams> Node<P> {
         // we can just concatenate the results from the left, self and right
         if self.sort_order() == ordering {
             if query.overlaps_left(&self.key, self.rank) {
-                if let Some(left) = self.left.map(|id| store.get(&id)).transpose()? {
+                if let Some(left) = store.get_opt(&self.left)? {
                     Box::pin(left.query_ordered0(query, ordering, store, co)).await?;
                 }
             }
@@ -655,7 +679,7 @@ impl<P: TreeParams> Node<P> {
                 co.yield_(Ok((self.key.clone(), self.value.clone()))).await;
             }
             if query.overlaps_right(&self.key, self.rank) {
-                if let Some(right) = self.right.map(|id| store.get(&id)).transpose()? {
+                if let Some(right) = store.get_opt(&self.right)? {
                     Box::pin(right.query_ordered0(query, ordering, store, co)).await?;
                 }
             }
@@ -664,7 +688,7 @@ impl<P: TreeParams> Node<P> {
             // need to merge the results from the left, self and right
             // still better than a full sort!
             let iter1 = if query.overlaps_left(&self.key, self.rank) {
-                if let Some(left) = self.left.map(|id| store.get(&id)).transpose()? {
+                if let Some(left) = store.get_opt(&self.left)? {
                     itertools::Either::Left(left.query_ordered(query, ordering, store).into_iter())
                 } else {
                     itertools::Either::Right(std::iter::empty())
@@ -678,7 +702,7 @@ impl<P: TreeParams> Node<P> {
                 itertools::Either::Right(std::iter::empty())
             };
             let iter3 = if query.overlaps_right(&self.key, self.rank) {
-                if let Some(right) = self.right.map(|id| store.get(&id)).transpose()? {
+                if let Some(right) = store.get_opt(&self.right)? {
                     itertools::Either::Left(right.query_ordered(query, ordering, store).into_iter())
                 } else {
                     itertools::Either::Right(std::iter::empty())
@@ -707,6 +731,110 @@ impl<P: TreeParams> Node<P> {
         }
     }
 
+    pub fn insert(
+        &mut self,
+        key: Point<P>,
+        value: P::V,
+        store: &mut impl Store<P>,
+    ) -> Result<Option<P::V>> {
+        let node = Node::single(key, value);
+        self.insert0(&store.put(self)?, &node, store)
+    }
+
+    fn insert0(
+        &mut self,
+        self_id: &NodeId,
+        node: &Node<P>,
+        store: &mut impl Store<P>,
+    ) -> Result<Option<P::V>> {
+        assert!(node.is_leaf());
+        let cmp = node.key.cmp_at_rank(&self.key, self.rank);
+        if cmp == Ordering::Equal {
+            let mut summary = node.summary.clone();
+            if let Some(left) = store.get_opt(&self.left)? {
+                summary = summary.combine(&left.summary);
+            }
+            if let Some(right) = store.get_opt(&self.right)? {
+                summary = summary.combine(&right.summary);
+            }
+            // just replace the value and update the summary
+            let old_value = self.value.clone();
+            self.value = node.value.clone();
+            self.summary = summary;
+            store.update(self_id, self)?;
+            return Ok(Some(old_value));
+        }
+        if node.rank < self.rank {
+            // node is below us, so we can just let it fall down
+            let old_value = match cmp {
+                Ordering::Less => {
+                    if let Some((id, mut child)) = store.get_opt_with_id(&self.left)? {
+                        child.insert0(&id, node, store)?
+                    } else {
+                        self.left = Some(store.put(node)?);
+                        None
+                    }
+                }
+                Ordering::Greater => {
+                    if let Some((id, mut child)) = store.get_opt_with_id(&self.right)? {
+                        child.insert0(&id, node, store)?
+                    } else {
+                        self.right = Some(store.put(node)?);
+                        None
+                    }
+                }
+                Ordering::Equal => unreachable!(),
+            };
+            self.summary = if old_value.is_none() {
+                // just add to the summary
+                self.summary.combine(&node.summary)
+            } else {
+                // recalculate the summary from scratch
+                let mut summary = P::M::lift((self.key.clone(), self.value.clone()));
+                if let Some(left) = store.get_opt(&self.left)? {
+                    summary = summary.combine(&left.summary);
+                }
+                if let Some(right) = store.get_opt(&self.right)? {
+                    summary = summary.combine(&right.summary);
+                }
+                summary
+            };
+            store.update(self_id, self)?;
+            return Ok(old_value);
+        } else {
+            todo!()
+        }
+    }
+
+    pub fn get(&self, key: Point<P>, store: &impl Store<P>) -> Result<Option<P::V>> {
+        match self.get0(key, store)? {
+            Some(node) => Ok(Some(node.value)),
+            None => Ok(None),
+        }
+    }
+
+    fn get0(&self, key: Point<P>, store: &impl Store<P>) -> Result<Option<Node<P>>> {
+        match key.cmp_at_rank(&self.key, self.rank) {
+            Ordering::Less => {
+                if let Some(left) = self.left {
+                    let left = store.get(&left)?;
+                    left.get0(key, store)
+                } else {
+                    Ok(None)
+                }
+            }
+            Ordering::Greater => {
+                if let Some(right) = self.right {
+                    let right = store.get(&right)?;
+                    right.get0(key, store)
+                } else {
+                    Ok(None)
+                }
+            }
+            Ordering::Equal => Ok(Some(self.clone())),
+        }
+    }
+
     pub fn from_iter<I: IntoIterator<Item = (Point<P>, P::V)>>(
         iter: I,
     ) -> Result<(MemStore<P>, NodeId)> {
@@ -727,14 +855,7 @@ impl<P: TreeParams> Node<P> {
         let mut root = nodes.remove(0);
         let root_id = store.put(&root)?;
         for node in nodes {
-            root.insert_no_balance(
-                &root_id,
-                node.key,
-                node.value,
-                node.rank,
-                &node.summary,
-                &mut store,
-            )?;
+            root.insert_no_balance(&root_id, &node, &mut store)?;
         }
         Ok((store, root_id))
     }
@@ -831,12 +952,10 @@ impl<P: TreeParams> Node<P> {
     fn insert_no_balance(
         &mut self,
         self_id: &NodeId,
-        point: Point<P>,
-        value: P::V,
-        rank: u8,
-        summary: &P::M,
+        node: &Self,
         store: &mut impl Store<P>,
     ) -> Result<()> {
+        assert!(node.is_leaf());
         let Node {
             key: parent_key,
             rank: parent_rank,
@@ -845,28 +964,26 @@ impl<P: TreeParams> Node<P> {
             right,
             value: _,
         } = self;
-        match point.cmp_at_rank(parent_key, *parent_rank) {
+        match node.key.cmp_at_rank(parent_key, *parent_rank) {
             Ordering::Less => {
-                if let Some(left_id) = left {
-                    let mut left = store.get(left_id)?;
-                    left.insert_no_balance(left_id, point, value, rank, summary, store)?;
+                if let Some((left_id, mut left)) = store.get_opt_with_id(&left)? {
+                    left.insert_no_balance(&left_id, node, store)?;
                 } else {
-                    *left = Some(store.put(&Node::single(point, value))?);
+                    *left = Some(store.put(node)?);
                 }
             }
             Ordering::Greater => {
-                if let Some(right_id) = right {
-                    let mut right = store.get(right_id)?;
-                    right.insert_no_balance(right_id, point, value, rank, summary, store)?;
+                if let Some((right_id, mut right)) = store.get_opt_with_id(&right)? {
+                    right.insert_no_balance(&right_id, node, store)?;
                 } else {
-                    *right = Some(store.put(&Node::single(point, value))?);
+                    *right = Some(store.put(node)?);
                 }
             }
             Ordering::Equal => {
                 panic!("Duplicate keys not supported in insert_no_balance");
             }
         }
-        *parent_summary = parent_summary.combine(summary);
+        *parent_summary = parent_summary.combine(&node.summary);
         store.update(self_id, self)?;
         Ok(())
     }

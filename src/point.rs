@@ -1,4 +1,5 @@
 use crate::{KeyParams, SortOrder};
+use redb::Key;
 use serde::Serialize;
 use std::{cmp::Ordering, fmt::Debug};
 
@@ -40,6 +41,12 @@ impl<K: KeyParams> Clone for XYZ<K> {
 impl<K: KeyParams> From<Point<K>> for XYZ<K> {
     fn from(p: Point<K>) -> Self {
         XYZ(p)
+    }
+}
+
+impl<K: KeyParams> From<XYZ<K>> for Point<K> {
+    fn from(p: XYZ<K>) -> Self {
+        p.0
     }
 }
 
