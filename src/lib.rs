@@ -741,6 +741,133 @@ impl<P: TreeParams> Node<P> {
         self.insert0(&store.put(self)?, &node, store)
     }
 
+    fn insert_iter(
+        mut root_id: Option<NodeId>,
+        mut x: Node<P>,
+        x_id: NodeId,
+        store: &mut impl Store<P>,
+    ) -> Result<NodeId> {
+        #[derive(Debug, Clone, PartialEq, Eq, Copy)]
+        enum Rel {
+            Left,
+            Right,
+        }
+        use Rel::*;
+        let key = x.key.clone();
+        let rank = x.rank;
+        let cmp_new = |x: &Point<P>| {
+            let key_cmp = x.cmp_at_rank(&key, rank);
+            match key_cmp {
+                Ordering::Less => Left,
+                Ordering::Greater => Right,
+                Ordering::Equal => unreachable!(),
+            }
+        };
+        let mut curr_id = root_id;
+        let mut prev_id = None;
+        let mut prev = None;
+        // find the correct place to insert the new node
+        let mut rel = Right;
+        // while cur != null and (rank < cur.rank or (rank = cur.rank and key > cur.key)) do
+        //   prev ← cur
+        //   cur ← if key < cur.key then cur.left else cur.right
+        while let Some(curr) = store.get_opt(&curr_id)? {
+            rel = cmp_new(&curr.key);
+            if rank < curr.rank || rank == curr.rank && rel == Left {
+                prev_id = curr_id;
+                curr_id = match rel {
+                    Left => curr.left,
+                    Right => curr.right,
+                };
+                prev = Some(curr);
+            } else {
+                break;
+            }
+        }
+        // if cur = root then root ← x
+        //   else if key < prev.key then prev.left ← x
+        //   else prev.right ← x
+        if curr_id == root_id {
+            root_id = Some(x_id);
+        } else {
+            let prev_id = prev_id.expect("prev_id is None");
+            let mut prev = prev.expect("prev is None");
+            match rel {
+                Left => prev.left = Some(x_id),
+                Right => prev.right = Some(x_id),
+            }
+            store.update(&prev_id, &prev)?;
+        }
+        // if cur = null then {x.left ← x.right ← null; return}
+        if curr_id.is_none() {
+            return Ok(x_id);
+        }
+        // if key < cur .key then x.right ← cur else x.left ← cur
+        match rel {
+            Left => x.left = curr_id,
+            Right => x.right = curr_id,
+        }
+        store.update(&x_id, &x)?;
+        // prev ← x
+        prev_id = Some(x_id);
+        // while cur 6= null do
+        //   fix ← prev
+        //   if cur .key < key then
+        //     repeat {prev ← cur ; cur ← cur .right}
+        //     until cur = null or cur .key > key
+        //   else
+        //     repeat {prev ← cur ; cur ← cur .left}
+        //     until cur = null or cur .key < key
+        //   if fix.key > key or (fix = x and prev.key > key) then
+        //     fix.left ← cur
+        //   else
+        //     fix.right ← cur
+        while curr_id.is_some() {
+            let fix_id = prev_id.unwrap();
+            let mut fix = store.get(&fix_id)?;
+            let mut curr = store.get(&curr_id.unwrap())?;
+            let mut prev;
+            match cmp_new(&curr.key) {
+                Left => loop {
+                    prev_id = curr_id;
+                    curr_id = curr.right;
+                    prev = curr;
+                    match store.get_opt(&curr_id)? {
+                        Some(x) => {
+                            curr = x;
+                            if cmp_new(&curr.key) == Right {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                },
+                Right => loop {
+                    prev_id = curr_id;
+                    curr_id = curr.left;
+                    prev = curr;
+                    match store.get_opt(&curr_id)? {
+                        Some(x) => {
+                            curr = x;
+                            if cmp_new(&curr.key) == Left {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                },
+            }
+            let cmp = cmp_new(&fix.key);
+            if cmp == Right || ((fix_id == x_id) && cmp_new(&prev.key) == Right) {
+                fix.left = curr_id;
+            } else {
+                fix.right = curr_id;
+            }
+            store.update(&fix_id, &fix)?;
+        }
+        Ok(root_id.unwrap())
+    }
+
     fn insert0(
         &mut self,
         self_id: &NodeId,
@@ -748,62 +875,74 @@ impl<P: TreeParams> Node<P> {
         store: &mut impl Store<P>,
     ) -> Result<Option<P::V>> {
         assert!(node.is_leaf());
-        let cmp = node.key.cmp_at_rank(&self.key, self.rank);
-        if cmp == Ordering::Equal {
-            let mut summary = node.summary.clone();
-            if let Some(left) = store.get_opt(&self.left)? {
-                summary = summary.combine(&left.summary);
-            }
-            if let Some(right) = store.get_opt(&self.right)? {
-                summary = summary.combine(&right.summary);
-            }
-            // just replace the value and update the summary
-            let old_value = self.value.clone();
-            self.value = node.value.clone();
-            self.summary = summary;
-            store.update(self_id, self)?;
-            return Ok(Some(old_value));
-        }
-        if node.rank < self.rank {
-            // node is below us, so we can just let it fall down
-            let old_value = match cmp {
-                Ordering::Less => {
-                    if let Some((id, mut child)) = store.get_opt_with_id(&self.left)? {
-                        child.insert0(&id, node, store)?
-                    } else {
-                        self.left = Some(store.put(node)?);
-                        None
-                    }
-                }
-                Ordering::Greater => {
-                    if let Some((id, mut child)) = store.get_opt_with_id(&self.right)? {
-                        child.insert0(&id, node, store)?
-                    } else {
-                        self.right = Some(store.put(node)?);
-                        None
-                    }
-                }
-                Ordering::Equal => unreachable!(),
-            };
-            self.summary = if old_value.is_none() {
-                // just add to the summary
-                self.summary.combine(&node.summary)
-            } else {
-                // recalculate the summary from scratch
-                let mut summary = P::M::lift((self.key.clone(), self.value.clone()));
+        let key_cmp = node.key.cmp_at_rank(&self.key, self.rank);
+        let rank_cmp = node.rank.cmp(&self.rank);
+        let old_value = match key_cmp {
+            Ordering::Equal => {
+                // equal ordering means equal rank, since the rank is deterministically derived from the key
+                assert!(rank_cmp == Ordering::Equal);
+                let mut summary = node.summary.clone();
                 if let Some(left) = store.get_opt(&self.left)? {
                     summary = summary.combine(&left.summary);
                 }
                 if let Some(right) = store.get_opt(&self.right)? {
                     summary = summary.combine(&right.summary);
                 }
-                summary
-            };
-            store.update(self_id, self)?;
-            return Ok(old_value);
+                // just replace the value and update the summary
+                let old_value = self.value.clone();
+                self.value = node.value.clone();
+                self.summary = summary;
+                store.update(self_id, self)?;
+                return Ok(Some(old_value));
+            }
+            Ordering::Less => {
+                if let Some((id, mut child)) = store.get_opt_with_id(&self.left)? {
+                    if rank_cmp == Ordering::Less {
+                        child.insert0(&id, node, store)?
+                    } else {
+                        // node will be the new parent
+                        // my right child will be the right child of the node
+                        // my left child will be the left child of the node
+                        todo!()
+                    }
+                } else {
+                    self.left = Some(store.put(&node)?);
+                    None
+                }
+            }
+            Ordering::Greater => {
+                if let Some((id, mut child)) = store.get_opt_with_id(&self.right)? {
+                    if rank_cmp == Ordering::Greater || rank_cmp == Ordering::Equal {
+                        child.insert0(&id, node, store)?
+                    } else {
+                        todo!()
+                    }
+                } else {
+                    self.right = Some(store.put(&node)?);
+                    None
+                }
+            }
+        };
+        self.summary = if old_value.is_none() {
+            // just add to the summary
+            self.summary.combine(&node.summary)
         } else {
-            todo!()
-        }
+            // recalculate the summary from scratch
+            let mut summary = P::M::lift((self.key.clone(), self.value.clone()));
+            if let Some(left) = store.get_opt(&self.left)? {
+                summary = summary.combine(&left.summary);
+            }
+            if let Some(right) = store.get_opt(&self.right)? {
+                summary = summary.combine(&right.summary);
+            }
+            summary
+        };
+        store.update(self_id, self)?;
+        Ok(old_value)
+    }
+
+    fn unzip0(&mut self, key: Point<P>, rank: u8) -> Result<(Option<NodeId>, Option<NodeId>)> {
+        todo!()
     }
 
     pub fn get(&self, key: Point<P>, store: &impl Store<P>) -> Result<Option<P::V>> {
