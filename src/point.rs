@@ -8,9 +8,9 @@ use std::{cmp::Ordering, fmt::Debug};
 /// orderings that are equally valid.
 #[derive(Serialize)]
 pub struct Point<K: KeyParams> {
-    pub x: K::X,
-    pub y: K::Y,
-    pub z: K::Z,
+    pub x: K::X, // fixed size
+    pub y: K::Y, // fixed size
+    pub z: K::Z, // variable size
 }
 
 impl<K: KeyParams> std::fmt::Debug for Point<K> {

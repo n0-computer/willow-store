@@ -6,7 +6,7 @@ use test_strategy::proptest;
 use testresult::TestResult;
 use willow_store::{
     FixedSize, KeyParams, LiftingCommutativeMonoid, MemStore, Node, NodeData, Point, QueryRange,
-    QueryRange3d, SortOrder, Store, TreeParams, VariableSize,
+    QueryRange3d, SortOrder, Store, StoreExt, TreeParams, VariableSize,
 };
 
 type TPoint = Point<TestParams>;
@@ -165,7 +165,7 @@ fn tree_query_ordered_impl(
     ordering: SortOrder,
 ) -> TestResult<()> {
     let (store, id) = willow_store::NodeData::from_iter(items.clone())?;
-    let tree = store.data(&id)?;
+    let tree: NodeData<TestParams> = store.data(&id)?;
     let actual = tree
         .query_ordered(&query, ordering, &store)
         .map(|x| x.unwrap())
