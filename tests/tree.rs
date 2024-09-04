@@ -235,14 +235,12 @@ fn tree_get_impl(items: Vec<(TPoint, u64)>) -> TestResult<()> {
 
 fn tree_insert_replace_impl(items: Vec<(TPoint, u64)>) -> TestResult<()> {
     let (mut store, id) = willow_store::NodeData::from_iter(items.clone())?;
-    let mut tree = Node {
-        id,
-        data: store.get(&id)?,
-    };
+    let mut tree = store.get_node_opt(&Some(id))?.unwrap();
     for (k, v) in &items {
         let new_v = v + 1;
-        tree.insert(k.clone(), new_v, &mut store)?;
+        tree.replace(k.clone(), new_v, &mut store)?;
     }
+    tree.assert_invariants(&store)?;
     Ok(())
 }
 

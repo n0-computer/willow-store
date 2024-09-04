@@ -129,9 +129,17 @@ pub trait CoordParams: Ord + PartialEq + Eq + Serialize + Clone + Debug + Displa
 
 impl<T: Ord + PartialEq + Eq + Serialize + Clone + Debug + Display> CoordParams for T {}
 
+pub trait FixedSize {
+    const SIZE: usize;
+}
+
+impl FixedSize for u64 {
+    const SIZE: usize = 8;
+}
+
 pub trait KeyParams {
-    type X: CoordParams;
-    type Y: CoordParams;
+    type X: CoordParams + FixedSize;
+    type Y: CoordParams + FixedSize;
     type Z: CoordParams;
 }
 
@@ -560,6 +568,11 @@ pub trait Store<P: TreeParams> {
     fn update(&mut self, id: &NodeId, node: &NodeData<P>) -> Result<()>;
     fn get(&self, id: &NodeId) -> Result<NodeData<P>>;
 
+    fn put_node(&mut self, data: NodeData<P>) -> Result<Node<P>> {
+        let id = self.put(&data)?;
+        Ok(Node { id, data })
+    }
+
     /// Get a node by id, returning None if the id is None.
     ///
     /// This is just a convenience method for the common case where you have an
@@ -573,7 +586,7 @@ pub trait Store<P: TreeParams> {
 
     /// Get a node by id, returning None if the id is None.
     /// Also return the id along with the node.
-    fn get_opt_with_id(&self, id: &Option<NodeId>) -> Result<Option<Node<P>>> {
+    fn get_node_opt(&self, id: &Option<NodeId>) -> Result<Option<Node<P>>> {
         match id {
             Some(id) => {
                 let node = self.get(id)?;
@@ -622,7 +635,8 @@ impl<P: TreeParams> Store<P> for MemStore<P> {
 pub type NodeId = NonZeroU64;
 
 /// Data for a node in the tree.
-/// This gets persisted as a single &[u8] in the database.
+/// This gets persisted as a single &[u8] in the database, using a [`NodeId`]
+/// as key. However, NodeData can exist in memory without a NodeId.
 ///
 /// TODO:
 /// - Use some zero copy stuff to make this more efficient.
@@ -650,6 +664,10 @@ impl<P: TreeParams> Clone for NodeData<P> {
 }
 
 /// A node combines node data with a node id.
+///
+/// When modifying a node, the id should not be modified. After a modification,
+/// the node should be updated in the store, otherwise there will be horrible
+/// inconsistencies.
 pub struct Node<P: TreeParams> {
     pub id: NodeId,
     pub data: NodeData<P>,
@@ -889,9 +907,8 @@ impl<P: TreeParams> NodeData<P> {
     }
 
     fn insert_iterative(
-        mut root_id: Option<NodeId>,
-        mut x: NodeData<P>,
-        x_id: NodeId,
+        mut root_opt: Option<Node<P>>,
+        mut x: Node<P>,
         store: &mut impl Store<P>,
     ) -> Result<NodeId> {
         #[derive(Debug, Clone, PartialEq, Eq, Copy)]
@@ -910,23 +927,19 @@ impl<P: TreeParams> NodeData<P> {
                 Ordering::Equal => unreachable!(),
             }
         };
-        let mut curr_id = root_id;
-        let mut prev_id = None;
-        let mut prev = None;
-        // find the correct place to insert the new node
-        let mut rel = Right;
+        let mut prev_opt = None;
+        let mut curr_opt = root_opt.clone();
         // while cur != null and (rank < cur.rank or (rank = cur.rank and key > cur.key)) do
         //   prev ← cur
         //   cur ← if key < cur.key then cur.left else cur.right
-        while let Some(curr) = store.get_opt(&curr_id)? {
-            rel = cmp_new(&curr.key);
+        while let Some(curr) = curr_opt.clone() {
+            let rel = cmp_new(&curr.key);
             if rank < curr.rank || rank == curr.rank && rel == Left {
-                prev_id = curr_id;
-                curr_id = match rel {
-                    Left => curr.left,
-                    Right => curr.right,
+                prev_opt = Some(curr.clone());
+                curr_opt = match rel {
+                    Left => store.get_node_opt(&curr.left)?,
+                    Right => store.get_node_opt(&curr.right)?,
                 };
-                prev = Some(curr);
             } else {
                 break;
             }
@@ -934,29 +947,29 @@ impl<P: TreeParams> NodeData<P> {
         // if cur = root then root ← x
         //   else if key < prev.key then prev.left ← x
         //   else prev.right ← x
-        if curr_id == root_id {
-            root_id = Some(x_id);
+        if same_node(&curr_opt, &root_opt) {
+            root_opt = Some(x.clone());
         } else {
-            let prev_id = prev_id.expect("prev_id is None");
-            let mut prev = prev.expect("prev is None");
-            match rel {
-                Left => prev.left = Some(x_id),
-                Right => prev.right = Some(x_id),
+            let mut prev = prev_opt.clone().expect("prev_opt is None");
+            match cmp_new(&prev.key) {
+                Left => prev.left = Some(x.id),
+                Right => prev.right = Some(x.id),
             }
-            store.update(&prev_id, &prev)?;
+            store.update(&prev.id, &prev)?;
         }
         // if cur = null then {x.left ← x.right ← null; return}
-        if curr_id.is_none() {
-            return Ok(x_id);
+        if curr_opt.is_none() {
+            return Ok(x.id);
         }
+        let curr = curr_opt.clone().expect("curr_opt is None");
         // if key < cur.key then x.right ← cur else x.left ← cur
-        match rel {
-            Left => x.right = curr_id,
-            Right => x.left = curr_id,
+        match cmp_new(&curr.key) {
+            Left => x.right = Some(curr.id),
+            Right => x.left = Some(curr.id),
         }
-        store.update(&x_id, &x)?;
+        store.update(&x.id, &x)?;
         // prev ← x
-        prev_id = Some(x_id);
+        prev_opt = Some(x.clone());
         // while cur 6= null do
         //   fix ← prev
         //   if cur .key < key then
@@ -969,19 +982,15 @@ impl<P: TreeParams> NodeData<P> {
         //     fix.left ← cur
         //   else
         //     fix.right ← cur
-        while curr_id.is_some() {
-            let fix_id = prev_id.unwrap();
-            let mut fix = store.get(&fix_id)?;
-            let mut curr = store.get(&curr_id.unwrap())?;
+        while let Some(curr) = curr_opt {
+            let mut fix = prev_opt.clone().unwrap();
             let mut prev;
             match cmp_new(&curr.key) {
                 Left => loop {
-                    prev_id = curr_id;
-                    curr_id = curr.right;
-                    prev = curr;
-                    match store.get_opt(&curr_id)? {
-                        Some(x) => {
-                            curr = x;
+                    prev = curr.clone();
+                    curr_opt = store.get_node_opt(&curr.right)?;
+                    match &curr_opt {
+                        Some(curr) => {
                             if cmp_new(&curr.key) == Right {
                                 break;
                             }
@@ -990,12 +999,10 @@ impl<P: TreeParams> NodeData<P> {
                     }
                 },
                 Right => loop {
-                    prev_id = curr_id;
-                    curr_id = curr.left;
-                    prev = curr;
-                    match store.get_opt(&curr_id)? {
-                        Some(x) => {
-                            curr = x;
+                    prev = curr.clone();
+                    curr_opt = store.get_node_opt(&curr.left)?;
+                    match &curr_opt {
+                        Some(curr) => {
                             if cmp_new(&curr.key) == Left {
                                 break;
                             }
@@ -1005,14 +1012,14 @@ impl<P: TreeParams> NodeData<P> {
                 },
             }
             let cmp = cmp_new(&fix.key);
-            if cmp == Right || ((fix_id == x_id) && cmp_new(&prev.key) == Right) {
-                fix.left = curr_id;
+            if cmp == Right || ((fix.id == x.id) && cmp_new(&prev.key) == Right) {
+                fix.left = Some(curr.id);
             } else {
-                fix.right = curr_id;
+                fix.right = Some(curr.id);
             }
-            store.update(&fix_id, &fix)?;
+            store.update(&fix.id, &fix)?;
         }
-        Ok(root_id.unwrap())
+        Ok(root_opt.unwrap().id)
     }
 
     pub fn get(&self, key: Point<P>, store: &impl Store<P>) -> Result<Option<P::V>> {
@@ -1062,11 +1069,7 @@ impl<P: TreeParams> NodeData<P> {
         });
         let mut store = MemStore::new();
         let root_data = nodes.remove(0);
-        let root_id = store.put(&root_data)?;
-        let mut root = Node {
-            id: root_id,
-            data: root_data,
-        };
+        let mut root = store.put_node(root_data)?;
         for node in nodes {
             let node = Node {
                 id: store.put(&node)?,
@@ -1074,7 +1077,7 @@ impl<P: TreeParams> NodeData<P> {
             };
             root.insert_no_balance(&node, &mut store)?;
         }
-        Ok((store, root_id))
+        Ok((store, root.id))
     }
 
     pub fn dump(&self, store: &impl Store<P>) -> Result<()> {
@@ -1184,14 +1187,14 @@ impl<P: TreeParams> Node<P> {
         } = self;
         match node.key.cmp_at_rank(parent_key, *parent_rank) {
             Ordering::Less => {
-                if let Some(mut left) = store.get_opt_with_id(&left)? {
+                if let Some(mut left) = store.get_node_opt(&left)? {
                     left.insert_no_balance(node, store)?;
                 } else {
                     *left = Some(store.put(node)?);
                 }
             }
             Ordering::Greater => {
-                if let Some(mut right) = store.get_opt_with_id(&right)? {
+                if let Some(mut right) = store.get_node_opt(&right)? {
                     right.insert_no_balance(node, store)?;
                 } else {
                     *right = Some(store.put(node)?);
@@ -1206,15 +1209,68 @@ impl<P: TreeParams> Node<P> {
         Ok(())
     }
 
+    /// Replace the value of a node in the tree and update the summary.
+    ///
+    /// Returns the old value. If the key is not found, returns None and does
+    /// not modify the tree.
+    pub fn replace(
+        &mut self,
+        key: Point<P>,
+        value: P::V,
+        store: &mut impl Store<P>,
+    ) -> Result<Option<P::V>> {
+        let node = NodeData::single(key, value);
+        let old_value = self.replace0(&node, store)?;
+        Ok(old_value)
+    }
+
+    fn replace0(&mut self, node: &NodeData<P>, store: &mut impl Store<P>) -> Result<Option<P::V>> {
+        assert!(node.is_leaf());
+        let key_cmp = node.key.cmp_at_rank(&self.key, self.rank);
+        let old_value = match key_cmp {
+            Ordering::Equal => {
+                // just replace the value and update the summary
+                let old_value = self.value.clone();
+                self.value = node.value.clone();
+                Some(old_value)
+            }
+            Ordering::Less => {
+                if let Some(mut left) = store.get_node_opt(&self.left)? {
+                    left.replace0(node, store)?
+                } else {
+                    None
+                }
+            }
+            Ordering::Greater => {
+                if let Some(mut right) = store.get_node_opt(&self.right)? {
+                    right.replace0(node, store)?
+                } else {
+                    None
+                }
+            }
+        };
+        if old_value.is_some() {
+            // recalculate the summary from scratch
+            let mut summary = P::M::lift((self.key.clone(), self.value.clone()));
+            if let Some(left) = store.get_opt(&self.left)? {
+                summary = summary.combine(&left.summary);
+            }
+            if let Some(right) = store.get_opt(&self.right)? {
+                summary = summary.combine(&right.summary);
+            }
+            self.summary = summary;
+            store.update(&self.id, &self.data)?;
+        };
+        Ok(old_value)
+    }
+
     pub fn insert(
         &mut self,
         key: Point<P>,
         value: P::V,
         store: &mut impl Store<P>,
     ) -> Result<Option<P::V>> {
-        let data = NodeData::single(key, value);
-        let id = store.put(&data)?;
-        let node = Self { id, data };
+        let node = store.put_node(NodeData::single(key, value))?;
         self.insert0(&node, store)
     }
 
@@ -1241,7 +1297,7 @@ impl<P: TreeParams> Node<P> {
                 return Ok(Some(old_value));
             }
             Ordering::Less => {
-                if let Some(mut left) = store.get_opt_with_id(&self.left)? {
+                if let Some(mut left) = store.get_node_opt(&self.left)? {
                     if rank_cmp == Ordering::Less {
                         left.insert0(node, store)?
                     } else {
@@ -1256,7 +1312,7 @@ impl<P: TreeParams> Node<P> {
                 }
             }
             Ordering::Greater => {
-                if let Some(mut right) = store.get_opt_with_id(&self.right)? {
+                if let Some(mut right) = store.get_node_opt(&self.right)? {
                     if rank_cmp == Ordering::Greater || rank_cmp == Ordering::Equal {
                         right.insert0(node, store)?
                     } else {
@@ -1389,5 +1445,13 @@ impl From<u8> for SortOrder {
             0 => SortOrder::ZXY,
             _ => unreachable!(),
         }
+    }
+}
+
+fn same_node<P: TreeParams>(a: &Option<Node<P>>, b: &Option<Node<P>>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => a.id == b.id,
+        (None, None) => true,
+        _ => false,
     }
 }
