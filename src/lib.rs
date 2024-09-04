@@ -1,17 +1,101 @@
+//! A db backed kd tree for k=3.
+//!
+//! Original idea from [Aljoscha Meyer] in [kv_3d_storage].
+//!
+//! This data structure combines the idea of a [kd tree] with a [zip tree].
+//! Each node is assigned an u8 rank based on the key. The rank should be
+//! drawn from a geometric distribution with p = 0.5. We use the number
+//! of trailing zeros in the blake3 hash of the key to determine the rank.
+//!
+//! To turn the zip tree into a kd tree, the partitioning for each node is
+//! alternated based on the rank (xyz, yzx, zxy). See the [`SortOrder`] enum
+//! for the exact mapping.
+//!
+//! Due to the random distribution of the ranks, this will provide partitioning
+//! in all three dimensions. Very frequently, you should get alternating
+//! dimensions so that every 3 levels you partition all 3 dimensions. However,
+//! unlike in a traditional kd tree, this can not be relied on.
+//!
+//! # Summaries
+//!
+//! In addition to key and value, each node also stores a summary. The summary
+//! can be computed (lifted) from an individual element, and summaries can be
+//! combined.
+//!
+//! The combine operation together with a zero element must form a commutative
+//! monoid. The rules for computing summaries are currently encoded in the
+//! [`LiftingCommutativeMonoid`] trait.
+//!
+//! For a leaf node, the summary is just the lifted value. For a branch node
+//! the summary is the summary of the optional left and right child and the
+//! value.
+//!
+//! # Operations
+//!
+//! ## Iteratiion over elements in a box
+//!
+//! A kd tree supports efficient queries for *boxes* or 3d ranges in 3D space.
+//! This is one of the main motivations for using a 3d tree. Point queries would
+//! be possible with a simpler data structure.
+//!
+//! ## Sorted iteration over elements in a box
+//!
+//! Elements in the tree are alternately partitioned by the three sort orders.
+//! While the elements are not strictly sorted along any of the three sort
+//! orders, the partitioning allows for an efficient merge sort like
+//! implementation of sorted iteration by any of the three sort orders.
+//!
+//! ## Summary of elements in a box
+//!
+//! The second main motivation for using a 3d tree is the ability to quickly
+//! compute summaries of elements in a box. Each node has a bounding box for
+//! which it is responsible. If the bounding box is fully contained in the query
+//! box, the summary of the node can be used without further recursing into the
+//! children.
+//!
+//! ## Insertion
+//!
+//! Insertion works like in a zip tree, except that the ordering to be used is
+//! alternated based on the rank.
+//!
+//! ### Insertion algorithm
+//!
+//! TLDR for the insertion algorithm: For a new node to be inserted, You first
+//! perform a normal binary search until you find the insertion location.
+//! Everything above the insertion point can remain the same. The tree below
+//! the insertion point needs to be unzipped into two separate trees that become
+//! the left and right child of the new node.
+//!
+//! The insertion algorithm is as follows:
+//!
+//! Find the insertion point by binary search.
+//!
+//! Below the insertion point, a node to the *left* of the new value needs to be
+//! fixed if its *right* child is to the right of the new value. To find a
+//! node to be fixed, just follow right children until you either reach a leaf
+//! node or a node that is to the right of the new value. The predecessor of
+//! that node is a node to be fixed later, and the node itself is the new right
+//! child of a node to be fixed on the right side.
+//!
+//! For nodes to the *right* of the new value, the same is done in reverse.
+//!
+//! The fix operation will alternate between fixing left and right of the
+//! insertion point until it reaches a leaf.
+//!
+//! [zip tree]: https://arxiv.org/pdf/1806.06726
+//! [kd tree]: https://dl.acm.org/doi/pdf/10.1145/361002.361007
+//! [Aljoscha Meyer]: https://aljoscha-meyer.de/
+//! [kv_3d_storage]: https://github.com/AljoschaMeyer/kv_3d_storage/blob/d311cdee31ce7f5b5f50f9798507b958fe0f887b/src/lib.rs
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     fmt::{Debug, Display},
-    future::Future,
-    iter,
     num::NonZeroU64,
-    ops::RangeBounds,
 };
 
 use anyhow::Result;
 use genawaiter::sync::{Co, Gen};
 use point::{XYZ, YZX, ZXY};
-use redb::Key;
 use serde::Serialize;
 
 mod point;
@@ -516,12 +600,12 @@ impl<P: TreeParams> Store<P> for MemStore<P> {
 pub type NodeId = NonZeroU64;
 
 pub struct Node<P: TreeParams> {
-    key: Point<P>,
-    rank: u8,
-    value: P::V,
-    summary: P::M,
-    left: Option<NodeId>,
-    right: Option<NodeId>,
+    key: Point<P>,         // variable size due to path
+    rank: u8,              // 1 byte
+    value: P::V,           // fixed size
+    summary: P::M,         // fixed size
+    left: Option<NodeId>,  // 8 bytes
+    right: Option<NodeId>, // 8 bytes
 }
 
 impl<P: TreeParams> Clone for Node<P> {
@@ -741,7 +825,7 @@ impl<P: TreeParams> Node<P> {
         self.insert0(&store.put(self)?, &node, store)
     }
 
-    fn insert_iter(
+    fn insert_iterative(
         mut root_id: Option<NodeId>,
         mut x: Node<P>,
         x_id: NodeId,
@@ -802,10 +886,10 @@ impl<P: TreeParams> Node<P> {
         if curr_id.is_none() {
             return Ok(x_id);
         }
-        // if key < cur .key then x.right ← cur else x.left ← cur
+        // if key < cur.key then x.right ← cur else x.left ← cur
         match rel {
-            Left => x.left = curr_id,
-            Right => x.right = curr_id,
+            Left => x.right = curr_id,
+            Right => x.left = curr_id,
         }
         store.update(&x_id, &x)?;
         // prev ← x
@@ -939,10 +1023,6 @@ impl<P: TreeParams> Node<P> {
         };
         store.update(self_id, self)?;
         Ok(old_value)
-    }
-
-    fn unzip0(&mut self, key: Point<P>, rank: u8) -> Result<(Option<NodeId>, Option<NodeId>)> {
-        todo!()
     }
 
     pub fn get(&self, key: Point<P>, store: &impl Store<P>) -> Result<Option<P::V>> {
