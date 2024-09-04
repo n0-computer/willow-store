@@ -5,7 +5,7 @@ use proptest::prelude::*;
 use test_strategy::proptest;
 use testresult::TestResult;
 use willow_store::{
-    KeyParams, LiftingCommutativeMonoid, Point, QueryRange, QueryRange3d, SortOrder, Store,
+    KeyParams, LiftingCommutativeMonoid, Node, Point, QueryRange, QueryRange3d, SortOrder, Store,
     TreeParams,
 };
 
@@ -235,7 +235,10 @@ fn tree_get_impl(items: Vec<(TPoint, u64)>) -> TestResult<()> {
 
 fn tree_insert_replace_impl(items: Vec<(TPoint, u64)>) -> TestResult<()> {
     let (mut store, id) = willow_store::NodeData::from_iter(items.clone())?;
-    let mut tree = store.get(&id)?;
+    let mut tree = Node {
+        id,
+        data: store.get(&id)?,
+    };
     for (k, v) in &items {
         let new_v = v + 1;
         tree.insert(k.clone(), new_v, &mut store)?;
