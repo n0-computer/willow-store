@@ -5,8 +5,8 @@ use proptest::prelude::*;
 use test_strategy::proptest;
 use testresult::TestResult;
 use willow_store::{
-    KeyParams, LiftingCommutativeMonoid, Node, Point, QueryRange, QueryRange3d, SortOrder, Store,
-    TreeParams,
+    FixedSize, KeyParams, LiftingCommutativeMonoid, MemStore, Node, NodeData, Point, QueryRange,
+    QueryRange3d, SortOrder, Store, TreeParams, VariableSize,
 };
 
 type TPoint = Point<TestParams>;
@@ -28,6 +28,16 @@ impl TreeParams for TestParams {
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct ValueSum(u64);
+
+impl FixedSize for ValueSum {
+    const SIZE: usize = 8;
+    fn read(buf: &[u8]) -> Self {
+        ValueSum(u64::from_le_bytes(buf.try_into().unwrap()))
+    }
+    fn write(&self, buf: &mut [u8]) {
+        buf.copy_from_slice(&self.0.to_le_bytes());
+    }
+}
 
 impl LiftingCommutativeMonoid<(Point<TestParams>, u64)> for ValueSum {
     fn zero() -> Self {
@@ -95,14 +105,10 @@ fn query() -> impl Strategy<Value = TQuery> {
 /// and contain all the points that were inserted.
 fn tree_creation_impl(items: Vec<(TPoint, u64)>) -> TestResult<()> {
     let (store, id) = willow_store::NodeData::from_iter(items.clone())?;
-    let tree = store.get(&id)?;
+    let tree = store.get_node(&id)?;
     // tree.dump(&store)?;
     tree.assert_invariants(&store)?;
-    let mut actual = tree
-        .iter_unordered(&store)
-        .into_iter()
-        .map(|x| x.unwrap())
-        .collect::<Vec<_>>();
+    let mut actual = tree.iter(&store).map(|x| x.unwrap()).collect::<Vec<_>>();
     let mut expected = items;
     actual.sort_by_key(|(p, _)| p.clone().xyz());
     expected.sort_by_key(|(p, _)| p.clone().xyz());
@@ -129,10 +135,9 @@ fn test_tree_creation() -> TestResult<()> {
 /// This is tested by comparing with a brute-force implementation.
 fn tree_query_unordered_impl(items: Vec<(TPoint, u64)>, query: TQuery) -> TestResult<()> {
     let (store, id) = willow_store::NodeData::from_iter(items.clone())?;
-    let tree = store.get(&id)?;
+    let tree = store.get_node(&id)?;
     let mut actual = tree
-        .query_unordered(&query, &store)
-        .into_iter()
+        .query(&query, &store)
         .map(|x| x.unwrap())
         .collect::<Vec<_>>();
     let mut expected = items
@@ -160,10 +165,9 @@ fn tree_query_ordered_impl(
     ordering: SortOrder,
 ) -> TestResult<()> {
     let (store, id) = willow_store::NodeData::from_iter(items.clone())?;
-    let tree = store.get(&id)?;
+    let tree = store.data(&id)?;
     let actual = tree
         .query_ordered(&query, ordering, &store)
-        .into_iter()
         .map(|x| x.unwrap())
         .collect::<Vec<_>>();
     let mut expected = items
@@ -184,7 +188,7 @@ fn tree_query_ordered_impl(
 /// This is tested by comparing with a brute-force implementation.
 fn tree_summary_impl(items: Vec<(TPoint, u64)>, query: TQuery) -> TestResult<()> {
     let (store, id) = willow_store::NodeData::from_iter(items.clone())?;
-    let tree = store.get(&id)?;
+    let tree = store.get_node(&id)?;
     let actual = tree.summary(&query, &store)?;
     let mut expected = ValueSum::zero();
     for (key, value) in &items {
@@ -202,7 +206,7 @@ fn tree_get_impl(items: Vec<(TPoint, u64)>) -> TestResult<()> {
         .iter()
         .map(|(k, _)| k.clone().xyz())
         .collect::<BTreeSet<_>>();
-    let tree = store.get(&id)?;
+    let tree = store.get_node(&id)?;
     // Compute a set of interesting points that are not in the tree.
     let mut non_keys = BTreeSet::new();
     let mut insert = |p: &TPoint| {
@@ -233,14 +237,29 @@ fn tree_get_impl(items: Vec<(TPoint, u64)>) -> TestResult<()> {
     Ok(())
 }
 
-fn tree_insert_replace_impl(items: Vec<(TPoint, u64)>) -> TestResult<()> {
+fn tree_update_impl(items: Vec<(TPoint, u64)>) -> TestResult<()> {
     let (mut store, id) = willow_store::NodeData::from_iter(items.clone())?;
-    let mut tree = store.get_node_opt(&Some(id))?.unwrap();
+    let mut tree = store.get_node(&id)?;
     for (k, v) in &items {
         let new_v = v + 1;
-        tree.replace(k.clone(), new_v, &mut store)?;
+        tree.update(k.clone(), new_v, &mut store)?;
     }
     tree.assert_invariants(&store)?;
+    Ok(())
+}
+
+fn tree_insert_impl(items: Vec<(TPoint, u64)>) -> TestResult<()> {
+    let mut node = Node::Empty;
+    let mut store = MemStore::new();
+    for (k, v) in &items {
+        node.insert(k.clone(), *v, &mut store)?;
+        node.dump(&store)?;
+    }
+    node.assert_invariants(&store)?;
+    for (k, v) in &items {
+        let actual = node.get(k.clone(), &store)?;
+        assert_eq!(actual, Some(*v));
+    }
     Ok(())
 }
 
@@ -309,14 +328,64 @@ fn prop_tree_get(#[strategy(treecontents())] items: Vec<(TPoint, u64)>) {
 }
 
 #[proptest]
-fn prop_tree_insert_replace(#[strategy(treecontents())] items: Vec<(TPoint, u64)>) {
-    tree_insert_replace_impl(items).unwrap();
+fn prop_tree_replace(#[strategy(treecontents())] items: Vec<(TPoint, u64)>) {
+    tree_update_impl(items).unwrap();
+}
+
+#[proptest]
+fn prop_tree_insert(#[strategy(treecontents())] items: Vec<(TPoint, u64)>) {
+    tree_insert_impl(items).unwrap();
 }
 
 #[test]
-fn test_tree_insert_replace() -> TestResult<()> {
-    let items = vec![(TPoint::new(31, 28, 33), 0), (TPoint::new(43, 10, 34), 0)];
-    tree_insert_replace_impl(items)?;
+fn test_tree_insert() -> TestResult<()> {
+    let cases = vec![vec![
+        (TPoint::new(25, 43, 27), 0),
+        (TPoint::new(0, 0, 0), 0),
+    ]];
+    for items in cases {
+        tree_insert_impl(items)?;
+    }
 
+    Ok(())
+}
+
+#[test]
+fn test_tree_replace() -> TestResult<()> {
+    let items = vec![(TPoint::new(31, 28, 33), 0), (TPoint::new(43, 10, 34), 0)];
+    tree_update_impl(items)?;
+    Ok(())
+}
+
+fn key_bytes_roundtrip_impl(p: TPoint) -> TestResult<()> {
+    let bytes = p.to_vec();
+    let p2 = TPoint::read(&bytes);
+    assert_eq!(p, p2);
+    Ok(())
+}
+
+#[proptest]
+fn prop_key_bytes_roundtrip(#[strategy(point())] p: TPoint) {
+    key_bytes_roundtrip_impl(p).unwrap();
+}
+
+fn node_bytes_roundtrip_impl(p: TPoint, v: u64) -> TestResult<()> {
+    let node = NodeData::single(p.clone(), v);
+    let bytes = node.to_vec();
+    let node2 = NodeData::<TestParams>::read(&bytes);
+    assert_eq!(node, node2);
+    Ok(())
+}
+
+#[proptest]
+fn prop_node_bytes_roundtrip(#[strategy(point())] p: TPoint, v: u64) {
+    node_bytes_roundtrip_impl(p, v).unwrap();
+}
+
+#[test]
+fn test_node_bytes_roundtrip() -> TestResult<()> {
+    let p = TPoint::new(0, 0, 0);
+    let v = 0;
+    node_bytes_roundtrip_impl(p, v)?;
     Ok(())
 }

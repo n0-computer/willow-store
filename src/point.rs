@@ -1,5 +1,4 @@
-use crate::{KeyParams, SortOrder};
-use redb::Key;
+use crate::{FixedSize, KeyParams, SortOrder, VariableSize};
 use serde::Serialize;
 use std::{cmp::Ordering, fmt::Debug};
 
@@ -176,6 +175,31 @@ impl<K: KeyParams> Clone for Point<K> {
 
 impl<K: KeyParams> From<(K::X, K::Y, K::Z)> for Point<K> {
     fn from((x, y, z): (K::X, K::Y, K::Z)) -> Self {
+        Point::new(x, y, z)
+    }
+}
+
+impl<K: KeyParams> VariableSize for Point<K> {
+    fn size(&self) -> usize {
+        K::X::SIZE + K::Y::SIZE + self.z.size()
+    }
+
+    fn write(&self, buf: &mut [u8]) {
+        let x_start = 0;
+        let y_start: usize = K::X::SIZE;
+        let z_start: usize = K::X::SIZE + K::Y::SIZE;
+        self.x.write(&mut buf[x_start..y_start]);
+        self.y.write(&mut buf[y_start..z_start]);
+        self.z.write(&mut buf[z_start..]);
+    }
+
+    fn read(buf: &[u8]) -> Self {
+        let x_start = 0;
+        let y_start: usize = K::X::SIZE;
+        let z_start: usize = K::X::SIZE + K::Y::SIZE;
+        let x = K::X::read(&buf[x_start..y_start]);
+        let y = K::Y::read(&buf[y_start..z_start]);
+        let z = K::Z::read(&buf[z_start..]);
         Point::new(x, y, z)
     }
 }
