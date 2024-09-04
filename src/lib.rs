@@ -1,6 +1,8 @@
 //! A db backed kd tree for k=3.
 //!
 //! Original idea from [Aljoscha Meyer] in [kv_3d_storage].
+//! 
+//! This is intended as persistence for [willow].
 //!
 //! This data structure combines the idea of a [kd tree] with a [zip tree].
 //! Each node is assigned an u8 rank based on the key. The rank should be
@@ -81,16 +83,24 @@
 //!
 //! The fix operation will alternate between fixing left and right of the
 //! insertion point until it reaches a leaf.
+//! 
+//! # Persistence
+//! 
+//! The data structure is backed by a database, but not a persistent data
+//! structure in the functional programming sense, since nodes are modified in
+//! place for efficiency during mutation ops. For persistent snapshots, we rely
+//! on the underlying database.
 //!
 //! [zip tree]: https://arxiv.org/pdf/1806.06726
 //! [kd tree]: https://dl.acm.org/doi/pdf/10.1145/361002.361007
 //! [Aljoscha Meyer]: https://aljoscha-meyer.de/
 //! [kv_3d_storage]: https://github.com/AljoschaMeyer/kv_3d_storage/blob/d311cdee31ce7f5b5f50f9798507b958fe0f887b/src/lib.rs
+//! [willow]: https://willowprotocol.org/
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     fmt::{Debug, Display},
-    num::NonZeroU64,
+    num::NonZeroU64, ops::Deref,
 };
 
 use anyhow::Result;
@@ -537,15 +547,15 @@ pub trait TreeParams: KeyParams + Sized {
 
 /// A simple store trait for storing nodes by id.
 pub trait Store<P: TreeParams> {
-    fn put(&mut self, node: &Node<P>) -> Result<NodeId>;
-    fn update(&mut self, id: &NodeId, node: &Node<P>) -> Result<()>;
-    fn get(&self, id: &NodeId) -> Result<Node<P>>;
+    fn put(&mut self, node: &NodeData<P>) -> Result<NodeId>;
+    fn update(&mut self, id: &NodeId, node: &NodeData<P>) -> Result<()>;
+    fn get(&self, id: &NodeId) -> Result<NodeData<P>>;
 
     /// Get a node by id, returning None if the id is None.
     ///
     /// This is just a convenience method for the common case where you have an
     /// optional id and want to get the node if it exists.
-    fn get_opt(&self, id: &Option<NodeId>) -> Result<Option<Node<P>>> {
+    fn get_opt(&self, id: &Option<NodeId>) -> Result<Option<NodeData<P>>> {
         match id {
             Some(id) => Ok(Some(self.get(id)?)),
             None => Ok(None),
@@ -554,7 +564,7 @@ pub trait Store<P: TreeParams> {
 
     /// Get a node by id, returning None if the id is None.
     /// Also return the id along with the node.
-    fn get_opt_with_id(&self, id: &Option<NodeId>) -> Result<Option<(NodeId, Node<P>)>> {
+    fn get_opt_with_id(&self, id: &Option<NodeId>) -> Result<Option<(NodeId, NodeData<P>)>> {
         match id {
             Some(id) => {
                 let node = self.get(id)?;
@@ -566,7 +576,7 @@ pub trait Store<P: TreeParams> {
 }
 
 pub struct MemStore<P: TreeParams> {
-    nodes: BTreeMap<NodeId, Node<P>>,
+    nodes: BTreeMap<NodeId, NodeData<P>>,
 }
 
 impl<P: TreeParams> MemStore<P> {
@@ -578,18 +588,18 @@ impl<P: TreeParams> MemStore<P> {
 }
 
 impl<P: TreeParams> Store<P> for MemStore<P> {
-    fn put(&mut self, node: &Node<P>) -> Result<NodeId> {
+    fn put(&mut self, node: &NodeData<P>) -> Result<NodeId> {
         let id = NodeId::new((self.nodes.len() as u64) + 1).unwrap();
         self.nodes.insert(id, node.clone());
         Ok(id)
     }
 
-    fn update(&mut self, id: &NodeId, node: &Node<P>) -> Result<()> {
+    fn update(&mut self, id: &NodeId, node: &NodeData<P>) -> Result<()> {
         self.nodes.insert(*id, node.clone());
         Ok(())
     }
 
-    fn get(&self, id: &NodeId) -> Result<Node<P>> {
+    fn get(&self, id: &NodeId) -> Result<NodeData<P>> {
         self.nodes
             .get(id)
             .cloned()
@@ -599,7 +609,13 @@ impl<P: TreeParams> Store<P> for MemStore<P> {
 
 pub type NodeId = NonZeroU64;
 
-pub struct Node<P: TreeParams> {
+/// Data for a node in the tree.
+/// This gets persisted as a single &[u8] in the database.
+///
+/// TODO:
+/// - Use some zero copy stuff to make this more efficient.
+/// - Have dedicated types for owned and borrowed NodeData (?).
+pub struct NodeData<P: TreeParams> {
     key: Point<P>,         // variable size due to path
     rank: u8,              // 1 byte
     value: P::V,           // fixed size
@@ -608,9 +624,9 @@ pub struct Node<P: TreeParams> {
     right: Option<NodeId>, // 8 bytes
 }
 
-impl<P: TreeParams> Clone for Node<P> {
+impl<P: TreeParams> Clone for NodeData<P> {
     fn clone(&self) -> Self {
-        Node {
+        Self {
             key: self.key.clone(),
             rank: self.rank,
             value: self.value.clone(),
@@ -621,16 +637,43 @@ impl<P: TreeParams> Clone for Node<P> {
     }
 }
 
-impl<P: TreeParams> Node<P> {
+/// A node combines node data with a node id.
+pub struct Node<P: TreeParams> {
+    id: NodeId,
+    data: NodeData<P>,
+}
+
+impl<P: TreeParams> Clone for Node<P> {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            data: self.data.clone(),
+        }
+    }
+}
+
+impl<P: TreeParams> Deref for Node<P> {
+    type Target = NodeData<P>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
+}
+
+impl<P: TreeParams> NodeData<P> {
+    /// True if the node is a leaf.
     fn is_leaf(&self) -> bool {
         self.left.is_none() && self.right.is_none()
     }
 
+    /// Get the sort order for the node, based on the rank.
     pub fn sort_order(&self) -> SortOrder {
         self.rank.into()
     }
 
-    /// Iterate over the tree in its own natural order.
+    /// Iterate over the entire tree in its natural order.
+    ///
+    /// The order is implementation dependent and should not be relied on.
     pub fn iter_unordered<'a>(
         &'a self,
         store: &'a impl Store<P>,
@@ -640,6 +683,48 @@ impl<P: TreeParams> Node<P> {
                 co.yield_(Err(cause)).await;
             }
         })
+    }
+
+    /// Query a 3d range in the tree in its natural order.
+    ///
+    /// The order is implementation dependent and should not be relied on.
+    pub fn query_unordered<'a>(
+        &'a self,
+        query: &'a QueryRange3d<P>,
+        store: &'a impl Store<P>,
+    ) -> impl IntoIterator<Item = Result<(Point<P>, P::V)>> + 'a {
+        Gen::new(|co| async move {
+            if let Err(cause) = self.query_unordered0(query, store, &co).await {
+                co.yield_(Err(cause)).await;
+            }
+        })
+    }
+
+    /// Query a 3d range in the tree in a defined order.
+    ///
+    /// The order is defined by the `ordering` parameter. All orderings use all
+    /// three dimensions, so the result is fully deteministic.
+    pub fn query_ordered<'a>(
+        self,
+        query: &'a QueryRange3d<P>,
+        ordering: SortOrder,
+        store: &'a impl Store<P>,
+    ) -> impl IntoIterator<Item = Result<(Point<P>, P::V)>> + 'a {
+        Gen::new(|co| async move {
+            if let Err(cause) = self.query_ordered0(query, ordering, store, &co).await {
+                co.yield_(Err(cause)).await;
+            }
+        })
+    }
+
+    /// Get a summary of the elements in a 3d range.
+    ///
+    /// The result is identical to iterating over the elements in the 3d range
+    /// and combining the summaries of each element, but will be much more
+    /// efficient for large trees.
+    pub fn summary(&self, query: &QueryRange3d<P>, store: &impl Store<P>) -> Result<P::M> {
+        let bbox = BBox::all();
+        self.summary0(query, &bbox, store)
     }
 
     async fn iter_unordered0(
@@ -655,36 +740,6 @@ impl<P: TreeParams> Node<P> {
             Box::pin(right.iter_unordered0(store, co)).await?;
         }
         Ok(())
-    }
-
-    pub fn query_unordered<'a>(
-        &'a self,
-        query: &'a QueryRange3d<P>,
-        store: &'a impl Store<P>,
-    ) -> impl IntoIterator<Item = Result<(Point<P>, P::V)>> + 'a {
-        Gen::new(|co| async move {
-            if let Err(cause) = self.query_unordered0(query, store, &co).await {
-                co.yield_(Err(cause)).await;
-            }
-        })
-    }
-
-    pub fn query_ordered<'a>(
-        self,
-        query: &'a QueryRange3d<P>,
-        ordering: SortOrder,
-        store: &'a impl Store<P>,
-    ) -> impl IntoIterator<Item = Result<(Point<P>, P::V)>> + 'a {
-        Gen::new(|co| async move {
-            if let Err(cause) = self.query_ordered0(query, ordering, store, &co).await {
-                co.yield_(Err(cause)).await;
-            }
-        })
-    }
-
-    pub fn summary(&self, query: &QueryRange3d<P>, store: &impl Store<P>) -> Result<P::M> {
-        let bbox = BBox::all();
-        self.summary0(query, &bbox, store)
     }
 
     fn summary0(
@@ -799,13 +854,13 @@ impl<P: TreeParams> Node<P> {
         Ok(())
     }
 
-    /// Create a new node with the given key and value.
+    /// Create a new node data with the given key and value.
     pub fn single(key: Point<P>, value: P::V) -> Self {
         let summary = P::M::lift((key.clone(), value.clone()));
         let key_bytes = postcard::to_allocvec(&key).expect("Failed to serialize key");
         let key_hash: [u8; 32] = blake3::hash(&key_bytes).into();
         let rank = count_trailing_zeros(&key_hash);
-        Node {
+        NodeData {
             key,
             rank,
             value,
@@ -821,13 +876,13 @@ impl<P: TreeParams> Node<P> {
         value: P::V,
         store: &mut impl Store<P>,
     ) -> Result<Option<P::V>> {
-        let node = Node::single(key, value);
+        let node = NodeData::single(key, value);
         self.insert0(&store.put(self)?, &node, store)
     }
 
     fn insert_iterative(
         mut root_id: Option<NodeId>,
-        mut x: Node<P>,
+        mut x: NodeData<P>,
         x_id: NodeId,
         store: &mut impl Store<P>,
     ) -> Result<NodeId> {
@@ -955,7 +1010,7 @@ impl<P: TreeParams> Node<P> {
     fn insert0(
         &mut self,
         self_id: &NodeId,
-        node: &Node<P>,
+        node: &NodeData<P>,
         store: &mut impl Store<P>,
     ) -> Result<Option<P::V>> {
         assert!(node.is_leaf());
@@ -1032,7 +1087,7 @@ impl<P: TreeParams> Node<P> {
         }
     }
 
-    fn get0(&self, key: Point<P>, store: &impl Store<P>) -> Result<Option<Node<P>>> {
+    fn get0(&self, key: Point<P>, store: &impl Store<P>) -> Result<Option<NodeData<P>>> {
         match key.cmp_at_rank(&self.key, self.rank) {
             Ordering::Less => {
                 if let Some(left) = self.left {
@@ -1059,7 +1114,7 @@ impl<P: TreeParams> Node<P> {
     ) -> Result<(MemStore<P>, NodeId)> {
         let mut nodes: Vec<_> = iter
             .into_iter()
-            .map(|(key, value)| Node::single(key, value))
+            .map(|(key, value)| NodeData::single(key, value))
             .collect();
         // Before we sort, remove all but the first occurence of each point.
         let mut uniques = BTreeSet::new();
@@ -1106,7 +1161,7 @@ impl<P: TreeParams> Node<P> {
     }
 
     pub fn assert_invariants(&self, store: &impl Store<P>) -> Result<AssertInvariantsRes<P>> {
-        let Node {
+        let NodeData {
             key,
             rank,
             value: _,
@@ -1175,7 +1230,7 @@ impl<P: TreeParams> Node<P> {
         store: &mut impl Store<P>,
     ) -> Result<()> {
         assert!(node.is_leaf());
-        let Node {
+        let NodeData {
             key: parent_key,
             rank: parent_rank,
             summary: parent_summary,
