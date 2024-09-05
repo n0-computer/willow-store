@@ -100,6 +100,7 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     fmt::{Debug, Display},
+    marker::PhantomData,
     ops::{Deref, DerefMut},
 };
 
@@ -613,11 +614,65 @@ pub trait TreeParams: KeyParams + Sized {
     type M: LiftingCommutativeMonoid<(Point<Self>, Self::V)> + Clone + Debug + Eq + FixedSize;
 }
 
-/// A simple store trait for storing nodes by id.
+#[inline(always)]
+fn min_key_size<P: KeyParams>() -> usize {
+    P::X::SIZE + P::Y::SIZE
+}
+
+#[inline(always)]
+fn min_data_size<P: TreeParams>() -> usize {
+    8 + 8 + 1 + P::V::SIZE + P::M::SIZE + min_key_size::<P>()
+}
+
+#[inline(always)]
+fn left_offset<P: TreeParams>() -> usize {
+    0
+}
+
+#[inline(always)]
+fn right_offset<P: TreeParams>() -> usize {
+    8
+}
+
+#[inline(always)]
+fn value_offset<P: TreeParams>() -> usize {
+    16
+}
+
+#[inline(always)]
+fn summary_offset<P: TreeParams>() -> usize {
+    16 + P::V::SIZE
+}
+
+#[inline(always)]
+fn rank_offset<P: TreeParams>() -> usize {
+    16 + P::V::SIZE + P::M::SIZE
+}
+
+#[inline(always)]
+fn key_offset<P: TreeParams>() -> usize {
+    16 + P::V::SIZE + P::M::SIZE + 1
+}
+
+/// A simple store trait for storing blobs.
 pub trait Store<T: VariableSize> {
     fn put(&mut self, node: &T) -> Result<NodeId>;
     fn data(&self, id: &NodeId) -> Result<T>;
     fn update(&mut self, id: &NodeId, node: &T) -> Result<()>;
+}
+
+impl<T: VariableSize> Store<T> for Box<dyn Store<T>> {
+    fn put(&mut self, node: &T) -> Result<NodeId> {
+        self.as_mut().put(node)
+    }
+
+    fn data(&self, id: &NodeId) -> Result<T> {
+        self.as_ref().data(id)
+    }
+
+    fn update(&mut self, id: &NodeId, node: &T) -> Result<()> {
+        self.as_mut().update(id, node)
+    }
 }
 
 pub trait StoreExt<P: TreeParams>: Store<NodeData<P>> {
@@ -649,7 +704,7 @@ pub trait StoreExt<P: TreeParams>: Store<NodeData<P>> {
     }
 }
 
-impl<P: TreeParams> StoreExt<P> for MemStore {}
+impl<T: Store<NodeData<P>>, P: TreeParams> StoreExt<P> for T {}
 
 pub struct MemStore {
     nodes: BTreeMap<NodeId, Vec<u8>>,
@@ -707,6 +762,60 @@ impl NodeId {
 
     pub fn is_empty(&self) -> bool {
         self == &Self::EMPTY
+    }
+}
+
+pub struct NodeData2<P: TreeParams, T: AsRef<[u8]> = Vec<u8>>(T, PhantomData<P>);
+
+impl<P: TreeParams, T: AsRef<[u8]>> NodeData2<P, T> {
+    pub fn new(data: T) -> Self {
+        debug_assert!(data.as_ref().len() >= min_data_size::<P>());
+        Self(data, PhantomData)
+    }
+
+    pub fn left(&self) -> NodeId {
+        NodeId::read(&self.0.as_ref()[left_offset::<P>()..right_offset::<P>()])
+    }
+
+    pub fn right(&self) -> NodeId {
+        NodeId::read(&self.0.as_ref()[right_offset::<P>()..value_offset::<P>()])
+    }
+
+    pub fn value(&self) -> P::V {
+        P::V::read(&self.0.as_ref()[value_offset::<P>()..summary_offset::<P>()])
+    }
+
+    pub fn summary(&self) -> P::M {
+        P::M::read(&self.0.as_ref()[summary_offset::<P>()..rank_offset::<P>()])
+    }
+
+    pub fn rank(&self) -> u8 {
+        self.0.as_ref()[rank_offset::<P>()]
+    }
+
+    pub fn key(&self) -> Point2<P, &[u8]> {
+        Point2::new(&self.0.as_ref()[key_offset::<P>()..])
+    }
+}
+
+pub struct Point2<P: KeyParams, T: AsRef<[u8]> = Vec<u8>>(T, PhantomData<P>);
+
+impl<P: KeyParams, T: AsRef<[u8]>> Point2<P, T> {
+    pub fn new(data: T) -> Self {
+        debug_assert!(data.as_ref().len() >= min_key_size::<P>());
+        Self(data, PhantomData)
+    }
+
+    pub fn x(&self) -> P::X {
+        P::X::read(&self.0.as_ref()[0..P::X::SIZE])
+    }
+
+    pub fn y(&self) -> P::Y {
+        P::Y::read(&self.0.as_ref()[P::X::SIZE..P::X::SIZE + P::Y::SIZE])
+    }
+
+    pub fn z(&self) -> P::Z {
+        P::Z::read(&self.0.as_ref()[P::X::SIZE + P::Y::SIZE..])
     }
 }
 
@@ -780,6 +889,24 @@ pub enum Node<P: TreeParams> {
     NonEmpty(NonEmptyNode<P>),
 }
 
+impl<P: TreeParams> Debug for Node<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Node::Empty => write!(f, "Empty"),
+            Node::NonEmpty(node) => write!(f, "{:?}", node),
+        }
+    }
+}
+
+impl<P: TreeParams> Debug for NonEmptyNode<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NonEmptyNode")
+            .field("id", &self.id)
+            .field("data", &self.data)
+            .finish()
+    }
+}
+
 impl<P: TreeParams> From<NonEmptyNode<P>> for Node<P> {
     fn from(node: NonEmptyNode<P>) -> Self {
         Node::NonEmpty(node)
@@ -819,6 +946,14 @@ impl<P: TreeParams> Node<P> {
         }
     }
 
+    pub fn rank(&self) -> u8 {
+        if let Node::NonEmpty(node) = self {
+            node.data.rank
+        } else {
+            panic!("Empty node")
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.id().is_empty()
     }
@@ -837,9 +972,9 @@ impl<P: TreeParams> Node<P> {
         }
     }
 
-    pub fn assert_invariants(&self, store: &impl StoreExt<P>) -> Result<()> {
+    pub fn assert_invariants(&self, store: &impl StoreExt<P>, include_summary: bool) -> Result<()> {
         if let Node::NonEmpty(node) = self {
-            node.assert_invariants(store)?;
+            node.assert_invariants(store, include_summary)?;
         }
         Ok(())
     }
@@ -967,6 +1102,45 @@ impl<P: TreeParams> Node<P> {
             Ok(())
         }
     }
+
+    pub fn from_iter<I: IntoIterator<Item = (Point<P>, P::V)>>(
+        iter: I,
+    ) -> Result<(impl StoreExt<P>, NodeId)> {
+        let mut nodes: Vec<_> = iter
+            .into_iter()
+            .map(|(key, value)| NodeData::single(key, value))
+            .collect();
+        // Before we sort, remove all but the first occurence of each point.
+        let mut uniques = BTreeSet::new();
+        nodes.retain(|node| uniques.insert(node.key.clone().xyz()));
+        // if rank is equal, compare keys at rank
+        nodes.sort_by(|p1, p2| {
+            p2.rank
+                .cmp(&p1.rank)
+                .then(p1.key.cmp_at_rank(&p2.key, p1.rank))
+        });
+        let mut store = MemStore::new();
+        let mut tree = Node::Empty;
+        for node in nodes {
+            let node = store.put_node(node.clone())?;
+            tree.insert_no_balance(&node, &mut store)?;
+        }
+        Ok((store, tree.id()))
+    }
+
+    fn insert_no_balance(
+        &mut self,
+        node: &NonEmptyNode<P>,
+        store: &mut impl StoreExt<P>,
+    ) -> Result<()> {
+        match self {
+            Node::Empty => {
+                *self = node.clone().into();
+                Ok(())
+            }
+            Node::NonEmpty(this) => this.insert_no_balance(node, store),
+        }
+    }
 }
 
 impl<P: TreeParams> Clone for Node<P> {
@@ -1061,6 +1235,10 @@ impl<P: TreeParams> NodeData<P> {
     /// True if the node is a leaf.
     fn is_leaf(&self) -> bool {
         self.left.is_empty() && self.right.is_empty()
+    }
+
+    pub fn rank(&self) -> u8 {
+        self.rank
     }
 
     /// Get the sort order for the node, based on the rank.
@@ -1252,32 +1430,6 @@ impl<P: TreeParams> NodeData<P> {
         }
     }
 
-    pub fn from_iter<I: IntoIterator<Item = (Point<P>, P::V)>>(
-        iter: I,
-    ) -> Result<(impl StoreExt<P>, NodeId)> {
-        let mut nodes: Vec<_> = iter
-            .into_iter()
-            .map(|(key, value)| NodeData::single(key, value))
-            .collect();
-        // Before we sort, remove all but the first occurence of each point.
-        let mut uniques = BTreeSet::new();
-        nodes.retain(|node| uniques.insert(node.key.clone().xyz()));
-        // if rank is equal, compare keys at rank
-        nodes.sort_by(|p1, p2| {
-            p2.rank
-                .cmp(&p1.rank)
-                .then(p1.key.cmp_at_rank(&p2.key, p1.rank))
-        });
-        let mut store = MemStore::new();
-        let root_data = nodes.remove(0);
-        let mut root = store.put_node(root_data)?;
-        for node in nodes {
-            let node = store.put_node(node.clone())?;
-            root.insert_no_balance(&node, &mut store)?;
-        }
-        Ok((store, root.id))
-    }
-
     fn dump0(&self, prefix: String, store: &impl StoreExt<P>) -> Result<()> {
         println!(
             "{}{:?} rank={} order={:?} value={:?}",
@@ -1300,7 +1452,11 @@ impl<P: TreeParams> NodeData<P> {
         Ok(())
     }
 
-    pub fn assert_invariants(&self, store: &impl StoreExt<P>) -> Result<AssertInvariantsRes<P>> {
+    pub fn assert_invariants(
+        &self,
+        store: &impl StoreExt<P>,
+        include_summary: bool,
+    ) -> Result<AssertInvariantsRes<P>> {
         let NodeData {
             key,
             rank,
@@ -1313,11 +1469,11 @@ impl<P: TreeParams> NodeData<P> {
         let right = store.data_opt(right)?;
         let left_res = left
             .as_ref()
-            .map(|node| node.assert_invariants(store))
+            .map(|node| node.assert_invariants(store, include_summary))
             .transpose()?;
         let right_res = right
             .as_ref()
-            .map(|node| node.assert_invariants(store))
+            .map(|node| node.assert_invariants(store, include_summary))
             .transpose()?;
         if let Some(ref left) = left_res {
             assert!(left.rank < *rank);
@@ -1358,7 +1514,9 @@ impl<P: TreeParams> NodeData<P> {
         if let Some(right) = right_res {
             res = res.combine(&right);
         }
-        assert_eq!(res.summary, *summary);
+        if include_summary {
+            assert_eq!(res.summary, *summary);
+        }
         Ok(res)
     }
 }
@@ -1374,6 +1532,16 @@ impl<P: TreeParams> NonEmptyNode<P> {
     }
 
     fn persist(&self, store: &mut impl StoreExt<P>) -> Result<()> {
+        if !self.left.is_empty() {
+            let left = store.data(&self.left)?;
+            assert!(self.key.cmp_at_rank(&left.key, self.rank) == Ordering::Greater);
+            assert!(left.rank < self.rank);
+        }
+        if !self.right.is_empty() {
+            let right = store.data(&self.right)?;
+            assert!(self.key.cmp_at_rank(&right.key, self.rank) == Ordering::Less);
+            assert!(right.rank <= self.rank);
+        }
         store.update(&self.id, &self.data)
     }
 
@@ -1465,19 +1633,18 @@ impl<P: TreeParams> NonEmptyNode<P> {
         x: NodeData<P>,
         store: &mut impl StoreExt<P>,
     ) -> Result<NodeId> {
-        use Rel::*;
         let root = store.get_node(&root_id)?;
         let mut x = store.put_node(x)?;
         let key = x.key.clone();
         let rank = x.rank;
         // Compare with x.key at x.rank
-        let x_cmp = |x: &Point<P>| {
-            let x_cmp = x.cmp_at_rank(&key, rank);
+        let x_lt = |rhs: &Point<P>| {
+            let x_cmp = key.cmp_at_rank(rhs, rank);
             match x_cmp {
-                Ordering::Less => Left,
-                Ordering::Greater => Right,
+                Ordering::Less => true,
+                Ordering::Greater => false,
                 Ordering::Equal => {
-                    println!("x={:?} key={:?}", x, key);
+                    // println!("x={:?} key={:?}", x, key);
                     unreachable!("Duplicate keys not supported in insert0");
                 }
             }
@@ -1487,18 +1654,19 @@ impl<P: TreeParams> NonEmptyNode<P> {
         // while cur != null and (rank < cur.rank or (rank = cur.rank and key > cur.key)) do
         //   prev ← cur
         //   cur ← if key < cur.key then cur.left else cur.right
-        while let Node::NonEmpty(t) = cur {
-            let rel = x_cmp(&t.key);
-            if rank < t.rank || rank == t.rank && rel == Left {
+        while !cur.is_empty() {
+            let cur_cmp_key = cur.key().cmp_at_rank(&key, cur.rank());
+            let key_gt_cur = cur_cmp_key == Ordering::Less;
+            if rank < cur.rank() || (rank == cur.rank() && key_gt_cur) {
                 // cur is above x, just go down
-                cur = match rel {
-                    Left => store.get_node(&t.left)?,
-                    Right => store.get_node(&t.right)?,
-                };
-                prev = Node::NonEmpty(t);
+                prev = cur.clone();
+                cur = if key_gt_cur {
+                    store.get_node(&cur.left())
+                } else {
+                    store.get_node(&cur.right())
+                }?;
             } else {
                 // cur is below x
-                cur = Node::NonEmpty(t);
                 break;
             }
         }
@@ -1506,25 +1674,41 @@ impl<P: TreeParams> NonEmptyNode<P> {
         //   else if key < prev.key then prev.left ← x
         //   else prev.right ← x
         if prev.is_empty() {
+            assert!(cur.id() == root_id);
             root_id = x.id;
         } else {
+            assert!(prev.rank() > rank || (prev.rank() == rank && !x_lt(prev.key())));
+            assert!(cur.id() != root_id);
             let prev = prev.non_empty_mut().expect("prev is empty");
-            match x_cmp(&prev.key) {
-                Left => prev.left = x.id,
-                Right => prev.right = x.id,
+            let prev_cmp_x = prev.key.cmp_at_rank(&x.key, prev.rank);
+            let prev_lt_x = prev_cmp_x == Ordering::Less;
+            if prev_lt_x {
+                prev.right = x.id;
+            } else {
+                prev.left = x.id;
             }
+            println!(
+                "prev.key={:?} x.key={:?} prev_cmp_x={:?} prev_lt_x={} {:?}",
+                prev.key,
+                x.key,
+                prev_cmp_x,
+                prev_lt_x,
+                prev.sort_order()
+            );
             prev.persist(store)?;
         }
         // if cur = null then {x.left ← x.right ← null; return}
         if cur.is_empty() {
-            return Ok(x.id);
+            return Ok(root_id);
         }
         {
             let cur = cur.non_empty().expect("cur is empty");
             // if key < cur.key then x.right ← cur else x.left ← cur
-            match x_cmp(&cur.key) {
-                Left => x.right = cur.id,
-                Right => x.left = cur.id,
+            let x_lt_cur = x_lt(&cur.key);
+            if x_lt_cur {
+                x.right = cur.id;
+            } else {
+                x.left = cur.id;
             }
         }
         x.persist(store)?;
@@ -1543,46 +1727,53 @@ impl<P: TreeParams> NonEmptyNode<P> {
         //   else
         //     fix.right ← cur
 
-        // while cur 6= null do
+        // while cur != null do
         while !cur.is_empty() {
             //   fix ← prev
             let mut fix = prev;
-            match x_cmp(&cur.key()) {
+            let x_lt_cur = x_lt(&cur.key());
+            println!("x.key={:?} cur.key={:?}", fix.key(), cur.key());
+            if x_lt_cur {
+                //   if cur.key < key then
                 //     repeat {prev ← cur ; cur ← cur.right}
                 //     until cur = null or cur.key > key
-                Left => loop {
+                loop {
                     prev = cur.clone();
-                    cur = store.get_node(&prev.right())?;
+                    cur = store.get_node(&cur.right())?;
                     let Node::NonEmpty(cur_ne) = &cur else {
                         break;
                     };
-                    if x_cmp(&cur_ne.key) == Right {
+                    if x_lt(&cur_ne.key) {
                         break;
                     }
-                },
+                }
+            } else {
+                //   else
                 //     repeat {prev ← cur ; cur ← cur.left}
                 //     until cur = null or cur.key < key
-                Right => loop {
+                loop {
                     prev = cur.clone();
-                    cur = store.get_node(&prev.left())?;
+                    cur = store.get_node(&cur.left())?;
                     let Node::NonEmpty(cur_ne) = &cur else {
                         break;
                     };
-                    if x_cmp(&cur_ne.key) == Left {
+                    if !x_lt(&cur_ne.key) {
                         break;
                     }
-                },
+                }
             }
             //   if fix.key > key or (fix = x and prev.key > key) then
             //     fix.left ← cur
             //   else
             //     fix.right ← cur
-            println!("{} {}", x.id, fix.id());
+            println!("x.id={} fix.id={} prev.id={}", x.id, fix.id(), prev.id());
             let fix = fix.non_empty_mut().expect("fix is empty");
             let prev = prev.non_empty().expect("prev is empty");
-            if ((fix.id == x.id) && x_cmp(&prev.key) == Right)
-                || ((fix.id != x.id) && x_cmp(&fix.key) == Right)
-            {
+            println!(
+                "fix.key={:?} prev.key={:?} x.key={:?} cur={:?}",
+                fix.key, prev.key, key, cur
+            );
+            if ((fix.id != x.id) && x_lt(&fix.key)) || ((fix.id == x.id) && x_lt(&prev.key)) {
                 fix.left = cur.id();
             } else {
                 fix.right = cur.id();
@@ -1696,10 +1887,4 @@ impl From<u8> for SortOrder {
             _ => unreachable!(),
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Copy)]
-enum Rel {
-    Left,
-    Right,
 }
