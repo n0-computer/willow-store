@@ -2,18 +2,28 @@
 //! description in the paper.
 //!
 //! To literally follow the paper, we implement semantics of an OO language
-//! with freely shareable pointers that can possibly be null.
-use std::{cell::RefCell, collections::BTreeSet, rc::Rc};
+//! with freely shareable pointers that can possibly be null (empty).
+use std::{cell::RefCell, cmp::Ordering, collections::BTreeSet, rc::Rc};
 
+use proptest::prelude::{any, Strategy};
 use rand::{seq::SliceRandom, SeedableRng};
 use test_strategy::proptest;
 use willow_store::count_trailing_zeros;
 
 struct NodeData {
-    key: u64,
+    key: (u64, u64, u64),
     rank: u8,
     left: Node,
     right: Node,
+}
+
+fn cmp_at_rank((xa, ya, za): (u64, u64, u64), (xb, yb, zb): (u64, u64, u64), rank: u8) -> Ordering {
+    match rank % 3 {
+        0 => xa.cmp(&xb).then(ya.cmp(&yb)).then(za.cmp(&zb)),
+        1 => ya.cmp(&yb).then(za.cmp(&zb)).then(xa.cmp(&xb)),
+        2 => za.cmp(&zb).then(xa.cmp(&xb)).then(ya.cmp(&yb)),
+        _ => unreachable!(),
+    }
 }
 
 #[derive(Clone)]
@@ -22,7 +32,7 @@ struct Node(Option<Rc<RefCell<NodeData>>>);
 impl Node {
     const EMPTY: Self = Self(None);
 
-    fn leaf(key: u64, rank: u8) -> Self {
+    fn leaf(key: (u64, u64, u64), rank: u8) -> Self {
         Self(Some(Rc::new(RefCell::new(NodeData {
             key,
             rank,
@@ -39,7 +49,7 @@ impl Node {
         self.0.as_ref().unwrap().borrow().rank
     }
 
-    fn key(&self) -> u64 {
+    fn key(&self) -> (u64, u64, u64) {
         self.0.as_ref().unwrap().borrow().key
     }
 
@@ -72,7 +82,7 @@ impl Node {
             println!("{indent}EMPTY");
         } else {
             self.left().print0(indent.clone() + "  ");
-            println!("{indent}key={} rank={}", self.key(), self.rank());
+            println!("{indent}key={:?} rank={}", self.key(), self.rank());
             self.right().print0(indent + "  ");
         }
     }
@@ -94,7 +104,7 @@ impl Node {
         }
     }
 
-    fn from_iter(iter: impl IntoIterator<Item = (u64, u8)>) -> Self {
+    fn from_iter(iter: impl IntoIterator<Item = ((u64, u64, u64), u8)>) -> Self {
         let mut root = Self::EMPTY;
         for (key, rank) in iter {
             let x = Self::leaf(key, rank);
@@ -114,6 +124,19 @@ impl PartialEq for Node {
     }
 }
 
+// contains is trivial and not given in the paper.
+fn contains_rec(root: Node, key: (u64, u64, u64)) -> bool {
+    if root.is_empty() {
+        false
+    } else if key == root.key() {
+        true
+    } else if cmp_at_rank(key, root.key(), root.rank()) == Ordering::Less {
+        contains_rec(root.left(), key)
+    } else {
+        contains_rec(root.right(), key)
+    }
+}
+
 // insert(x, root):
 // if root = null then {x.left ← x.right ← null; x.rank ← RandomRank; return x}
 // if x.key < root.key then
@@ -129,7 +152,7 @@ fn insert_rec<'a>(x: Node, root: Node) -> Node {
     if root.is_empty() {
         return x;
     }
-    if x.key() < root.key() {
+    if cmp_at_rank(x.key(), root.key(), root.rank()) == Ordering::Less {
         if insert_rec(x.clone(), root.left()) == x {
             if x.rank() < root.rank() {
                 root.set_left(x);
@@ -176,21 +199,6 @@ fn zip(x: Node, y: Node) -> Node {
     }
 }
 
-// contains is trivial and not given in the paper.
-fn contains_rec(root: Node, key: u64) -> bool {
-    if root.is_empty() {
-        return false;
-    }
-    if key == root.key() {
-        return true;
-    }
-    if key < root.key() {
-        contains_rec(root.left(), key)
-    } else {
-        contains_rec(root.right(), key)
-    }
-}
-
 // delete(x, root):
 // if x.key = root.key then return zip(root.left , root.right)
 // if x.key < root.key then
@@ -206,7 +214,7 @@ fn delete_rec(x: Node, root: Node) -> Node {
     if x.key() == root.key() {
         return zip(root.left(), root.right());
     }
-    if x.key() < root.key() {
+    if cmp_at_rank(x.key(), root.key(), root.rank()) == Ordering::Less {
         if x.key() == root.left().key() {
             root.set_left(zip(root.left().left(), root.left().right()));
         } else {
@@ -383,19 +391,19 @@ fn delete(root: &mut Node, x: Node) {
     }
 }
 
-fn add_rank(keys: impl IntoIterator<Item = u64>) -> impl Iterator<Item = (u64, u8)> {
+fn add_rank(
+    keys: impl IntoIterator<Item = (u64, u64, u64)>,
+) -> impl Iterator<Item = ((u64, u64, u64), u8)> {
     keys.into_iter().map(|i| {
-        let hash: [u8; 32] = blake3::hash(&i.to_le_bytes()).into();
+        let ser = postcard::to_allocvec(&i).unwrap();
+        let hash: [u8; 32] = blake3::hash(&ser).into();
         let rank = count_trailing_zeros(&hash);
         (i, rank)
     })
 }
 
-fn insert_rec_impl(keys: BTreeSet<u64>, seed: u64) {
-    let mut items = add_rank(keys).collect::<Vec<_>>();
-    let seed = blake3::hash(&seed.to_be_bytes()).into();
-    let mut rng = rand::rngs::SmallRng::from_seed(seed);
-    items.shuffle(&mut rng);
+fn insert_rec_impl(keys: TestSet) {
+    let items = keys.0;
     let mut root = Node::EMPTY;
     for (key, rank) in items.clone() {
         let x = Node::leaf(key, rank);
@@ -408,11 +416,8 @@ fn insert_rec_impl(keys: BTreeSet<u64>, seed: u64) {
     }
 }
 
-fn insert_impl(keys: BTreeSet<u64>, seed: u64) {
-    let mut items = add_rank(keys).collect::<Vec<_>>();
-    let seed = blake3::hash(&seed.to_be_bytes()).into();
-    let mut rng = rand::rngs::SmallRng::from_seed(seed);
-    items.shuffle(&mut rng);
+fn insert_impl(keys: TestSet) {
+    let items = keys.0;
     let mut root = Node::EMPTY;
     for (key, rank) in items.clone() {
         let x = Node::leaf(key, rank);
@@ -425,14 +430,11 @@ fn insert_impl(keys: BTreeSet<u64>, seed: u64) {
     }
 }
 
-fn delete_rec_impl(keys: BTreeSet<u64>, seed: u64) {
-    if keys.is_empty() {
+fn delete_rec_impl(keys: TestSet) {
+    let items = keys.0;
+    if items.is_empty() {
         return;
     }
-    let mut items = add_rank(keys).collect::<Vec<_>>();
-    let seed = blake3::hash(&seed.to_be_bytes()).into();
-    let mut rng = rand::rngs::SmallRng::from_seed(seed);
-    items.shuffle(&mut rng);
     let (k, r) = items[0];
     let tree = Node::from_iter(items.iter().cloned());
     let tree = delete_rec(Node::leaf(k, r), tree);
@@ -443,14 +445,11 @@ fn delete_rec_impl(keys: BTreeSet<u64>, seed: u64) {
     assert!(!contains_rec(tree.clone(), k));
 }
 
-fn delete_impl(keys: BTreeSet<u64>, seed: u64) {
-    if keys.is_empty() {
+fn delete_impl(keys: TestSet) {
+    let items = keys.0;
+    if items.is_empty() {
         return;
     }
-    let mut items = add_rank(keys).collect::<Vec<_>>();
-    let seed = blake3::hash(&seed.to_be_bytes()).into();
-    let mut rng = rand::rngs::SmallRng::from_seed(seed);
-    items.shuffle(&mut rng);
     let (k, r) = items[0];
     let mut tree = Node::from_iter(items.iter().cloned());
     delete(&mut tree, Node::leaf(k, r));
@@ -461,30 +460,35 @@ fn delete_impl(keys: BTreeSet<u64>, seed: u64) {
     assert!(!contains_rec(tree.clone(), k));
 }
 
-#[proptest]
-fn prop_insert_rec(values: BTreeSet<u64>, seed: u64) {
-    insert_rec_impl(values, seed);
+#[derive(Debug)]
+struct TestSet(Vec<((u64, u64, u64), u8)>);
+
+fn random_test_set() -> impl Strategy<Value = TestSet> {
+    (any::<BTreeSet<(u64, u64, u64)>>(), any::<u64>()).prop_map(|(items, seed)| {
+        let seed = blake3::hash(&seed.to_be_bytes()).into();
+        let mut rng = rand::rngs::SmallRng::from_seed(seed);
+        let mut items = add_rank(items).collect::<Vec<_>>();
+        items.shuffle(&mut rng);
+        TestSet(items)
+    })
 }
 
 #[proptest]
-fn prop_insert(values: BTreeSet<u64>, seed: u64) {
-    insert_impl(values, seed);
+fn prop_kd_insert_rec(#[strategy(random_test_set())] values: TestSet) {
+    insert_rec_impl(values);
 }
 
 #[proptest]
-fn prop_delete_rec(values: BTreeSet<u64>, seed: u64) {
-    delete_rec_impl(values, seed);
+fn prop_kd_insert(#[strategy(random_test_set())] values: TestSet) {
+    insert_impl(values);
 }
 
 #[proptest]
-fn prop_delete(values: BTreeSet<u64>, seed: u64) {
-    delete_impl(values, seed);
+fn prop_kd_delete_rec(#[strategy(random_test_set())] values: TestSet) {
+    delete_rec_impl(values);
 }
 
-#[test]
-fn test_delete() {
-    let data: Vec<(BTreeSet<u64>, u64)> = [([0].into_iter().collect(), 0)].into_iter().collect();
-    for (keys, seed) in data {
-        delete_impl(keys, seed);
-    }
+#[proptest]
+fn prop_kd_delete(#[strategy(random_test_set())] values: TestSet) {
+    delete_impl(values);
 }
