@@ -657,8 +657,8 @@ fn key_offset<P: TreeParams>() -> usize {
 /// A simple store trait for storing blobs.
 pub trait Store<T: VariableSize> {
     fn put(&mut self, node: &T) -> Result<NodeId>;
-    fn data(&self, id: &NodeId) -> Result<T>;
-    fn update(&mut self, id: &NodeId, node: &T) -> Result<()>;
+    fn data(&self, id: NodeId) -> Result<T>;
+    fn update(&mut self, id: NodeId, node: &T) -> Result<()>;
 }
 
 impl<T: VariableSize> Store<T> for Box<dyn Store<T>> {
@@ -666,11 +666,11 @@ impl<T: VariableSize> Store<T> for Box<dyn Store<T>> {
         self.as_mut().put(node)
     }
 
-    fn data(&self, id: &NodeId) -> Result<T> {
+    fn data(&self, id: NodeId) -> Result<T> {
         self.as_ref().data(id)
     }
 
-    fn update(&mut self, id: &NodeId, node: &T) -> Result<()> {
+    fn update(&mut self, id: NodeId, node: &T) -> Result<()> {
         self.as_mut().update(id, node)
     }
 }
@@ -685,7 +685,7 @@ pub trait StoreExt<P: TreeParams>: Store<NodeData<P>> {
     ///
     /// This is just a convenience method for the common case where you have an
     /// optional id and want to get the node if it exists.
-    fn data_opt(&self, id: &NodeId) -> Result<Option<NodeData<P>>> {
+    fn data_opt(&self, id: NodeId) -> Result<Option<NodeData<P>>> {
         Ok(if id.is_empty() {
             None
         } else {
@@ -695,11 +695,11 @@ pub trait StoreExt<P: TreeParams>: Store<NodeData<P>> {
 
     /// Get a node by id, returning None if the id is None.
     /// Also return the id along with the node.
-    fn get_node(&self, id: &NodeId) -> Result<Node<P>> {
+    fn get_node(&self, id: NodeId) -> Result<Node<P>> {
         Ok(if id.is_empty() {
             Node::Empty
         } else {
-            NonEmptyNode::new(*id, self.data(id)?).into()
+            NonEmptyNode::new(id, self.data(id)?).into()
         })
     }
 }
@@ -726,23 +726,30 @@ impl<T: VariableSize> Store<T> for MemStore {
         Ok(id)
     }
 
-    fn update(&mut self, id: &NodeId, node: &T) -> Result<()> {
+    fn update(&mut self, id: NodeId, node: &T) -> Result<()> {
         assert!(!id.is_empty());
-        self.nodes.insert(*id, node.to_vec());
+        self.nodes.insert(id, node.to_vec());
         Ok(())
     }
 
-    fn data(&self, id: &NodeId) -> Result<T> {
+    fn data(&self, id: NodeId) -> Result<T> {
         assert!(!id.is_empty());
-        match self.nodes.get(id) {
+        match self.nodes.get(&id) {
             Some(data) => Ok(T::read(data)),
             None => Err(anyhow::anyhow!("Node not found")),
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct NodeId([u8; 8]);
+
+impl Debug for NodeId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let id = u64::from_be_bytes(self.0);
+        write!(f, "NodeId({})", id)
+    }
+}
 
 impl Display for NodeId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1090,7 +1097,7 @@ impl<P: TreeParams> Node<P> {
             return Ok(Some(old));
         }
         let id = NonEmptyNode::insert0(node.id, data, store)?;
-        *self = store.get_node(&id)?;
+        *self = store.get_node(id)?;
         Ok(None)
     }
 
@@ -1098,7 +1105,7 @@ impl<P: TreeParams> Node<P> {
         if let Node::NonEmpty(node) = self {
             node.dump0("".into(), store)
         } else {
-            println!("Empty");
+            tracing::info!("Empty");
             Ok(())
         }
     }
@@ -1251,11 +1258,11 @@ impl<P: TreeParams> NodeData<P> {
         store: &impl StoreExt<P>,
         co: &Co<Result<(Point<P>, P::V)>>,
     ) -> Result<()> {
-        if let Some(left) = store.data_opt(&self.left)? {
+        if let Some(left) = store.data_opt(self.left)? {
             Box::pin(left.iter_unordered0(store, co)).await?;
         }
         co.yield_(Ok((self.key.clone(), self.value.clone()))).await;
-        if let Some(right) = store.data_opt(&self.right)? {
+        if let Some(right) = store.data_opt(self.right)? {
             Box::pin(right.iter_unordered0(store, co)).await?;
         }
         Ok(())
@@ -1279,7 +1286,7 @@ impl<P: TreeParams> NodeData<P> {
         }
         let mut summary = P::M::zero();
         if query.overlaps_left(&self.key, self.rank) {
-            if let Some(left) = store.data_opt(&self.left)? {
+            if let Some(left) = store.data_opt(self.left)? {
                 let left_bbox = bbox.split_left(&self.key, self.rank);
                 summary = summary.combine(&left.summary0(query, &left_bbox, store)?);
             }
@@ -1288,7 +1295,7 @@ impl<P: TreeParams> NodeData<P> {
             summary = summary.combine(&P::M::lift((self.key.clone(), self.value.clone())));
         }
         if query.overlaps_right(&self.key, self.rank) {
-            if let Some(right) = store.data_opt(&self.right)? {
+            if let Some(right) = store.data_opt(self.right)? {
                 let right_bbox = bbox.split_right(&self.key, self.rank);
                 summary = summary.combine(&right.summary0(query, &right_bbox, store)?);
             }
@@ -1303,7 +1310,7 @@ impl<P: TreeParams> NodeData<P> {
         co: &Co<Result<(Point<P>, P::V)>>,
     ) -> Result<()> {
         if query.overlaps_left(&self.key, self.rank) {
-            if let Some(left) = store.data_opt(&self.left)? {
+            if let Some(left) = store.data_opt(self.left)? {
                 Box::pin(left.query0(query, store, co)).await?;
             }
         }
@@ -1311,7 +1318,7 @@ impl<P: TreeParams> NodeData<P> {
             co.yield_(Ok((self.key.clone(), self.value.clone()))).await;
         }
         if query.overlaps_right(&self.key, self.rank) {
-            if let Some(right) = store.data_opt(&self.right)? {
+            if let Some(right) = store.data_opt(self.right)? {
                 Box::pin(right.query0(query, store, co)).await?;
             }
         }
@@ -1347,7 +1354,7 @@ impl<P: TreeParams> NodeData<P> {
         // we can just concatenate the results from the left, self and right
         if self.sort_order() == ordering {
             if query.overlaps_left(&self.key, self.rank) {
-                if let Some(left) = store.data_opt(&self.left)? {
+                if let Some(left) = store.data_opt(self.left)? {
                     Box::pin(left.query_ordered0(query, ordering, store, co)).await?;
                 }
             }
@@ -1355,7 +1362,7 @@ impl<P: TreeParams> NodeData<P> {
                 co.yield_(Ok((self.key.clone(), self.value.clone()))).await;
             }
             if query.overlaps_right(&self.key, self.rank) {
-                if let Some(right) = store.data_opt(&self.right)? {
+                if let Some(right) = store.data_opt(self.right)? {
                     Box::pin(right.query_ordered0(query, ordering, store, co)).await?;
                 }
             }
@@ -1364,7 +1371,7 @@ impl<P: TreeParams> NodeData<P> {
             // need to merge the results from the left, self and right
             // still better than a full sort!
             let iter1 = if query.overlaps_left(&self.key, self.rank) {
-                if let Some(left) = store.data_opt(&self.left)? {
+                if let Some(left) = store.data_opt(self.left)? {
                     itertools::Either::Left(left.query_ordered(query, ordering, store).into_iter())
                 } else {
                     itertools::Either::Right(std::iter::empty())
@@ -1378,7 +1385,7 @@ impl<P: TreeParams> NodeData<P> {
                 itertools::Either::Right(std::iter::empty())
             };
             let iter3 = if query.overlaps_right(&self.key, self.rank) {
-                if let Some(right) = store.data_opt(&self.right)? {
+                if let Some(right) = store.data_opt(self.right)? {
                     itertools::Either::Left(right.query_ordered(query, ordering, store).into_iter())
                 } else {
                     itertools::Either::Right(std::iter::empty())
@@ -1412,7 +1419,7 @@ impl<P: TreeParams> NodeData<P> {
         match key.cmp_at_rank(&self.key, self.rank) {
             Ordering::Less => {
                 if !self.left.is_empty() {
-                    let left = store.data(&self.left)?;
+                    let left = store.data(self.left)?;
                     left.get0(key, store)
                 } else {
                     Ok(None)
@@ -1420,7 +1427,7 @@ impl<P: TreeParams> NodeData<P> {
             }
             Ordering::Greater => {
                 if !self.right.is_empty() {
-                    let right = store.data(&self.right)?;
+                    let right = store.data(self.right)?;
                     right.get0(key, store)
                 } else {
                     Ok(None)
@@ -1431,7 +1438,7 @@ impl<P: TreeParams> NodeData<P> {
     }
 
     fn dump0(&self, prefix: String, store: &impl StoreExt<P>) -> Result<()> {
-        println!(
+        tracing::info!(
             "{}{:?} rank={} order={:?} value={:?}",
             prefix,
             self.key,
@@ -1440,13 +1447,13 @@ impl<P: TreeParams> NodeData<P> {
             self.value
         );
         if !self.left.is_empty() {
-            println!("{} left:", prefix);
-            let left = store.data(&self.left)?;
+            tracing::info!("{} left:", prefix);
+            let left = store.data(self.left)?;
             left.dump0(format!("{}  ", prefix), store)?;
         }
         if !self.right.is_empty() {
-            println!("{} right:", prefix);
-            let right = store.data(&self.right)?;
+            tracing::info!("{} right:", prefix);
+            let right = store.data(self.right)?;
             right.dump0(format!("{}  ", prefix), store)?;
         }
         Ok(())
@@ -1465,8 +1472,8 @@ impl<P: TreeParams> NodeData<P> {
             left,
             right,
         } = self;
-        let left = store.data_opt(left)?;
-        let right = store.data_opt(right)?;
+        let left = store.data_opt(*left)?;
+        let right = store.data_opt(*right)?;
         let left_res = left
             .as_ref()
             .map(|node| node.assert_invariants(store, include_summary))
@@ -1533,16 +1540,16 @@ impl<P: TreeParams> NonEmptyNode<P> {
 
     fn persist(&self, store: &mut impl StoreExt<P>) -> Result<()> {
         if !self.left.is_empty() {
-            let left = store.data(&self.left)?;
+            let left = store.data(self.left)?;
             assert!(self.key.cmp_at_rank(&left.key, self.rank) == Ordering::Greater);
             assert!(left.rank < self.rank);
         }
         if !self.right.is_empty() {
-            let right = store.data(&self.right)?;
+            let right = store.data(self.right)?;
             assert!(self.key.cmp_at_rank(&right.key, self.rank) == Ordering::Less);
             assert!(right.rank <= self.rank);
         }
-        store.update(&self.id, &self.data)
+        store.update(self.id, &self.data)
     }
 
     // Insert a new node into the tree without balancing.
@@ -1562,14 +1569,14 @@ impl<P: TreeParams> NonEmptyNode<P> {
         } = self;
         match node.key.cmp_at_rank(parent_key, *parent_rank) {
             Ordering::Less => {
-                if let Node::NonEmpty(mut left) = store.get_node(&left)? {
+                if let Node::NonEmpty(mut left) = store.get_node(*left)? {
                     left.insert_no_balance(node, store)?;
                 } else {
                     *left = store.put(node)?;
                 }
             }
             Ordering::Greater => {
-                if let Node::NonEmpty(mut right) = store.get_node(&right)? {
+                if let Node::NonEmpty(mut right) = store.get_node(*right)? {
                     right.insert_no_balance(node, store)?;
                 } else {
                     *right = store.put(node)?;
@@ -1580,7 +1587,7 @@ impl<P: TreeParams> NonEmptyNode<P> {
             }
         }
         *parent_summary = parent_summary.combine(&node.summary);
-        store.update(id, &self.data)?;
+        store.update(*id, &self.data)?;
         Ok(())
     }
 
@@ -1599,14 +1606,14 @@ impl<P: TreeParams> NonEmptyNode<P> {
                 Some(old_value)
             }
             Ordering::Less => {
-                if let Node::NonEmpty(mut left) = store.get_node(&self.left)? {
+                if let Node::NonEmpty(mut left) = store.get_node(self.left)? {
                     left.update0(data, store)?
                 } else {
                     None
                 }
             }
             Ordering::Greater => {
-                if let Node::NonEmpty(mut right) = store.get_node(&self.right)? {
+                if let Node::NonEmpty(mut right) = store.get_node(self.right)? {
                     right.update0(data, store)?
                 } else {
                     None
@@ -1616,10 +1623,10 @@ impl<P: TreeParams> NonEmptyNode<P> {
         if old_value.is_some() {
             // recalculate the summary from scratch
             let mut summary = P::M::lift((self.key.clone(), self.value.clone()));
-            if let Some(left) = store.data_opt(&self.left)? {
+            if let Some(left) = store.data_opt(self.left)? {
                 summary = summary.combine(&left.summary);
             }
-            if let Some(right) = store.data_opt(&self.right)? {
+            if let Some(right) = store.data_opt(self.right)? {
                 summary = summary.combine(&right.summary);
             }
             self.summary = summary;
@@ -1633,8 +1640,9 @@ impl<P: TreeParams> NonEmptyNode<P> {
         x: NodeData<P>,
         store: &mut impl StoreExt<P>,
     ) -> Result<NodeId> {
-        let root = store.get_node(&root_id)?;
+        let root = store.get_node(root_id)?;
         let mut x = store.put_node(x)?;
+        tracing::info!("insert0 root_id={} x={:?}", root_id, x);
         let key = x.key.clone();
         let rank = x.rank;
         // Compare with x.key at x.rank
@@ -1661,9 +1669,9 @@ impl<P: TreeParams> NonEmptyNode<P> {
                 // cur is above x, just go down
                 prev = cur.clone();
                 cur = if key_gt_cur {
-                    store.get_node(&cur.left())
+                    store.get_node(cur.left())
                 } else {
-                    store.get_node(&cur.right())
+                    store.get_node(cur.right())
                 }?;
             } else {
                 // cur is below x
@@ -1683,11 +1691,13 @@ impl<P: TreeParams> NonEmptyNode<P> {
             let prev_cmp_x = prev.key.cmp_at_rank(&x.key, prev.rank);
             let prev_lt_x = prev_cmp_x == Ordering::Less;
             if prev_lt_x {
+                tracing::info!("setting x as right child of prev");
                 prev.right = x.id;
             } else {
+                tracing::info!("setting x as left child of prev");
                 prev.left = x.id;
             }
-            println!(
+            tracing::info!(
                 "prev.key={:?} x.key={:?} prev_cmp_x={:?} prev_lt_x={} {:?}",
                 prev.key,
                 x.key,
@@ -1701,17 +1711,23 @@ impl<P: TreeParams> NonEmptyNode<P> {
         if cur.is_empty() {
             return Ok(root_id);
         }
+
         {
             let cur = cur.non_empty().expect("cur is empty");
             // if key < cur.key then x.right ← cur else x.left ← cur
             let x_lt_cur = x_lt(&cur.key);
             if x_lt_cur {
+                tracing::info!("setting cur {:?} as right child of x {:?}", cur.key, key);
                 x.right = cur.id;
             } else {
+                tracing::info!("setting cur {:?} as left child of x {:?}", cur.key, key);
                 x.left = cur.id;
             }
         }
         x.persist(store)?;
+        tracing::info!("tree before unzip/repair:");
+        store.get_node(root_id)?.dump(store)?;
+        tracing::info!("---");
         // prev ← x
         prev = Node::NonEmpty(x.clone());
         // while cur 6= null do
@@ -1732,14 +1748,20 @@ impl<P: TreeParams> NonEmptyNode<P> {
             //   fix ← prev
             let mut fix = prev;
             let x_lt_cur = x_lt(&cur.key());
-            println!("x.key={:?} cur.key={:?}", fix.key(), cur.key());
-            if x_lt_cur {
+            let cur_lt_x = !x_lt_cur;
+            tracing::info!(
+                "fix loop x.key={:?} fix.key={:?} cur.key={:?}",
+                x.key,
+                fix.key(),
+                cur.key()
+            );
+            if cur_lt_x {
                 //   if cur.key < key then
                 //     repeat {prev ← cur ; cur ← cur.right}
                 //     until cur = null or cur.key > key
                 loop {
                     prev = cur.clone();
-                    cur = store.get_node(&cur.right())?;
+                    cur = store.get_node(cur.right())?;
                     let Node::NonEmpty(cur_ne) = &cur else {
                         break;
                     };
@@ -1753,7 +1775,7 @@ impl<P: TreeParams> NonEmptyNode<P> {
                 //     until cur = null or cur.key < key
                 loop {
                     prev = cur.clone();
-                    cur = store.get_node(&cur.left())?;
+                    cur = store.get_node(cur.left())?;
                     let Node::NonEmpty(cur_ne) = &cur else {
                         break;
                     };
@@ -1766,16 +1788,22 @@ impl<P: TreeParams> NonEmptyNode<P> {
             //     fix.left ← cur
             //   else
             //     fix.right ← cur
-            println!("x.id={} fix.id={} prev.id={}", x.id, fix.id(), prev.id());
+            tracing::info!("x.id={} fix.id={} prev.id={}", x.id, fix.id(), prev.id());
             let fix = fix.non_empty_mut().expect("fix is empty");
             let prev = prev.non_empty().expect("prev is empty");
-            println!(
-                "fix.key={:?} prev.key={:?} x.key={:?} cur={:?}",
-                fix.key, prev.key, key, cur
+            tracing::info!(
+                "fix.id={}, fix.key={:?} prev.key={:?} x.key={:?} cur={:?}",
+                fix.id,
+                fix.key,
+                prev.key,
+                key,
+                cur
             );
             if ((fix.id != x.id) && x_lt(&fix.key)) || ((fix.id == x.id) && x_lt(&prev.key)) {
+                tracing::info!("fixing fix.left to {}", cur.id());
                 fix.left = cur.id();
             } else {
+                tracing::info!("fixing fix.right to {}", cur.id());
                 fix.right = cur.id();
             }
             fix.persist(store)?;
@@ -1784,7 +1812,7 @@ impl<P: TreeParams> NonEmptyNode<P> {
     }
 }
 
-fn count_trailing_zeros(hash: &[u8; 32]) -> u8 {
+pub fn count_trailing_zeros(hash: &[u8; 32]) -> u8 {
     let mut rank = 0;
     for byte in hash.iter().rev() {
         if *byte == 0 {

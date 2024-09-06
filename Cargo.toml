@@ -15,7 +15,7 @@ hex = "0.4.3"
 itertools = "0.13.0"
 postcard = { version = "1.0.8", features = ["use-std"] }
 proptest = "1.5.0"
-rand = "0.8.5"
+rand = { version = "0.8.5", features = ["small_rng"] }
 redb = "2.0.0"
 ref-cast = "1.0.22"
 self_cell = "1.0.3"

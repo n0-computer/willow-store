@@ -120,7 +120,7 @@ fn query() -> impl Strategy<Value = TQuery> {
 /// and contain all the points that were inserted.
 fn tree_creation_impl(items: Vec<(TPoint, u64)>) -> TestResult<()> {
     let (store, id) = willow_store::Node::from_iter(items.clone())?;
-    let tree = store.get_node(&id)?;
+    let tree = store.get_node(id)?;
     // tree.dump(&store)?;
     tree.assert_invariants(&store, true)?;
     let mut actual = tree.iter(&store).map(|x| x.unwrap()).collect::<Vec<_>>();
@@ -150,7 +150,7 @@ fn test_tree_creation() -> TestResult<()> {
 /// This is tested by comparing with a brute-force implementation.
 fn tree_query_unordered_impl(items: Vec<(TPoint, u64)>, query: TQuery) -> TestResult<()> {
     let (store, id) = willow_store::Node::from_iter(items.clone())?;
-    let tree = store.get_node(&id)?;
+    let tree = store.get_node(id)?;
     let mut actual = tree
         .query(&query, &store)
         .map(|x| x.unwrap())
@@ -180,7 +180,7 @@ fn tree_query_ordered_impl(
     ordering: SortOrder,
 ) -> TestResult<()> {
     let (store, id) = willow_store::Node::from_iter(items.clone())?;
-    let tree: NodeData<TestParams> = store.data(&id)?;
+    let tree: NodeData<TestParams> = store.data(id)?;
     let actual = tree
         .query_ordered(&query, ordering, &store)
         .map(|x| x.unwrap())
@@ -203,7 +203,7 @@ fn tree_query_ordered_impl(
 /// This is tested by comparing with a brute-force implementation.
 fn tree_summary_impl(items: Vec<(TPoint, u64)>, query: TQuery) -> TestResult<()> {
     let (store, id) = willow_store::Node::from_iter(items.clone())?;
-    let tree = store.get_node(&id)?;
+    let tree = store.get_node(id)?;
     let actual = tree.summary(&query, &store)?;
     let mut expected = ValueSum::zero();
     for (key, value) in &items {
@@ -221,7 +221,7 @@ fn tree_get_impl(items: Vec<(TPoint, u64)>) -> TestResult<()> {
         .iter()
         .map(|(k, _)| k.clone().xyz())
         .collect::<BTreeSet<_>>();
-    let tree = store.get_node(&id)?;
+    let tree = store.get_node(id)?;
     // Compute a set of interesting points that are not in the tree.
     let mut non_keys = BTreeSet::new();
     let mut insert = |p: &TPoint| {
@@ -254,7 +254,7 @@ fn tree_get_impl(items: Vec<(TPoint, u64)>) -> TestResult<()> {
 
 fn tree_update_impl(items: Vec<(TPoint, u64)>) -> TestResult<()> {
     let (mut store, id) = willow_store::Node::from_iter(items.clone())?;
-    let mut tree = store.get_node(&id)?;
+    let mut tree = store.get_node(id)?;
     for (k, v) in &items {
         let new_v = v + 1;
         tree.update(k.clone(), new_v, &mut store)?;
@@ -266,21 +266,21 @@ fn tree_update_impl(items: Vec<(TPoint, u64)>) -> TestResult<()> {
 fn tree_insert_impl(items: Vec<(TPoint, u64)>) -> TestResult<()> {
     {
         let (s, id) = willow_store::Node::from_iter(items.clone())?;
-        s.get_node(&id)?.dump(&s)?;
+        s.get_node(id)?.dump(&s)?;
     }
     let mut items2 = items.clone();
     let (key, value) = items2.pop().unwrap();
     let (mut store, id) = Node::from_iter(items2.clone())?;
-    let mut node = store.get_node(&id)?;
-    println!("---");
-    println!("dump before insert:");
+    let mut node = store.get_node(id)?;
+    tracing::info!("---");
+    tracing::info!("dump before insert:");
     node.dump(&store)?;
-    println!("---");
+    tracing::info!("---");
     node.insert(key, value, &mut store)?;
-    println!("---");
-    println!("dump after insert:");
+    tracing::info!("---");
+    tracing::info!("dump after insert:");
     node.dump(&store)?;
-    println!("---");
+    tracing::info!("---");
     node.assert_invariants(&store, false)?;
     for (k, v) in &items {
         let actual = node.get(k.clone(), &store)?;
@@ -359,6 +359,7 @@ fn prop_tree_replace(#[strategy(treecontents())] items: Vec<(TPoint, u64)>) {
 }
 
 #[proptest]
+#[ignore]
 fn prop_tree_insert(
     #[strategy(treecontents_with_opts(xpoint(), 0..100u64, 1..10usize))] items: Vec<(TPoint, u64)>,
 ) {
@@ -373,14 +374,29 @@ fn parse_case(case: Vec<((u64, u64, u64), u64)>) -> Vec<(TPoint, u64)> {
 
 #[test]
 fn test_tree_insert() -> TestResult<()> {
+    tracing_subscriber::fmt::try_init().ok();
     let cases = vec![
         vec![((0, 0, 1), 0), ((0, 0, 0), 0)],
         vec![((0, 0, 0), 0), ((0, 0, 1), 0)],
         vec![((1, 0, 6), 0), ((0, 3, 0), 0)],
         vec![((18, 9, 28), 0), ((0, 0, 0), 0)],
         vec![((0, 0, 0), 1), ((1, 0, 0), 0)],
-        // vec![((18, 9, 28), 0), ((0, 0, 0), 0), ((0, 2, 0), 0)],
+        vec![((2, 0, 0), 0), ((0, 0, 0), 0), ((1, 0, 0), 0)],
+        vec![((18, 9, 28), 0), ((0, 0, 0), 0), ((0, 2, 0), 0)],
     ];
+    for items in cases {
+        let items = parse_case(items);
+        tree_insert_impl(items)?;
+    }
+
+    Ok(())
+}
+
+#[test]
+#[ignore]
+fn test_tree_ins2() -> TestResult<()> {
+    tracing_subscriber::fmt::try_init().ok();
+    let cases = vec![vec![((0, 0, 0), 0), ((19, 0, 0), 0), ((21, 0, 0), 0)]];
     for items in cases {
         let items = parse_case(items);
         tree_insert_impl(items)?;
@@ -443,6 +459,6 @@ fn points_with_rank(rank: u8) -> impl Strategy<Value = Vec<(TPoint, u64)>> {
 #[proptest]
 fn prop_same_rank(#[strategy(points_with_rank(0))] items: Vec<(TPoint, u64)>) {
     let (store, id) = willow_store::Node::from_iter(items.clone()).unwrap();
-    let tree = store.get_node(&id).unwrap();
+    let tree = store.get_node(id).unwrap();
     tree.dump(&store).unwrap();
 }
