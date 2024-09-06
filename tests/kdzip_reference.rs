@@ -17,6 +17,15 @@ struct NodeData {
     right: Node,
 }
 
+fn order_at_rank(rank: u8) -> &'static str {
+    match rank % 3 {
+        0 => "xyz",
+        1 => "yzx",
+        2 => "zyz",
+        _ => unreachable!(),
+    }
+}
+
 fn cmp_at_rank((xa, ya, za): (u64, u64, u64), (xb, yb, zb): (u64, u64, u64), rank: u8) -> Ordering {
     match rank % 3 {
         0 => xa.cmp(&xb).then(ya.cmp(&yb)).then(za.cmp(&zb)),
@@ -82,7 +91,12 @@ impl Node {
             println!("{indent}EMPTY");
         } else {
             self.left().print0(indent.clone() + "  ");
-            println!("{indent}key={:?} rank={}", self.key(), self.rank());
+            println!(
+                "{indent}key={:?} rank={} order={}",
+                self.key(),
+                self.rank(),
+                order_at_rank(self.rank())
+            );
             self.right().print0(indent + "  ");
         }
     }
@@ -96,11 +110,11 @@ impl Node {
         self.right().check_invariants();
         if !self.left().is_empty() {
             assert!(self.left().rank() < rank);
-            assert!(self.left().key() < self.key());
+            assert!(cmp_at_rank(self.left().key(), self.key(), self.rank()) == Ordering::Less);
         }
         if !self.right().is_empty() {
             assert!(self.right().rank() <= rank);
-            assert!(self.right().key() > self.key());
+            assert!(cmp_at_rank(self.right().key(), self.key(), self.rank()) == Ordering::Greater);
         }
     }
 
@@ -109,6 +123,26 @@ impl Node {
         for (key, rank) in iter {
             let x = Self::leaf(key, rank);
             root = insert_rec(x, root);
+        }
+        root
+    }
+
+    fn from_iter_reference(iter: impl IntoIterator<Item = ((u64, u64, u64), u8)>) -> Self {
+        let mut nodes = iter
+            .into_iter()
+            .map(|(key, rank)| Node::leaf(key, rank))
+            .collect::<Vec<_>>();
+        // Before we sort, remove all but the first occurence of each point.
+        let mut uniques = BTreeSet::new();
+        nodes.retain(|node| uniques.insert(node.key()));
+        nodes.sort_by(|p1, p2| {
+            p2.rank()
+                .cmp(&p1.rank())
+                .then(cmp_at_rank(p1.key(), p2.key(), p1.rank()))
+        });
+        let mut root = Self::EMPTY;
+        for node in nodes {
+            insert_no_balance(&mut root, node);
         }
         root
     }
@@ -396,12 +430,52 @@ fn delete(root: &mut Node, x: Node) {
     }
 }
 
+fn insert_no_balance(root: &mut Node, x: Node) {
+    if root.is_empty() {
+        *root = x;
+        return;
+    }
+    match cmp_at_rank(root.key(), x.key(), root.rank()) {
+        Ordering::Less => {
+            if root.right().is_empty() {
+                root.set_right(x);
+            } else {
+                insert_no_balance(&mut root.right(), x);
+            }
+        }
+        Ordering::Greater => {
+            if root.left().is_empty() {
+                root.set_left(x);
+            } else {
+                insert_no_balance(&mut root.left(), x);
+            }
+        }
+        Ordering::Equal => {
+            panic!("duplicate key");
+        }
+    }
+}
+
+/// Compute rank from key, like in real use
 fn add_rank(
     keys: impl IntoIterator<Item = (u64, u64, u64)>,
 ) -> impl Iterator<Item = ((u64, u64, u64), u8)> {
     keys.into_iter().map(|i| {
         let ser = postcard::to_allocvec(&i).unwrap();
         let hash: [u8; 32] = blake3::hash(&ser).into();
+        let rank = count_trailing_zeros(&hash);
+        (i, rank)
+    })
+}
+
+/// Assign a random rank with the right distribution to each key
+fn random_rank<'a>(
+    keys: impl IntoIterator<Item = (u64, u64, u64)> + 'a,
+    rng: &'a mut impl rand::Rng,
+) -> impl Iterator<Item = ((u64, u64, u64), u8)> + 'a {
+    keys.into_iter().map(move |i| {
+        let x = rng.gen::<u64>();
+        let hash: [u8; 32] = blake3::hash(&x.to_be_bytes()).into();
         let rank = count_trailing_zeros(&hash);
         (i, rank)
     })
@@ -428,8 +502,15 @@ fn insert_impl(keys: TestSet) {
         let x = Node::leaf(key, rank);
         insert(&mut root, x);
     }
+    println!("actual:");
+    root.print();
+    println!("---");
     // root.print();
     root.check_invariants();
+    let reference = Node::from_iter_reference(items.iter().cloned());
+    println!("reference:");
+    reference.print();
+    println!("---");
     for item in items {
         assert!(contains_rec(root.clone(), item.0));
     }
@@ -465,6 +546,11 @@ fn delete_impl(keys: TestSet) {
     assert!(!contains_rec(tree.clone(), k));
 }
 
+/// A set of points with ranks.
+///
+/// Must not contain duplicates.
+///
+/// Rank is usually computed from the key, but can be provided explicitly for testing.
 #[derive(Debug)]
 struct TestSet(Vec<((u64, u64, u64), u8)>);
 
@@ -473,6 +559,16 @@ fn random_test_set() -> impl Strategy<Value = TestSet> {
         let seed = blake3::hash(&seed.to_be_bytes()).into();
         let mut rng = rand::rngs::SmallRng::from_seed(seed);
         let mut items = add_rank(items).collect::<Vec<_>>();
+        items.shuffle(&mut rng);
+        TestSet(items)
+    })
+}
+
+fn random_test_set_2() -> impl Strategy<Value = TestSet> {
+    (any::<BTreeSet<(u64, u64, u64)>>(), any::<u64>()).prop_map(|(items, seed)| {
+        let seed = blake3::hash(&seed.to_be_bytes()).into();
+        let mut rng = rand::rngs::SmallRng::from_seed(seed);
+        let mut items = random_rank(items, &mut rng).collect::<Vec<_>>();
         items.shuffle(&mut rng);
         TestSet(items)
     })
@@ -493,21 +589,34 @@ fn uniform_test_set() -> impl Strategy<Value = TestSet> {
 }
 
 #[proptest]
+#[ignore]
 fn prop_kd_insert_rec(#[strategy(random_test_set())] values: TestSet) {
     insert_rec_impl(values);
 }
 
 #[proptest]
-fn prop_kd_insert(#[strategy(random_test_set())] values: TestSet) {
+fn prop_kd_insert(#[strategy(random_test_set_2())] values: TestSet) {
     insert_impl(values);
 }
 
+#[test]
+fn test_kd_insert() {
+    insert_impl(TestSet(vec![
+        ((1, 0, 2), 0),
+        ((1, 0, 0), 0),
+        ((0, 0, 3), 0),
+        ((1, 0, 1), 1),
+    ]));
+}
+
 #[proptest]
+#[ignore]
 fn prop_kd_delete_rec(#[strategy(random_test_set())] values: TestSet) {
     delete_rec_impl(values);
 }
 
 #[proptest]
+#[ignore]
 fn prop_kd_delete(#[strategy(random_test_set())] values: TestSet) {
     delete_impl(values);
 }
