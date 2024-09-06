@@ -260,9 +260,12 @@ fn insert(root: &mut Node, x: Node) {
     let key = x.key();
     let mut cur = root.clone();
     let mut prev = Node::EMPTY;
-    while !cur.is_empty() && (rank < cur.rank() || (rank == cur.rank() && key > cur.key())) {
+    while !cur.is_empty()
+        && (rank < cur.rank()
+            || (rank == cur.rank() && cmp_at_rank(key, cur.key(), cur.rank()) == Ordering::Greater))
+    {
         prev = cur.clone();
-        cur = if key < cur.key() {
+        cur = if cmp_at_rank(key, cur.key(), cur.rank()) == Ordering::Less {
             cur.left()
         } else {
             cur.right()
@@ -270,7 +273,7 @@ fn insert(root: &mut Node, x: Node) {
     }
     if &cur == root {
         *root = x.clone();
-    } else if key < prev.key() {
+    } else if cmp_at_rank(key, prev.key(), prev.rank()) == Ordering::Less {
         prev.set_left(x.clone());
     } else {
         prev.set_right(x.clone());
@@ -280,7 +283,7 @@ fn insert(root: &mut Node, x: Node) {
         x.set_right(Node::EMPTY);
         return;
     }
-    if key < cur.key() {
+    if cmp_at_rank(key, cur.key(), rank) == Ordering::Less {
         x.set_right(cur.clone());
     } else {
         x.set_left(cur.clone());
@@ -288,11 +291,11 @@ fn insert(root: &mut Node, x: Node) {
     prev = x.clone();
     while !cur.is_empty() {
         let fix = prev.clone();
-        if cur.key() < key {
+        if cmp_at_rank(cur.key(), key, rank) == Ordering::Less {
             loop {
                 prev = cur.clone();
                 cur = cur.right();
-                if cur.is_empty() || cur.key() > key {
+                if cur.is_empty() || cmp_at_rank(cur.key(), key, rank) == Ordering::Greater {
                     break;
                 }
             }
@@ -300,12 +303,14 @@ fn insert(root: &mut Node, x: Node) {
             loop {
                 prev = cur.clone();
                 cur = cur.left();
-                if cur.is_empty() || cur.key() < key {
+                if cur.is_empty() || cmp_at_rank(cur.key(), key, rank) == Ordering::Less {
                     break;
                 }
             }
         }
-        if fix.key() > key || (fix == x && prev.key() > key) {
+        if cmp_at_rank(fix.key(), key, rank) == Ordering::Greater
+            || (fix == x && cmp_at_rank(prev.key(), key, rank) == Ordering::Greater)
+        {
             fix.set_left(cur.clone());
         } else {
             fix.set_right(cur.clone());
@@ -473,6 +478,20 @@ fn random_test_set() -> impl Strategy<Value = TestSet> {
     })
 }
 
+fn uniform_test_set() -> impl Strategy<Value = TestSet> {
+    (any::<BTreeSet<u64>>(), any::<u64>()).prop_map(|(items, seed)| {
+        let seed = blake3::hash(&seed.to_be_bytes()).into();
+        let mut rng = rand::rngs::SmallRng::from_seed(seed);
+        let items = items
+            .into_iter()
+            .map(|x| (x, x, x))
+            .collect::<BTreeSet<_>>();
+        let mut items = add_rank(items).collect::<Vec<_>>();
+        items.shuffle(&mut rng);
+        TestSet(items)
+    })
+}
+
 #[proptest]
 fn prop_kd_insert_rec(#[strategy(random_test_set())] values: TestSet) {
     insert_rec_impl(values);
@@ -490,5 +509,25 @@ fn prop_kd_delete_rec(#[strategy(random_test_set())] values: TestSet) {
 
 #[proptest]
 fn prop_kd_delete(#[strategy(random_test_set())] values: TestSet) {
+    delete_impl(values);
+}
+
+#[proptest]
+fn prop_kd_insert_rec_uniform(#[strategy(uniform_test_set())] values: TestSet) {
+    insert_rec_impl(values);
+}
+
+#[proptest]
+fn prop_kd_insert_uniform(#[strategy(uniform_test_set())] values: TestSet) {
+    insert_impl(values);
+}
+
+#[proptest]
+fn prop_kd_delete_rec_uniform(#[strategy(uniform_test_set())] values: TestSet) {
+    delete_rec_impl(values);
+}
+
+#[proptest]
+fn prop_kd_delete_uniform(#[strategy(uniform_test_set())] values: TestSet) {
     delete_impl(values);
 }
