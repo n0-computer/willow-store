@@ -3,7 +3,7 @@
 //!
 //! To literally follow the paper, we implement semantics of an OO language
 //! with freely shareable pointers that can possibly be null (empty).
-use std::{cell::RefCell, cmp::Ordering, collections::BTreeSet, rc::Rc};
+use std::{cell::RefCell, cmp::Ordering, collections::BTreeSet, fmt::Debug, rc::Rc};
 
 use proptest::prelude::{any, Strategy};
 use rand::{seq::SliceRandom, SeedableRng};
@@ -38,6 +38,16 @@ fn cmp_at_rank((xa, ya, za): (u64, u64, u64), (xb, yb, zb): (u64, u64, u64), ran
 #[derive(Clone)]
 struct Node(Option<Rc<RefCell<NodeData>>>);
 
+impl Debug for Node {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_empty() {
+            write!(f, "EMPTY")
+        } else {
+            write!(f, "Node({:?}, {})", self.key(), self.rank())
+        }
+    }
+}
+
 impl Node {
     const EMPTY: Self = Self(None);
 
@@ -52,6 +62,10 @@ impl Node {
 
     fn is_empty(&self) -> bool {
         self.0.is_none()
+    }
+
+    fn is_leaf(&self) -> bool {
+        !self.is_empty() && self.left().is_empty() && self.right().is_empty()
     }
 
     fn rank(&self) -> u8 {
@@ -159,15 +173,101 @@ impl PartialEq for Node {
 }
 
 // contains is trivial and not given in the paper.
-fn contains_rec(root: Node, key: (u64, u64, u64)) -> bool {
-    if root.is_empty() {
+fn contains_rec(node: Node, key: (u64, u64, u64)) -> bool {
+    if node.is_empty() {
         false
-    } else if key == root.key() {
+    } else if key == node.key() {
         true
-    } else if cmp_at_rank(key, root.key(), root.rank()) == Ordering::Less {
-        contains_rec(root.left(), key)
+    } else if cmp_at_rank(key, node.key(), node.rank()) == Ordering::Less {
+        contains_rec(node.left(), key)
     } else {
-        contains_rec(root.right(), key)
+        contains_rec(node.right(), key)
+    }
+}
+
+fn split_to_vec(node: &Node, key: (u64, u64, u64), rank: u8) -> Vec<Node> {
+    let mut res = vec![];
+    split_rec(node, key, rank, &mut res);
+    if res.is_empty() {
+        res.push(node.clone());
+    }
+    res
+}
+
+/// Convert a node into a list of nodes, non-recursively.
+fn flatten(node: &Node, res: &mut Vec<Node>) {
+    if node.is_empty() {
+        return;
+    }
+    if !node.left().is_empty() {
+        res.push(node.left().clone());
+        node.set_left(Node::EMPTY);
+    }
+    res.push(node.clone());
+    if !node.right().is_empty() {
+        res.push(node.right().clone());
+        node.set_right(Node::EMPTY);
+    }
+}
+
+// splits a tree into parts that don't overlap with the key
+fn split_rec(node: &Node, key: (u64, u64, u64), rank: u8, res: &mut Vec<Node>) -> (bool, bool) {
+    if node.is_empty() {
+        return (false, false);
+    }
+    let same_sort = node.rank() % 3 == rank % 3;
+    let cmp = cmp_at_rank(node.key(), key, rank);
+    if same_sort {
+        match cmp {
+            Ordering::Less => {
+                // left does not need to be split
+                // self does not need to be split
+                // right might need to be split
+                let (has_left, has_right) = split_rec(&node.right(), key, rank, res);
+                if has_left && has_right {
+                    assert!(has_right);
+                    node.set_right(Node::EMPTY);
+                }
+                if has_right {
+                    flatten(node, res);
+                }
+                (true, has_right)
+            }
+            Ordering::Greater => {
+                // left might need to be split
+                // self does not need to be split
+                // right does not need to be split
+                let (has_left, has_right) = split_rec(&node.left(), key, rank, res);
+                if has_left && has_right {
+                    node.set_left(Node::EMPTY);
+                }
+                if has_left {
+                    flatten(node, res);
+                }
+                (has_left, true)
+            }
+            Ordering::Equal => {
+                panic!("duplicate key");
+            }
+        }
+    } else {
+        assert!(cmp != Ordering::Equal, "duplicate key");
+        let (left_left, left_right) = split_rec(&node.left(), key, rank, res);
+        if left_left && left_right {
+            node.set_left(Node::EMPTY);
+        }
+        let (right_left, right_right) = split_rec(&node.right(), key, rank, res);
+        if right_left && right_right {
+            node.set_right(Node::EMPTY);
+        }
+        let self_left = cmp == Ordering::Less;
+        let self_right = cmp == Ordering::Greater;
+        let res_left = left_left || self_left || right_left;
+        let res_right = left_right || self_right || right_right;
+        if res_left && res_right {
+            flatten(node, res);
+        }
+        (res_left, res_right)
     }
 }
 
@@ -290,6 +390,7 @@ fn delete_rec(x: Node, root: Node) -> Node {
 //   else
 //     fix .right ← cur
 fn insert(root: &mut Node, x: Node) {
+    println!("insert root={:?} x={:?}", root, x);
     let rank = x.rank();
     let key = x.key();
     let mut cur = root.clone();
@@ -306,6 +407,7 @@ fn insert(root: &mut Node, x: Node) {
         };
     }
     if &cur == root {
+        println!("x becomes new root");
         *root = x.clone();
     } else if cmp_at_rank(key, prev.key(), prev.rank()) == Ordering::Less {
         prev.set_left(x.clone());
@@ -313,18 +415,20 @@ fn insert(root: &mut Node, x: Node) {
         prev.set_right(x.clone());
     }
     if cur.is_empty() {
-        x.set_left(Node::EMPTY);
-        x.set_right(Node::EMPTY);
+        assert!(x.is_leaf());
         return;
     }
     if cmp_at_rank(key, cur.key(), rank) == Ordering::Less {
+        println!("cur {:?} becomes right child of x {:?}", cur, x);
         x.set_right(cur.clone());
     } else {
+        println!("cur {:?} becomes left child of x {:?}", cur, x);
         x.set_left(cur.clone());
     }
     prev = x.clone();
     while !cur.is_empty() {
         let fix = prev.clone();
+        println!("fix key={:?} rank={}", fix.key(), fix.rank());
         if cmp_at_rank(cur.key(), key, rank) == Ordering::Less {
             loop {
                 prev = cur.clone();
@@ -456,187 +560,299 @@ fn insert_no_balance(root: &mut Node, x: Node) {
     }
 }
 
-/// Compute rank from key, like in real use
-fn add_rank(
-    keys: impl IntoIterator<Item = (u64, u64, u64)>,
-) -> impl Iterator<Item = ((u64, u64, u64), u8)> {
-    keys.into_iter().map(|i| {
-        let ser = postcard::to_allocvec(&i).unwrap();
-        let hash: [u8; 32] = blake3::hash(&ser).into();
-        let rank = count_trailing_zeros(&hash);
-        (i, rank)
-    })
+struct Relation {
+    left: bool,
+    right: bool,
 }
 
-/// Assign a random rank with the right distribution to each key
-fn random_rank<'a>(
-    keys: impl IntoIterator<Item = (u64, u64, u64)> + 'a,
-    rng: &'a mut impl rand::Rng,
-) -> impl Iterator<Item = ((u64, u64, u64), u8)> + 'a {
-    keys.into_iter().map(move |i| {
-        let x = rng.gen::<u64>();
-        let hash: [u8; 32] = blake3::hash(&x.to_be_bytes()).into();
-        let rank = count_trailing_zeros(&hash);
-        (i, rank)
-    })
-}
-
-fn insert_rec_impl(keys: TestSet) {
-    let items = keys.0;
-    let mut root = Node::EMPTY;
-    for (key, rank) in items.clone() {
-        let x = Node::leaf(key, rank);
-        root = insert_rec(x, root);
+impl Relation {
+    fn empty() -> Self {
+        Self {
+            left: false,
+            right: false,
+        }
     }
-    // root.print();
-    root.check_invariants();
-    for item in items {
-        assert!(contains_rec(root.clone(), item.0));
+    fn new(left: bool, right: bool) -> Self {
+        Self { left, right }
+    }
+    fn combine(lhs: Self, rhs: Self) -> Self {
+        Self::new(lhs.left || rhs.left, lhs.right || rhs.right)
+    }
+    fn is_both(&self) -> bool {
+        self.left && self.right
     }
 }
 
-fn insert_impl(keys: TestSet) {
-    let items = keys.0;
-    let mut root = Node::EMPTY;
-    for (key, rank) in items.clone() {
-        let x = Node::leaf(key, rank);
-        insert(&mut root, x);
+mod tests {
+    use super::*;
+    /// Compute rank from key, like in real use
+    fn add_rank(
+        keys: impl IntoIterator<Item = (u64, u64, u64)>,
+    ) -> impl Iterator<Item = ((u64, u64, u64), u8)> {
+        keys.into_iter().map(|i| {
+            let ser = postcard::to_allocvec(&i).unwrap();
+            let hash: [u8; 32] = blake3::hash(&ser).into();
+            let rank = count_trailing_zeros(&hash);
+            (i, rank)
+        })
     }
-    println!("actual:");
-    root.print();
-    println!("---");
-    // root.print();
-    root.check_invariants();
-    let reference = Node::from_iter_reference(items.iter().cloned());
-    println!("reference:");
-    reference.print();
-    println!("---");
-    for item in items {
-        assert!(contains_rec(root.clone(), item.0));
+
+    /// Assign a random rank with the right distribution to each key
+    fn random_rank<'a>(
+        keys: impl IntoIterator<Item = (u64, u64, u64)> + 'a,
+        rng: &'a mut impl rand::Rng,
+    ) -> impl Iterator<Item = ((u64, u64, u64), u8)> + 'a {
+        keys.into_iter().map(move |i| {
+            let x = rng.gen::<u64>();
+            let hash: [u8; 32] = blake3::hash(&x.to_be_bytes()).into();
+            let rank = count_trailing_zeros(&hash);
+            (i, rank)
+        })
     }
-}
 
-fn delete_rec_impl(keys: TestSet) {
-    let items = keys.0;
-    if items.is_empty() {
-        return;
+    fn insert_rec_impl(keys: TestSet) {
+        let items = keys.0;
+        let mut root = Node::EMPTY;
+        for (key, rank) in items.clone() {
+            let x = Node::leaf(key, rank);
+            root = insert_rec(x, root);
+        }
+        // root.print();
+        root.check_invariants();
+        for item in items {
+            assert!(contains_rec(root.clone(), item.0));
+        }
     }
-    let (k, r) = items[0];
-    let tree = Node::from_iter(items.iter().cloned());
-    let tree = delete_rec(Node::leaf(k, r), tree);
-    tree.check_invariants();
-    for (key, _) in items.into_iter().skip(1) {
-        assert!(contains_rec(tree.clone(), key));
+
+    fn insert_impl(keys: TestSet) {
+        let reference = keys.0;
+        if reference.is_empty() {
+            return;
+        }
+        let mut items = reference.clone();
+        let (key, rank) = items.pop().unwrap();
+        let mut root = Node::from_iter_reference(items.clone());
+        {
+            println!("BEFORE");
+            println!("actual:");
+            root.print();
+            // root.print();
+            root.check_invariants();
+            let reference_node = Node::from_iter_reference(items.clone());
+            println!("reference:");
+            reference_node.print();
+            println!("");
+        }
+        insert(&mut root, Node::leaf(key, rank));
+        {
+            println!("AFTER");
+            println!("actual:");
+            root.print();
+            // root.print();
+            root.check_invariants();
+            let reference_node = Node::from_iter_reference(reference.clone());
+            println!("reference:");
+            reference_node.print();
+        }
+        for item in reference {
+            assert!(contains_rec(root.clone(), item.0));
+        }
     }
-    assert!(!contains_rec(tree.clone(), k));
-}
 
-fn delete_impl(keys: TestSet) {
-    let items = keys.0;
-    if items.is_empty() {
-        return;
+    fn delete_rec_impl(keys: TestSet) {
+        let items = keys.0;
+        if items.is_empty() {
+            return;
+        }
+        let (k, r) = items[0];
+        let tree = Node::from_iter(items.iter().cloned());
+        let tree = delete_rec(Node::leaf(k, r), tree);
+        tree.check_invariants();
+        for (key, _) in items.into_iter().skip(1) {
+            assert!(contains_rec(tree.clone(), key));
+        }
+        assert!(!contains_rec(tree.clone(), k));
     }
-    let (k, r) = items[0];
-    let mut tree = Node::from_iter(items.iter().cloned());
-    delete(&mut tree, Node::leaf(k, r));
-    tree.check_invariants();
-    for (key, _) in items.into_iter().skip(1) {
-        assert!(contains_rec(tree.clone(), key));
+
+    fn delete_impl(keys: TestSet) {
+        let items = keys.0;
+        if items.is_empty() {
+            return;
+        }
+        let (k, r) = items[0];
+        let mut tree = Node::from_iter(items.iter().cloned());
+        delete(&mut tree, Node::leaf(k, r));
+        tree.check_invariants();
+        for (key, _) in items.into_iter().skip(1) {
+            assert!(contains_rec(tree.clone(), key));
+        }
+        assert!(!contains_rec(tree.clone(), k));
     }
-    assert!(!contains_rec(tree.clone(), k));
-}
 
-/// A set of points with ranks.
-///
-/// Must not contain duplicates.
-///
-/// Rank is usually computed from the key, but can be provided explicitly for testing.
-#[derive(Debug)]
-struct TestSet(Vec<((u64, u64, u64), u8)>);
+    fn split_impl(keys: TestSet) {
+        let reference = keys.0;
+        if reference.is_empty() {
+            return;
+        }
+        let mut items = reference.clone();
+        let (key, rank) = items.pop().unwrap();
+        let tree = Node::from_iter_reference(items.iter().cloned());
+        for (key, _rank) in items.iter().cloned() {
+            if !contains_rec(tree.clone(), key) {
+                println!("broken tree:");
+                tree.print();
+                println!("missing key={:?}", key);
+                assert!(false);
+            }
+        }
+        println!("full:");
+        tree.print();
+        let parts = split_to_vec(&tree, key, rank);
+        println!("items.len()={} parts.len()={}", items.len(), parts.len());
 
-fn random_test_set() -> impl Strategy<Value = TestSet> {
-    (any::<BTreeSet<(u64, u64, u64)>>(), any::<u64>()).prop_map(|(items, seed)| {
-        let seed = blake3::hash(&seed.to_be_bytes()).into();
-        let mut rng = rand::rngs::SmallRng::from_seed(seed);
-        let mut items = add_rank(items).collect::<Vec<_>>();
-        items.shuffle(&mut rng);
-        TestSet(items)
-    })
-}
+        for (key, _rank) in items {
+            let count = parts
+                .iter()
+                .filter(|x| contains_rec((*x).clone(), key))
+                .count();
+            if count != 1 {
+                for part in &parts {
+                    println!("part:");
+                    part.print();
+                }
+                println!("missing key={:?}", key);
+            }
+            assert_eq!(count, 1);
+        }
+    }
 
-fn random_test_set_2() -> impl Strategy<Value = TestSet> {
-    (any::<BTreeSet<(u64, u64, u64)>>(), any::<u64>()).prop_map(|(items, seed)| {
-        let seed = blake3::hash(&seed.to_be_bytes()).into();
-        let mut rng = rand::rngs::SmallRng::from_seed(seed);
-        let mut items = random_rank(items, &mut rng).collect::<Vec<_>>();
-        items.shuffle(&mut rng);
-        TestSet(items)
-    })
-}
+    /// A set of points with ranks.
+    ///
+    /// Must not contain duplicates.
+    ///
+    /// Rank is usually computed from the key, but can be provided explicitly for testing.
+    #[derive(Debug)]
+    struct TestSet(Vec<((u64, u64, u64), u8)>);
 
-fn uniform_test_set() -> impl Strategy<Value = TestSet> {
-    (any::<BTreeSet<u64>>(), any::<u64>()).prop_map(|(items, seed)| {
-        let seed = blake3::hash(&seed.to_be_bytes()).into();
-        let mut rng = rand::rngs::SmallRng::from_seed(seed);
-        let items = items
-            .into_iter()
-            .map(|x| (x, x, x))
-            .collect::<BTreeSet<_>>();
-        let mut items = add_rank(items).collect::<Vec<_>>();
-        items.shuffle(&mut rng);
-        TestSet(items)
-    })
-}
+    fn random_test_set() -> impl Strategy<Value = TestSet> {
+        (any::<BTreeSet<(u64, u64, u64)>>(), any::<u64>()).prop_map(|(items, seed)| {
+            let seed = blake3::hash(&seed.to_be_bytes()).into();
+            let mut rng = rand::rngs::SmallRng::from_seed(seed);
+            let mut items = add_rank(items).collect::<Vec<_>>();
+            items.shuffle(&mut rng);
+            TestSet(items)
+        })
+    }
 
-#[proptest]
-#[ignore]
-fn prop_kd_insert_rec(#[strategy(random_test_set())] values: TestSet) {
-    insert_rec_impl(values);
-}
+    fn random_test_set_2() -> impl Strategy<Value = TestSet> {
+        (any::<BTreeSet<(u64, u64, u64)>>(), any::<u64>()).prop_map(|(items, seed)| {
+            let seed = blake3::hash(&seed.to_be_bytes()).into();
+            let mut rng = rand::rngs::SmallRng::from_seed(seed);
+            let mut items = random_rank(items, &mut rng).collect::<Vec<_>>();
+            items.shuffle(&mut rng);
+            TestSet(items)
+        })
+    }
 
-#[proptest]
-fn prop_kd_insert(#[strategy(random_test_set_2())] values: TestSet) {
-    insert_impl(values);
-}
+    fn uniform_test_set() -> impl Strategy<Value = TestSet> {
+        (any::<BTreeSet<u64>>(), any::<u64>()).prop_map(|(items, seed)| {
+            let seed = blake3::hash(&seed.to_be_bytes()).into();
+            let mut rng = rand::rngs::SmallRng::from_seed(seed);
+            let items = items
+                .into_iter()
+                .map(|x| (x, x, x))
+                .collect::<BTreeSet<_>>();
+            let mut items = add_rank(items).collect::<Vec<_>>();
+            items.shuffle(&mut rng);
+            TestSet(items)
+        })
+    }
 
-#[test]
-fn test_kd_insert() {
-    insert_impl(TestSet(vec![
-        ((1, 0, 2), 0),
-        ((1, 0, 0), 0),
-        ((0, 0, 3), 0),
-        ((1, 0, 1), 1),
-    ]));
-}
+    fn uniform_test_set_2() -> impl Strategy<Value = TestSet> {
+        (any::<BTreeSet<u64>>(), any::<u64>()).prop_map(|(items, seed)| {
+            let seed = blake3::hash(&seed.to_be_bytes()).into();
+            let mut rng = rand::rngs::SmallRng::from_seed(seed);
+            let items = items
+                .into_iter()
+                .map(|x| (x, x, x))
+                .collect::<BTreeSet<_>>();
+            let mut items = random_rank(items, &mut rng).collect::<Vec<_>>();
+            items.shuffle(&mut rng);
+            TestSet(items)
+        })
+    }
 
-#[proptest]
-#[ignore]
-fn prop_kd_delete_rec(#[strategy(random_test_set())] values: TestSet) {
-    delete_rec_impl(values);
-}
+    #[proptest]
+    #[ignore]
+    fn prop_kd_insert_rec(#[strategy(random_test_set())] values: TestSet) {
+        insert_rec_impl(values);
+    }
 
-#[proptest]
-#[ignore]
-fn prop_kd_delete(#[strategy(random_test_set())] values: TestSet) {
-    delete_impl(values);
-}
+    #[proptest]
+    #[ignore]
+    fn prop_kd_insert(#[strategy(random_test_set_2())] values: TestSet) {
+        insert_impl(values);
+    }
 
-#[proptest]
-fn prop_kd_insert_rec_uniform(#[strategy(uniform_test_set())] values: TestSet) {
-    insert_rec_impl(values);
-}
+    #[test]
+    fn test_kd_insert() {
+        let cases = vec![
+            // TestSet(vec![
+            //     ((1, 0, 2), 0),
+            //     ((1, 0, 0), 0),
+            //     ((0, 0, 3), 0),
+            //     ((1, 0, 1), 1),
+            // ]),
+            TestSet(vec![
+                ((0, 0, 0), 3),
+                ((0, 0, 1), 1),
+                ((0, 4741757182755845721, 0), 3),
+                ((7769037433229280596, 0, 0), 4),
+            ]),
+        ];
+        for case in cases {
+            let node = Node::from_iter_reference(case.0.iter().cloned());
+            node.print();
+            for (key, rank) in &case.0 {
+                assert!(contains_rec(node.clone(), *key));
+            }
+        }
+    }
 
-#[proptest]
-fn prop_kd_insert_uniform(#[strategy(uniform_test_set())] values: TestSet) {
-    insert_impl(values);
-}
+    #[proptest]
+    #[ignore]
+    fn prop_kd_delete_rec(#[strategy(random_test_set())] values: TestSet) {
+        delete_rec_impl(values);
+    }
 
-#[proptest]
-fn prop_kd_delete_rec_uniform(#[strategy(uniform_test_set())] values: TestSet) {
-    delete_rec_impl(values);
-}
+    #[proptest]
+    #[ignore]
+    fn prop_kd_delete(#[strategy(random_test_set())] values: TestSet) {
+        delete_impl(values);
+    }
 
-#[proptest]
-fn prop_kd_delete_uniform(#[strategy(uniform_test_set())] values: TestSet) {
-    delete_impl(values);
+    #[proptest]
+    fn prop_kd_insert_rec_uniform(#[strategy(uniform_test_set())] values: TestSet) {
+        insert_rec_impl(values);
+    }
+
+    #[proptest]
+    fn prop_kd_insert_uniform(#[strategy(uniform_test_set())] values: TestSet) {
+        insert_impl(values);
+    }
+
+    #[proptest]
+    fn prop_kd_delete_rec_uniform(#[strategy(uniform_test_set())] values: TestSet) {
+        delete_rec_impl(values);
+    }
+
+    #[proptest]
+    fn prop_kd_delete_uniform(#[strategy(uniform_test_set())] values: TestSet) {
+        delete_impl(values);
+    }
+
+    #[proptest]
+    fn prop_kd_split_uniform(#[strategy(random_test_set_2())] values: TestSet) {
+        split_impl(values);
+    }
 }

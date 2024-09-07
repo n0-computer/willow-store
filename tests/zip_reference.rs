@@ -35,6 +35,10 @@ impl Node {
         self.0.is_none()
     }
 
+    fn is_leaf(&self) -> bool {
+        !self.is_empty() && self.left().is_empty() && self.right().is_empty()
+    }
+
     fn rank(&self) -> u8 {
         self.0.as_ref().unwrap().borrow().rank
     }
@@ -266,8 +270,7 @@ fn insert(root: &mut Node, x: Node) {
         prev.set_right(x.clone());
     }
     if cur.is_empty() {
-        x.set_left(Node::EMPTY);
-        x.set_right(Node::EMPTY);
+        assert!(x.is_leaf());
         return;
     }
     if key < cur.key() {

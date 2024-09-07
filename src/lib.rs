@@ -995,7 +995,7 @@ impl<P: TreeParams> Node<P> {
     ) -> impl Iterator<Item = Result<(Point<P>, P::V)>> + 'a {
         Gen::new(|co| async move {
             if let Node::NonEmpty(node) = self {
-                if let Err(cause) = node.iter_unordered0(store, &co).await {
+                if let Err(cause) = node.iter0(store, &co).await {
                     co.yield_(Err(cause)).await;
                 }
             }
@@ -1253,17 +1253,17 @@ impl<P: TreeParams> NodeData<P> {
         self.rank.into()
     }
 
-    async fn iter_unordered0(
+    async fn iter0(
         &self,
         store: &impl StoreExt<P>,
         co: &Co<Result<(Point<P>, P::V)>>,
     ) -> Result<()> {
         if let Some(left) = store.data_opt(self.left)? {
-            Box::pin(left.iter_unordered0(store, co)).await?;
+            Box::pin(left.iter0(store, co)).await?;
         }
         co.yield_(Ok((self.key.clone(), self.value.clone()))).await;
         if let Some(right) = store.data_opt(self.right)? {
-            Box::pin(right.iter_unordered0(store, co)).await?;
+            Box::pin(right.iter0(store, co)).await?;
         }
         Ok(())
     }
