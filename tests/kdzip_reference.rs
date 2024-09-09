@@ -141,14 +141,7 @@ impl Node {
         root
     }
 
-    fn from_iter_reference(iter: impl IntoIterator<Item = ((u64, u64, u64), u8)>) -> Self {
-        let mut nodes = iter
-            .into_iter()
-            .map(|(key, rank)| Node::leaf(key, rank))
-            .collect::<Vec<_>>();
-        // Before we sort, remove all but the first occurence of each point.
-        let mut uniques = BTreeSet::new();
-        nodes.retain(|node| uniques.insert(node.key()));
+    fn from_unique_nodes(mut nodes: Vec<Node>) -> Self {
         nodes.sort_by(|p1, p2| {
             p2.rank()
                 .cmp(&p1.rank())
@@ -159,6 +152,17 @@ impl Node {
             insert_no_balance(&mut root, node);
         }
         root
+    }
+
+    fn from_iter_reference(iter: impl IntoIterator<Item = ((u64, u64, u64), u8)>) -> Self {
+        let mut nodes = iter
+            .into_iter()
+            .map(|(key, rank)| Node::leaf(key, rank))
+            .collect::<Vec<_>>();
+        // Before we sort, remove all but the first occurence of each point.
+        let mut uniques = BTreeSet::new();
+        nodes.retain(|node| uniques.insert(node.key()));
+        Self::from_unique_nodes(nodes)
     }
 }
 
@@ -188,10 +192,22 @@ fn contains_rec(node: Node, key: (u64, u64, u64)) -> bool {
 fn split_to_vec(node: &Node, key: (u64, u64, u64), rank: u8) -> Vec<Node> {
     let mut res = vec![];
     split_rec(node, key, rank, &mut res);
-    if res.is_empty() {
+    // split_all(node.clone(), &mut res);
+    if res.is_empty() && !node.is_empty() {
         res.push(node.clone());
     }
     res
+}
+
+fn split_all(node: Node, res: &mut Vec<Node>) {
+    if node.is_empty() {
+        return;
+    }
+    split_all(node.left(), res);
+    split_all(node.right(), res);
+    node.set_left(Node::EMPTY);
+    node.set_right(Node::EMPTY);
+    res.push(node);
 }
 
 /// Convert a node into a list of nodes, non-recursively.
@@ -211,40 +227,36 @@ fn flatten(node: &Node, res: &mut Vec<Node>) {
 }
 
 // splits a tree into parts that don't overlap with the key
-fn split_rec(node: &Node, key: (u64, u64, u64), rank: u8, res: &mut Vec<Node>) -> (bool, bool) {
+fn split_rec(node: &Node, key: (u64, u64, u64), rank: u8, res: &mut Vec<Node>) -> bool {
     if node.is_empty() {
-        return (false, false);
+        return false;
     }
     let same_sort = node.rank() % 3 == rank % 3;
     let cmp = cmp_at_rank(node.key(), key, rank);
     if same_sort {
         match cmp {
             Ordering::Less => {
-                // left does not need to be split
-                // self does not need to be split
-                // right might need to be split
-                let (has_left, has_right) = split_rec(&node.right(), key, rank, res);
-                if has_left && has_right {
-                    assert!(has_right);
+                // if split_rec(&node.left(), key, rank, res) {
+                //     node.set_left(Node::EMPTY);
+                // }
+                if split_rec(&node.right(), key, rank, res) {
                     node.set_right(Node::EMPTY);
                 }
-                if has_right {
-                    flatten(node, res);
-                }
-                (true, has_right)
+                flatten(node, res);
+                true
             }
             Ordering::Greater => {
                 // left might need to be split
                 // self does not need to be split
                 // right does not need to be split
-                let (has_left, has_right) = split_rec(&node.left(), key, rank, res);
-                if has_left && has_right {
+                if split_rec(&node.right(), key, rank, res) {
+                    node.set_right(Node::EMPTY);
+                }
+                if split_rec(&node.left(), key, rank, res) {
                     node.set_left(Node::EMPTY);
                 }
-                if has_left {
-                    flatten(node, res);
-                }
-                (has_left, true)
+                flatten(node, res);
+                true
             }
             Ordering::Equal => {
                 panic!("duplicate key");
@@ -252,22 +264,14 @@ fn split_rec(node: &Node, key: (u64, u64, u64), rank: u8, res: &mut Vec<Node>) -
         }
     } else {
         assert!(cmp != Ordering::Equal, "duplicate key");
-        let (left_left, left_right) = split_rec(&node.left(), key, rank, res);
-        if left_left && left_right {
+        if split_rec(&node.left(), key, rank, res) {
             node.set_left(Node::EMPTY);
         }
-        let (right_left, right_right) = split_rec(&node.right(), key, rank, res);
-        if right_left && right_right {
+        if split_rec(&node.right(), key, rank, res) {
             node.set_right(Node::EMPTY);
         }
-        let self_left = cmp == Ordering::Less;
-        let self_right = cmp == Ordering::Greater;
-        let res_left = left_left || self_left || right_left;
-        let res_right = left_right || self_right || right_right;
-        if res_left && res_right {
-            flatten(node, res);
-        }
-        (res_left, res_right)
+        flatten(node, res);
+        true
     }
 }
 
@@ -697,32 +701,56 @@ mod tests {
         let mut items = reference.clone();
         let (key, rank) = items.pop().unwrap();
         let tree = Node::from_iter_reference(items.iter().cloned());
-        for (key, _rank) in items.iter().cloned() {
-            if !contains_rec(tree.clone(), key) {
-                println!("broken tree:");
-                tree.print();
-                println!("missing key={:?}", key);
-                assert!(false);
-            }
-        }
-        println!("full:");
-        tree.print();
         let parts = split_to_vec(&tree, key, rank);
-        println!("items.len()={} parts.len()={}", items.len(), parts.len());
-
         for (key, _rank) in items {
             let count = parts
                 .iter()
                 .filter(|x| contains_rec((*x).clone(), key))
                 .count();
-            if count != 1 {
-                for part in &parts {
-                    println!("part:");
-                    part.print();
-                }
-                println!("missing key={:?}", key);
-            }
             assert_eq!(count, 1);
+        }
+    }
+
+    fn insert_split_impl(keys: TestSet) {
+        let reference = keys.0;
+        if reference.is_empty() {
+            return;
+        }
+        let items = reference.clone();
+        // build the tree using the reference implementation
+        let reference_tree = Node::from_iter_reference(items.iter().cloned());
+        // filter out the root
+        let root_key = reference_tree.key();
+        let root_rank = reference_tree.rank();
+        let items: Vec<_> = items
+            .into_iter()
+            .filter(|(key, _rank)| key != &root_key)
+            .collect();
+        let tree_without_root = Node::from_iter_reference(items.iter().cloned());
+
+        let mut parts = split_to_vec(&tree_without_root, root_key, root_rank);
+        for (key, _rank) in items {
+            let count = parts
+                .iter()
+                .filter(|x| contains_rec((*x).clone(), key))
+                .count();
+            assert_eq!(count, 1);
+        }
+        parts.push(Node::leaf(root_key, root_rank));
+        let root = Node::from_unique_nodes(parts);
+        let mut fail = false;
+        for (key, _rank) in reference.iter().cloned() {
+            fail |= !contains_rec(root.clone(), key);
+        }
+        if fail {
+            println!("----------");
+            println!("actual:");
+            root.print();
+            let expected = Node::from_iter_reference(reference.iter().cloned());
+            println!("expected:");
+            expected.print();
+            println!("----------");
+            assert!(false);
         }
     }
 
@@ -734,8 +762,16 @@ mod tests {
     #[derive(Debug)]
     struct TestSet(Vec<((u64, u64, u64), u8)>);
 
+    fn small_key() -> impl Strategy<Value = (u64, u64, u64)> {
+        (0..5u64, 0..5u64, 0..5u64)
+    }
+
+    fn small_key_set() -> impl Strategy<Value = BTreeSet<(u64, u64, u64)>> {
+        proptest::collection::btree_set(small_key(), 0..20)
+    }
+
     fn random_test_set() -> impl Strategy<Value = TestSet> {
-        (any::<BTreeSet<(u64, u64, u64)>>(), any::<u64>()).prop_map(|(items, seed)| {
+        (small_key_set(), any::<u64>()).prop_map(|(items, seed)| {
             let seed = blake3::hash(&seed.to_be_bytes()).into();
             let mut rng = rand::rngs::SmallRng::from_seed(seed);
             let mut items = add_rank(items).collect::<Vec<_>>();
@@ -852,7 +888,12 @@ mod tests {
     }
 
     #[proptest]
-    fn prop_kd_split_uniform(#[strategy(random_test_set_2())] values: TestSet) {
+    fn prop_kd_split(#[strategy(random_test_set_2())] values: TestSet) {
         split_impl(values);
+    }
+
+    #[proptest]
+    fn prop_kd_insert_split(#[strategy(random_test_set())] values: TestSet) {
+        insert_split_impl(values);
     }
 }
