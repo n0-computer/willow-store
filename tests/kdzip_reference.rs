@@ -11,26 +11,24 @@ use test_strategy::proptest;
 use willow_store::count_trailing_zeros;
 
 struct NodeData {
-    key: (u64, u64, u64),
+    key: (u64, u64),
     rank: u8,
     left: Node,
     right: Node,
 }
 
 fn order_at_rank(rank: u8) -> &'static str {
-    match rank % 3 {
-        0 => "xyz",
-        1 => "yzx",
-        2 => "zyz",
+    match rank % 2 {
+        0 => "xy",
+        1 => "yx",
         _ => unreachable!(),
     }
 }
 
-fn cmp_at_rank((xa, ya, za): (u64, u64, u64), (xb, yb, zb): (u64, u64, u64), rank: u8) -> Ordering {
-    match rank % 3 {
-        0 => xa.cmp(&xb).then(ya.cmp(&yb)).then(za.cmp(&zb)),
-        1 => ya.cmp(&yb).then(za.cmp(&zb)).then(xa.cmp(&xb)),
-        2 => za.cmp(&zb).then(xa.cmp(&xb)).then(ya.cmp(&yb)),
+fn cmp_at_rank((xa, ya): (u64, u64), (xb, yb): (u64, u64), rank: u8) -> Ordering {
+    match rank % 2 {
+        0 => xa.cmp(&xb).then(ya.cmp(&yb)),
+        1 => ya.cmp(&yb).then(xa.cmp(&xb)),
         _ => unreachable!(),
     }
 }
@@ -51,7 +49,7 @@ impl Debug for Node {
 impl Node {
     const EMPTY: Self = Self(None);
 
-    fn leaf(key: (u64, u64, u64), rank: u8) -> Self {
+    fn leaf(key: (u64, u64), rank: u8) -> Self {
         Self(Some(Rc::new(RefCell::new(NodeData {
             key,
             rank,
@@ -72,7 +70,7 @@ impl Node {
         self.0.as_ref().unwrap().borrow().rank
     }
 
-    fn key(&self) -> (u64, u64, u64) {
+    fn key(&self) -> (u64, u64) {
         self.0.as_ref().unwrap().borrow().key
     }
 
@@ -132,7 +130,7 @@ impl Node {
         }
     }
 
-    fn from_iter(iter: impl IntoIterator<Item = ((u64, u64, u64), u8)>) -> Self {
+    fn from_iter(iter: impl IntoIterator<Item = ((u64, u64), u8)>) -> Self {
         let mut root = Self::EMPTY;
         for (key, rank) in iter {
             let x = Self::leaf(key, rank);
@@ -154,7 +152,7 @@ impl Node {
         root
     }
 
-    fn from_iter_reference(iter: impl IntoIterator<Item = ((u64, u64, u64), u8)>) -> Self {
+    fn from_iter_reference(iter: impl IntoIterator<Item = ((u64, u64), u8)>) -> Self {
         let mut nodes = iter
             .into_iter()
             .map(|(key, rank)| Node::leaf(key, rank))
@@ -177,7 +175,7 @@ impl PartialEq for Node {
 }
 
 // contains is trivial and not given in the paper.
-fn contains_rec(node: Node, key: (u64, u64, u64)) -> bool {
+fn contains_rec(node: Node, key: (u64, u64)) -> bool {
     if node.is_empty() {
         false
     } else if key == node.key() {
@@ -189,7 +187,7 @@ fn contains_rec(node: Node, key: (u64, u64, u64)) -> bool {
     }
 }
 
-fn split_to_vec(node: &Node, key: (u64, u64, u64), rank: u8) -> Vec<Node> {
+fn split_to_vec(node: &Node, key: (u64, u64), rank: u8) -> Vec<Node> {
     let mut res = vec![];
     split_rec(node, key, rank, &mut res);
     // split_all(node.clone(), &mut res);
@@ -226,12 +224,29 @@ fn flatten(node: &Node, res: &mut Vec<Node>) {
     }
 }
 
-// splits a tree into parts that don't overlap with the key
-fn split_rec(node: &Node, key: (u64, u64, u64), rank: u8, res: &mut Vec<Node>) -> bool {
+fn intersects(node: &Node, key: (u64, u64), rank: u8) -> bool {
     if node.is_empty() {
         return false;
     }
-    let same_sort = node.rank() % 3 == rank % 3;
+    let same_sort = node.rank() % 2 == rank % 2;
+    let cmp = cmp_at_rank(node.key(), key, rank);
+    if same_sort {
+        match cmp {
+            Ordering::Less => intersects(&node.right(), key, rank),
+            Ordering::Greater => intersects(&node.left(), key, rank),
+            Ordering::Equal => true,
+        }
+    } else {
+        cmp == Ordering::Equal || intersects(&node.left(), key, rank) || intersects(&node.right(), key, rank)
+    }
+}
+
+// splits a tree into parts that don't overlap with the key
+fn split_rec(node: &Node, key: (u64, u64), rank: u8, res: &mut Vec<Node>) -> bool {
+    if node.is_empty() {
+        return false;
+    }
+    let same_sort = node.rank() % 2 == rank % 2;
     let cmp = cmp_at_rank(node.key(), key, rank);
     if same_sort {
         match cmp {
@@ -239,18 +254,24 @@ fn split_rec(node: &Node, key: (u64, u64, u64), rank: u8, res: &mut Vec<Node>) -
                 // if split_rec(&node.left(), key, rank, res) {
                 //     node.set_left(Node::EMPTY);
                 // }
-                if split_rec(&node.right(), key, rank, res) {
-                    node.set_right(Node::EMPTY);
+                if !node.right().is_empty() {
+                    if split_rec(&node.right(), key, rank, res) {
+                        node.set_right(Node::EMPTY);
+                    }
+                    flatten(node, res);
+                    true
+                } else {
+                    false
                 }
-                flatten(node, res);
-                true
             }
             Ordering::Greater => {
                 // left might need to be split
                 // self does not need to be split
                 // right does not need to be split
-                if split_rec(&node.right(), key, rank, res) {
-                    node.set_right(Node::EMPTY);
+                if node.right().is_empty() || node.right().rank() == node.rank() {
+                    if split_rec(&node.right(), key, rank, res) {
+                        node.set_right(Node::EMPTY);
+                    }
                 }
                 if split_rec(&node.left(), key, rank, res) {
                     node.set_left(Node::EMPTY);
@@ -591,8 +612,8 @@ mod tests {
     use super::*;
     /// Compute rank from key, like in real use
     fn add_rank(
-        keys: impl IntoIterator<Item = (u64, u64, u64)>,
-    ) -> impl Iterator<Item = ((u64, u64, u64), u8)> {
+        keys: impl IntoIterator<Item = (u64, u64)>,
+    ) -> impl Iterator<Item = ((u64, u64), u8)> {
         keys.into_iter().map(|i| {
             let ser = postcard::to_allocvec(&i).unwrap();
             let hash: [u8; 32] = blake3::hash(&ser).into();
@@ -603,9 +624,9 @@ mod tests {
 
     /// Assign a random rank with the right distribution to each key
     fn random_rank<'a>(
-        keys: impl IntoIterator<Item = (u64, u64, u64)> + 'a,
+        keys: impl IntoIterator<Item = (u64, u64)> + 'a,
         rng: &'a mut impl rand::Rng,
-    ) -> impl Iterator<Item = ((u64, u64, u64), u8)> + 'a {
+    ) -> impl Iterator<Item = ((u64, u64), u8)> + 'a {
         keys.into_iter().map(move |i| {
             let x = rng.gen::<u64>();
             let hash: [u8; 32] = blake3::hash(&x.to_be_bytes()).into();
@@ -760,14 +781,14 @@ mod tests {
     ///
     /// Rank is usually computed from the key, but can be provided explicitly for testing.
     #[derive(Debug)]
-    struct TestSet(Vec<((u64, u64, u64), u8)>);
+    struct TestSet(Vec<((u64, u64), u8)>);
 
-    fn small_key() -> impl Strategy<Value = (u64, u64, u64)> {
-        (0..5u64, 0..5u64, 0..5u64)
+    fn small_key() -> impl Strategy<Value = (u64, u64)> {
+        (0..5u64, 0..5u64)
     }
 
-    fn small_key_set() -> impl Strategy<Value = BTreeSet<(u64, u64, u64)>> {
-        proptest::collection::btree_set(small_key(), 0..20)
+    fn small_key_set() -> impl Strategy<Value = BTreeSet<(u64, u64)>> {
+        proptest::collection::btree_set(small_key(), 0..1000)
     }
 
     fn random_test_set() -> impl Strategy<Value = TestSet> {
@@ -781,7 +802,7 @@ mod tests {
     }
 
     fn random_test_set_2() -> impl Strategy<Value = TestSet> {
-        (any::<BTreeSet<(u64, u64, u64)>>(), any::<u64>()).prop_map(|(items, seed)| {
+        (any::<BTreeSet<(u64, u64)>>(), any::<u64>()).prop_map(|(items, seed)| {
             let seed = blake3::hash(&seed.to_be_bytes()).into();
             let mut rng = rand::rngs::SmallRng::from_seed(seed);
             let mut items = random_rank(items, &mut rng).collect::<Vec<_>>();
@@ -794,10 +815,7 @@ mod tests {
         (any::<BTreeSet<u64>>(), any::<u64>()).prop_map(|(items, seed)| {
             let seed = blake3::hash(&seed.to_be_bytes()).into();
             let mut rng = rand::rngs::SmallRng::from_seed(seed);
-            let items = items
-                .into_iter()
-                .map(|x| (x, x, x))
-                .collect::<BTreeSet<_>>();
+            let items = items.into_iter().map(|x| (x, x)).collect::<BTreeSet<_>>();
             let mut items = add_rank(items).collect::<Vec<_>>();
             items.shuffle(&mut rng);
             TestSet(items)
@@ -808,10 +826,7 @@ mod tests {
         (any::<BTreeSet<u64>>(), any::<u64>()).prop_map(|(items, seed)| {
             let seed = blake3::hash(&seed.to_be_bytes()).into();
             let mut rng = rand::rngs::SmallRng::from_seed(seed);
-            let items = items
-                .into_iter()
-                .map(|x| (x, x, x))
-                .collect::<BTreeSet<_>>();
+            let items = items.into_iter().map(|x| (x, x)).collect::<BTreeSet<_>>();
             let mut items = random_rank(items, &mut rng).collect::<Vec<_>>();
             items.shuffle(&mut rng);
             TestSet(items)
@@ -832,19 +847,19 @@ mod tests {
 
     #[test]
     fn test_kd_insert() {
-        let cases = vec![
+        let cases: Vec<TestSet> = vec![
             // TestSet(vec![
             //     ((1, 0, 2), 0),
             //     ((1, 0, 0), 0),
             //     ((0, 0, 3), 0),
             //     ((1, 0, 1), 1),
             // ]),
-            TestSet(vec![
-                ((0, 0, 0), 3),
-                ((0, 0, 1), 1),
-                ((0, 4741757182755845721, 0), 3),
-                ((7769037433229280596, 0, 0), 4),
-            ]),
+            // TestSet(vec![
+            //     ((0, 0, 0), 3),
+            //     ((0, 0, 1), 1),
+            //     ((0, 4741757182755845721, 0), 3),
+            //     ((7769037433229280596, 0, 0), 4),
+            // ]),
         ];
         for case in cases {
             let node = Node::from_iter_reference(case.0.iter().cloned());
