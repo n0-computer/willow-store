@@ -119,11 +119,10 @@ fn query() -> impl Strategy<Value = TQuery> {
 /// The tree should conform to the invariants of the tree structure,
 /// and contain all the points that were inserted.
 fn tree_creation_impl(items: Vec<(TPoint, u64)>) -> TestResult<()> {
-    let (store, id) = willow_store::IdAndData::from_iter(items.clone())?;
-    let tree = store.get_node(id)?;
+    let (store, node) = willow_store::IdAndData::from_iter(items.clone())?;
     // tree.dump(&store)?;
-    tree.assert_invariants(&store, true)?;
-    let mut actual = tree.iter(&store).map(|x| x.unwrap()).collect::<Vec<_>>();
+    node.assert_invariants(&store, true)?;
+    let mut actual = node.iter(&store).map(|x| x.unwrap()).collect::<Vec<_>>();
     let mut expected = items;
     actual.sort_by_key(|(p, _)| p.clone().xyz());
     expected.sort_by_key(|(p, _)| p.clone().xyz());
@@ -259,7 +258,7 @@ fn tree_update_impl(items: Vec<(TPoint, u64)>) -> TestResult<()> {
         let new_v = v + 1;
         tree.update(k.clone(), new_v, &mut store)?;
     }
-    tree.assert_invariants(&store, true)?;
+    tree.id().assert_invariants(&store, true)?;
     Ok(())
 }
 
