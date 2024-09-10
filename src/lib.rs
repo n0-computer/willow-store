@@ -96,6 +96,7 @@
 //! [Aljoscha Meyer]: https://aljoscha-meyer.de/
 //! [kv_3d_storage]: https://github.com/AljoschaMeyer/kv_3d_storage/blob/d311cdee31ce7f5b5f50f9798507b958fe0f887b/src/lib.rs
 //! [willow]: https://willowprotocol.org/
+use core::panic;
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
@@ -656,18 +657,18 @@ fn key_offset<P: TreeParams>() -> usize {
 
 /// A simple store trait for storing blobs.
 pub trait Store<T: VariableSize> {
-    fn put(&mut self, node: &T) -> Result<NodeId>;
-    fn data(&self, id: NodeId) -> Result<T>;
+    fn create(&mut self, node: &T) -> Result<NodeId>;
+    fn read(&self, id: NodeId) -> Result<T>;
     fn update(&mut self, id: NodeId, node: &T) -> Result<()>;
 }
 
 impl<T: VariableSize> Store<T> for Box<dyn Store<T>> {
-    fn put(&mut self, node: &T) -> Result<NodeId> {
-        self.as_mut().put(node)
+    fn create(&mut self, node: &T) -> Result<NodeId> {
+        self.as_mut().create(node)
     }
 
-    fn data(&self, id: NodeId) -> Result<T> {
-        self.as_ref().data(id)
+    fn read(&self, id: NodeId) -> Result<T> {
+        self.as_ref().read(id)
     }
 
     fn update(&mut self, id: NodeId, node: &T) -> Result<()> {
@@ -676,30 +677,34 @@ impl<T: VariableSize> Store<T> for Box<dyn Store<T>> {
 }
 
 pub trait StoreExt<P: TreeParams>: Store<NodeData<P>> {
-    fn put_node(&mut self, data: NodeData<P>) -> Result<NonEmptyNode<P>> {
-        let id = self.put(&data)?;
-        Ok(NonEmptyNode::new(id, data))
+    fn put_node(&mut self, data: NodeData<P>) -> Result<NonEmptyIdAndData<P>> {
+        let id = Node(self.create(&data)?, PhantomData);
+        Ok(NonEmptyIdAndData::new(id, data))
+    }
+
+    fn data(&self, id: Node<P>) -> Result<NodeData<P>> {
+        Store::read(self, id.0)
     }
 
     /// Get a node by id, returning None if the id is None.
     ///
     /// This is just a convenience method for the common case where you have an
     /// optional id and want to get the node if it exists.
-    fn data_opt(&self, id: NodeId) -> Result<Option<NodeData<P>>> {
+    fn data_opt(&self, id: Node<P>) -> Result<Option<NodeData<P>>> {
         Ok(if id.is_empty() {
             None
         } else {
-            Some(self.data(id)?)
+            Some(self.read(id.0)?)
         })
     }
 
     /// Get a node by id, returning None if the id is None.
     /// Also return the id along with the node.
-    fn get_node(&self, id: NodeId) -> Result<Node<P>> {
+    fn get_node(&self, id: Node<P>) -> Result<IdAndData<P>> {
         Ok(if id.is_empty() {
-            Node::Empty
+            IdAndData::Empty
         } else {
-            NonEmptyNode::new(id, self.data(id)?).into()
+            NonEmptyIdAndData::new(id, self.read(id.0)?).into()
         })
     }
 }
@@ -719,7 +724,7 @@ impl MemStore {
 }
 
 impl<T: VariableSize> Store<T> for MemStore {
-    fn put(&mut self, node: &T) -> Result<NodeId> {
+    fn create(&mut self, node: &T) -> Result<NodeId> {
         let id = NodeId::from((self.nodes.len() as u64) + 1);
         assert!(!id.is_empty());
         self.nodes.insert(id, node.to_vec());
@@ -732,7 +737,7 @@ impl<T: VariableSize> Store<T> for MemStore {
         Ok(())
     }
 
-    fn data(&self, id: NodeId) -> Result<T> {
+    fn read(&self, id: NodeId) -> Result<T> {
         assert!(!id.is_empty());
         match self.nodes.get(&id) {
             Some(data) => Ok(T::read(data)),
@@ -770,14 +775,172 @@ impl NodeId {
     pub fn is_empty(&self) -> bool {
         self == &Self::EMPTY
     }
+}
 
-    pub fn count<P: TreeParams>(&self, store: &impl Store<NodeData<P>>) -> Result<u64> {
-        Ok(if self.is_empty() {
-            0
+pub struct Node<P: TreeParams>(NodeId, PhantomData<P>);
+
+impl<P: TreeParams> From<NodeId> for Node<P> {
+    fn from(id: NodeId) -> Self {
+        Node(id, PhantomData)
+    }
+}
+
+impl<P: TreeParams> Clone for Node<P> {
+    fn clone(&self) -> Self {
+        Self(self.0, PhantomData)
+    }
+}
+
+impl<P: TreeParams> Copy for Node<P> {}
+
+impl<P: TreeParams> Debug for Node<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_empty() {
+            write!(f, "Node(EMPTY)")
         } else {
-            let data = store.data(*self)?;
-            data.left.count(store)? + data.right.count(store)? + 1
+            write!(f, "Node({})", self.0)
+        }
+    }
+}
+
+impl<P: TreeParams> Display for Node<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_empty() {
+            write!(f, "EMPTY")
+        } else {
+            write!(f, "{}", self.0)
+        }
+    }
+}
+
+impl<P: TreeParams> PartialEq for Node<P> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl<P: TreeParams> Eq for Node<P> {}
+
+impl<P: TreeParams> Node<P> {
+    pub const EMPTY: Self = Self(NodeId::EMPTY, PhantomData);
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn count(&self, store: &impl StoreExt<P>) -> Result<u64> {
+        Ok(if let Some(data) = store.data_opt(*self)? {
+            1 + data.left.count(store)? + data.right.count(store)?
+        } else {
+            0
         })
+    }
+
+    pub fn insert(
+        &mut self,
+        key: Point<P>,
+        value: P::V,
+        store: &mut impl StoreExt<P>,
+    ) -> Result<Option<P::V>> {
+        if self.is_empty() {
+            *self = store.create(&NodeData::single(key, value))?.into();
+            return Ok(None);
+        }
+        if self.get(key.clone(), store)?.is_some() {
+            panic!("Key already exists");
+        }
+        *self = NonEmptyIdAndData::insert(*self, NodeData::single(key, value), store)?;
+        Ok(None)
+    }
+
+    pub fn delete(&mut self, key: Point<P>, store: &mut impl StoreExt<P>) -> Result<Option<P::V>> {
+        self.delete_impl(key, store)
+    }
+
+    fn delete_impl(&mut self, key: Point<P>, store: &mut impl StoreExt<P>) -> Result<Option<P::V>> {
+        let initial_count = self.count(store)?;
+        let root = store.get_node(*self)?;
+        assert!(root.get(key.clone(), store)?.is_some());
+        let mut cur = root.clone();
+        let mut prev = IdAndData::Empty;
+        while let Some(cur_ne) = cur.non_empty() {
+            let key_cmp_cur = key.cmp_at_rank(&cur_ne.key, cur_ne.rank);
+            if key_cmp_cur == Ordering::Equal {
+                break;
+            }
+            prev = cur.clone();
+            let child = match key_cmp_cur {
+                Ordering::Less => cur_ne.left,
+                Ordering::Greater => cur_ne.right,
+                Ordering::Equal => unreachable!(),
+            };
+            cur = store.get_node(child)?;
+        }
+        let cur = if let IdAndData::NonEmpty(cur) = cur {
+            cur
+        } else {
+            return Ok(None);
+        };
+        let removed = cur.value.clone();
+        let mut res = Vec::new();
+        store.get_node(cur.left)?.split_all(store, &mut res)?;
+        store.get_node(cur.right)?.split_all(store, &mut res)?;
+        println!("{}/{}", initial_count, res.len());
+        let merged = IdAndData::from_unique_nodes(store, res)?;
+        if let Some(prev) = prev.non_empty_mut() {
+            if prev.left == cur.id() {
+                prev.left = merged.id();
+            } else {
+                prev.right = merged.id();
+            }
+            prev.persist(store)?;
+        } else {
+            *self = merged.id();
+        }
+        Ok(Some(removed))
+        // delete(cur);
+    }
+
+    pub fn assert_invariants(&self, store: &impl StoreExt<P>, include_summary: bool) -> Result<()> {
+        if !self.is_empty() {
+            let data = store.get_node(*self)?;
+            data.assert_invariants(store, include_summary)?;
+        }
+        Ok(())
+    }
+
+    pub fn get(&self, key: Point<P>, store: &impl StoreExt<P>) -> Result<Option<P::V>> {
+        Ok(self.get0(key, store)?.map(|x| x.value))
+    }
+
+    fn get0(&self, key: Point<P>, store: &impl StoreExt<P>) -> Result<Option<NodeData<P>>> {
+        let data = store.data(*self)?;
+        match key.cmp_at_rank(&data.key, data.rank) {
+            Ordering::Less => {
+                if !data.left.is_empty() {
+                    data.left.get0(key, store)
+                } else {
+                    Ok(None)
+                }
+            }
+            Ordering::Greater => {
+                if !data.right.is_empty() {
+                    data.right.get0(key, store)
+                } else {
+                    Ok(None)
+                }
+            }
+            Ordering::Equal => Ok(Some(data)),
+        }
+    }
+
+    pub fn dump(&self, store: &impl StoreExt<P>) -> Result<()> {
+        if let IdAndData::NonEmpty(node) = store.get_node(*self)? {
+            node.dump0("".into(), store)
+        } else {
+            tracing::info!("Empty");
+            Ok(())
+        }
     }
 }
 
@@ -843,12 +1006,12 @@ impl<P: KeyParams, T: AsRef<[u8]>> Point2<P, T> {
 /// - Use some zero copy stuff to make this more efficient.
 /// - Have dedicated types for owned and borrowed NodeData (?).
 pub struct NodeData<P: TreeParams> {
-    left: NodeId,  // 8 bytes, 0 if empty
-    right: NodeId, // 8 bytes, 0 if empty
-    value: P::V,   // fixed size
-    summary: P::M, // fixed size
-    rank: u8,      // 1 byte
-    key: Point<P>, // variable size due to path
+    left: Node<P>,  // 8 bytes, 0 if empty
+    right: Node<P>, // 8 bytes, 0 if empty
+    value: P::V,    // fixed size
+    summary: P::M,  // fixed size
+    rank: u8,       // 1 byte
+    key: Point<P>,  // variable size due to path
 }
 
 impl<P: TreeParams> Debug for NodeData<P> {
@@ -895,26 +1058,26 @@ impl<P: TreeParams> Eq for NodeData<P> {}
 /// When modifying a node, the id should not be modified. After a modification,
 /// the node should be updated in the store, otherwise there will be horrible
 /// inconsistencies.
-pub struct NonEmptyNode<P: TreeParams> {
-    id: NodeId,
+pub struct NonEmptyIdAndData<P: TreeParams> {
+    id: Node<P>,
     data: NodeData<P>,
 }
 
-pub enum Node<P: TreeParams> {
+pub enum IdAndData<P: TreeParams> {
     Empty,
-    NonEmpty(NonEmptyNode<P>),
+    NonEmpty(NonEmptyIdAndData<P>),
 }
 
-impl<P: TreeParams> Debug for Node<P> {
+impl<P: TreeParams> Debug for IdAndData<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Node::Empty => write!(f, "Empty"),
-            Node::NonEmpty(node) => write!(f, "{:?}", node),
+            IdAndData::Empty => write!(f, "Empty"),
+            IdAndData::NonEmpty(node) => write!(f, "{:?}", node),
         }
     }
 }
 
-impl<P: TreeParams> Debug for NonEmptyNode<P> {
+impl<P: TreeParams> Debug for NonEmptyIdAndData<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NonEmptyNode")
             .field("id", &self.id)
@@ -923,39 +1086,39 @@ impl<P: TreeParams> Debug for NonEmptyNode<P> {
     }
 }
 
-impl<P: TreeParams> From<NonEmptyNode<P>> for Node<P> {
-    fn from(node: NonEmptyNode<P>) -> Self {
-        Node::NonEmpty(node)
+impl<P: TreeParams> From<NonEmptyIdAndData<P>> for IdAndData<P> {
+    fn from(node: NonEmptyIdAndData<P>) -> Self {
+        IdAndData::NonEmpty(node)
     }
 }
 
-impl<P: TreeParams> Node<P> {
-    pub fn id(&self) -> NodeId {
+impl<P: TreeParams> IdAndData<P> {
+    pub fn id(&self) -> Node<P> {
         match self {
-            Node::Empty => NodeId::EMPTY,
-            Node::NonEmpty(node) => node.id,
+            IdAndData::Empty => Node::EMPTY,
+            IdAndData::NonEmpty(node) => node.id,
         }
     }
 
     /// Get the key of the node. Panics if the node is empty.
     pub fn key(&self) -> &Point<P> {
-        if let Node::NonEmpty(node) = self {
+        if let IdAndData::NonEmpty(node) = self {
             &node.data.key
         } else {
             panic!("Empty node")
         }
     }
 
-    pub fn left(&self) -> NodeId {
-        if let Node::NonEmpty(node) = self {
+    pub fn left(&self) -> Node<P> {
+        if let IdAndData::NonEmpty(node) = self {
             node.data.left
         } else {
             panic!("Empty node")
         }
     }
 
-    pub fn right(&self) -> NodeId {
-        if let Node::NonEmpty(node) = self {
+    pub fn right(&self) -> Node<P> {
+        if let IdAndData::NonEmpty(node) = self {
             node.data.right
         } else {
             panic!("Empty node")
@@ -963,7 +1126,7 @@ impl<P: TreeParams> Node<P> {
     }
 
     pub fn rank(&self) -> u8 {
-        if let Node::NonEmpty(node) = self {
+        if let IdAndData::NonEmpty(node) = self {
             node.data.rank
         } else {
             panic!("Empty node")
@@ -974,29 +1137,29 @@ impl<P: TreeParams> Node<P> {
         self.id().is_empty()
     }
 
-    pub fn into_non_empty(self) -> Option<NonEmptyNode<P>> {
+    pub fn into_non_empty(self) -> Option<NonEmptyIdAndData<P>> {
         match self {
-            Node::Empty => None,
-            Node::NonEmpty(node) => Some(node),
+            IdAndData::Empty => None,
+            IdAndData::NonEmpty(node) => Some(node),
         }
     }
 
-    pub fn non_empty(&self) -> Option<&NonEmptyNode<P>> {
+    pub fn non_empty(&self) -> Option<&NonEmptyIdAndData<P>> {
         match self {
-            Node::Empty => None,
-            Node::NonEmpty(node) => Some(node),
+            IdAndData::Empty => None,
+            IdAndData::NonEmpty(node) => Some(node),
         }
     }
 
-    pub fn non_empty_mut(&mut self) -> Option<&mut NonEmptyNode<P>> {
+    pub fn non_empty_mut(&mut self) -> Option<&mut NonEmptyIdAndData<P>> {
         match self {
-            Node::Empty => None,
-            Node::NonEmpty(node) => Some(node),
+            IdAndData::Empty => None,
+            IdAndData::NonEmpty(node) => Some(node),
         }
     }
 
     pub fn assert_invariants(&self, store: &impl StoreExt<P>, include_summary: bool) -> Result<()> {
-        if let Node::NonEmpty(node) = self {
+        if let IdAndData::NonEmpty(node) = self {
             node.assert_invariants(store, include_summary)?;
         }
         Ok(())
@@ -1010,7 +1173,7 @@ impl<P: TreeParams> Node<P> {
         store: &'a impl StoreExt<P>,
     ) -> impl Iterator<Item = Result<(Point<P>, P::V)>> + 'a {
         Gen::new(|co| async move {
-            if let Node::NonEmpty(node) = self {
+            if let IdAndData::NonEmpty(node) = self {
                 if let Err(cause) = node.iter0(store, &co).await {
                     co.yield_(Err(cause)).await;
                 }
@@ -1028,7 +1191,7 @@ impl<P: TreeParams> Node<P> {
         store: &'a impl StoreExt<P>,
     ) -> impl Iterator<Item = Result<(Point<P>, P::V)>> + 'a {
         Gen::new(|co| async move {
-            if let Node::NonEmpty(node) = self {
+            if let IdAndData::NonEmpty(node) = self {
                 if let Err(cause) = node.query0(query, store, &co).await {
                     co.yield_(Err(cause)).await;
                 }
@@ -1048,7 +1211,7 @@ impl<P: TreeParams> Node<P> {
         store: &'a impl StoreExt<P>,
     ) -> impl Iterator<Item = Result<(Point<P>, P::V)>> + 'a {
         Gen::new(|co| async move {
-            if let Node::NonEmpty(node) = self {
+            if let IdAndData::NonEmpty(node) = self {
                 if let Err(cause) = node.query_ordered0(query, ordering, store, &co).await {
                     co.yield_(Err(cause)).await;
                 }
@@ -1063,7 +1226,7 @@ impl<P: TreeParams> Node<P> {
     /// and combining the summaries of each element, but will be much more
     /// efficient for large trees.
     pub fn summary(&self, query: &QueryRange3d<P>, store: &impl StoreExt<P>) -> Result<P::M> {
-        if let Node::NonEmpty(node) = self {
+        if let IdAndData::NonEmpty(node) = self {
             let bbox = BBox::all();
             node.summary0(query, &bbox, store)
         } else {
@@ -1072,7 +1235,7 @@ impl<P: TreeParams> Node<P> {
     }
 
     pub fn get(&self, key: Point<P>, store: &impl StoreExt<P>) -> Result<Option<P::V>> {
-        Ok(if let Node::NonEmpty(node) = self {
+        Ok(if let IdAndData::NonEmpty(node) = self {
             node.get0(key, store)?.map(|node| node.value)
         } else {
             None
@@ -1089,7 +1252,7 @@ impl<P: TreeParams> Node<P> {
         value: P::V,
         store: &mut impl StoreExt<P>,
     ) -> Result<Option<P::V>> {
-        Ok(if let Node::NonEmpty(node) = self {
+        Ok(if let IdAndData::NonEmpty(node) = self {
             let data = NodeData::single(key, value);
             let old = node.update0(&data, store)?;
             old
@@ -1098,57 +1261,18 @@ impl<P: TreeParams> Node<P> {
         })
     }
 
-    pub fn insert(
-        &mut self,
-        key: Point<P>,
-        value: P::V,
-        store: &mut impl StoreExt<P>,
-    ) -> Result<Option<P::V>> {
-        let data = NodeData::single(key, value);
-        let Node::NonEmpty(node) = self else {
-            *self = store.put_node(data)?.into();
-            return Ok(None);
-        };
-        if let Some(old) = node.update0(&data, store)? {
-            return Ok(Some(old));
-        }
-        let id = NonEmptyNode::insert0(node.id, data, store)?;
-        *self = store.get_node(id)?;
-        Ok(None)
-    }
-
-    pub fn delete(&mut self, key: Point<P>, store: &mut impl StoreExt<P>) -> Result<Option<P::V>> {
-        Ok(if let Node::NonEmpty(node) = self {
-            let mut id = node.id();
-            let old = NonEmptyNode::delete(&mut id, key, store)?;
-            *self = store.get_node(id)?;
-            old
-        } else {
-            None
-        })
-    }
-
-    pub fn dump(&self, store: &impl StoreExt<P>) -> Result<()> {
-        if let Node::NonEmpty(node) = self {
-            node.dump0("".into(), store)
-        } else {
-            tracing::info!("Empty");
-            Ok(())
-        }
-    }
-
     fn split_all(
         &mut self,
         store: &mut impl StoreExt<P>,
-        res: &mut Vec<NonEmptyNode<P>>,
+        res: &mut Vec<NonEmptyIdAndData<P>>,
     ) -> Result<()> {
         if let Some(mut node) = self.non_empty().cloned() {
             let mut left = store.get_node(node.left)?;
             let mut right = store.get_node(node.right)?;
             left.split_all(store, res)?;
             right.split_all(store, res)?;
-            node.left = NodeId::EMPTY;
-            node.right = NodeId::EMPTY;
+            node.left = Node::EMPTY;
+            node.right = Node::EMPTY;
             res.push(node);
         }
         Ok(())
@@ -1156,15 +1280,15 @@ impl<P: TreeParams> Node<P> {
 
     pub fn from_unique_nodes(
         store: &mut impl StoreExt<P>,
-        mut nodes: Vec<NonEmptyNode<P>>,
-    ) -> Result<Node<P>> {
+        mut nodes: Vec<NonEmptyIdAndData<P>>,
+    ) -> Result<IdAndData<P>> {
         // if rank is equal, compare keys at rank
         nodes.sort_by(|p1, p2| {
             p2.rank
                 .cmp(&p1.rank)
                 .then(p1.key.cmp_at_rank(&p2.key, p1.rank))
         });
-        let mut tree = Node::Empty;
+        let mut tree = IdAndData::Empty;
         for node in nodes {
             let node = store.put_node(node.data)?;
             tree.insert_no_balance(&node, store)?;
@@ -1174,7 +1298,7 @@ impl<P: TreeParams> Node<P> {
 
     pub fn from_iter<I: IntoIterator<Item = (Point<P>, P::V)>>(
         iter: I,
-    ) -> Result<(impl StoreExt<P>, NodeId)> {
+    ) -> Result<(impl StoreExt<P>, Node<P>)> {
         let mut nodes: Vec<_> = iter
             .into_iter()
             .map(|(key, value)| NodeData::single(key, value))
@@ -1189,7 +1313,7 @@ impl<P: TreeParams> Node<P> {
                 .then(p1.key.cmp_at_rank(&p2.key, p1.rank))
         });
         let mut store = MemStore::new();
-        let mut tree = Node::Empty;
+        let mut tree = IdAndData::Empty;
         for node in nodes {
             let node = store.put_node(node.clone())?;
             tree.insert_no_balance(&node, &mut store)?;
@@ -1199,29 +1323,29 @@ impl<P: TreeParams> Node<P> {
 
     fn insert_no_balance(
         &mut self,
-        node: &NonEmptyNode<P>,
+        node: &NonEmptyIdAndData<P>,
         store: &mut impl StoreExt<P>,
     ) -> Result<()> {
         match self {
-            Node::Empty => {
+            IdAndData::Empty => {
                 *self = node.clone().into();
                 Ok(())
             }
-            Node::NonEmpty(this) => this.insert_no_balance(node, store),
+            IdAndData::NonEmpty(this) => this.insert_no_balance(node, store),
         }
     }
 }
 
-impl<P: TreeParams> Clone for Node<P> {
+impl<P: TreeParams> Clone for IdAndData<P> {
     fn clone(&self) -> Self {
         match self {
-            Node::Empty => Node::Empty,
-            Node::NonEmpty(node) => Node::NonEmpty(node.clone()),
+            IdAndData::Empty => IdAndData::Empty,
+            IdAndData::NonEmpty(node) => IdAndData::NonEmpty(node.clone()),
         }
     }
 }
 
-impl<P: TreeParams> Clone for NonEmptyNode<P> {
+impl<P: TreeParams> Clone for NonEmptyIdAndData<P> {
     fn clone(&self) -> Self {
         Self {
             id: self.id,
@@ -1230,7 +1354,7 @@ impl<P: TreeParams> Clone for NonEmptyNode<P> {
     }
 }
 
-impl<P: TreeParams> Deref for NonEmptyNode<P> {
+impl<P: TreeParams> Deref for NonEmptyIdAndData<P> {
     type Target = NodeData<P>;
 
     fn deref(&self) -> &Self::Target {
@@ -1238,7 +1362,7 @@ impl<P: TreeParams> Deref for NonEmptyNode<P> {
     }
 }
 
-impl<P: TreeParams> DerefMut for NonEmptyNode<P> {
+impl<P: TreeParams> DerefMut for NonEmptyIdAndData<P> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.data
     }
@@ -1264,8 +1388,8 @@ impl<P: TreeParams> VariableSize for NodeData<P> {
         let rank_start: usize = 16 + P::V::SIZE + P::M::SIZE;
         let key_start: usize = 16 + P::V::SIZE + P::M::SIZE + 1;
         assert_eq!(buf.len(), self.size());
-        self.left.write(&mut buf[L_START..R_START]);
-        self.right.write(&mut buf[R_START..V_START]);
+        self.left.0.write(&mut buf[L_START..R_START]);
+        self.right.0.write(&mut buf[R_START..V_START]);
         self.value.write(&mut buf[V_START..m_start]);
         self.summary.write(&mut buf[m_start..rank_start]);
         self.rank.write(&mut buf[rank_start..key_start]);
@@ -1281,8 +1405,8 @@ impl<P: TreeParams> VariableSize for NodeData<P> {
         let x_start: usize = 16 + P::V::SIZE + P::M::SIZE + 1;
         let y_start: usize = 16 + P::V::SIZE + P::M::SIZE + 1 + P::X::SIZE;
         let z_start: usize = 16 + P::V::SIZE + P::M::SIZE + 1 + P::X::SIZE + P::Y::SIZE;
-        let left = NodeId::read(&buf[L_START..R_START]);
-        let right = NodeId::read(&buf[R_START..V_START]);
+        let left = NodeId::read(&buf[L_START..R_START]).into();
+        let right = NodeId::read(&buf[R_START..V_START]).into();
         let value = P::V::read(&buf[V_START..m_start]);
         let summary = P::M::read(&buf[m_start..rank_start]);
         let rank = u8::read(&buf[rank_start..x_start]);
@@ -1472,8 +1596,8 @@ impl<P: TreeParams> NodeData<P> {
             rank,
             value,
             summary,
-            left: NodeId::EMPTY,
-            right: NodeId::EMPTY,
+            left: Node::EMPTY,
+            right: Node::EMPTY,
         }
     }
 
@@ -1590,13 +1714,13 @@ impl<P: TreeParams> NodeData<P> {
     }
 }
 
-impl<P: TreeParams> NonEmptyNode<P> {
-    fn new(id: NodeId, data: NodeData<P>) -> Self {
+impl<P: TreeParams> NonEmptyIdAndData<P> {
+    fn new(id: Node<P>, data: NodeData<P>) -> Self {
         assert!(!id.is_empty());
-        NonEmptyNode { id, data }
+        NonEmptyIdAndData { id, data }
     }
 
-    fn id(&self) -> NodeId {
+    fn id(&self) -> Node<P> {
         self.id
     }
 
@@ -1611,13 +1735,13 @@ impl<P: TreeParams> NonEmptyNode<P> {
             assert!(self.key.cmp_at_rank(&right.key, self.rank) == Ordering::Less);
             assert!(right.rank <= self.rank);
         }
-        store.update(self.id, &self.data)
+        store.update(self.id.0, &self.data)
     }
 
     // Insert a new node into the tree without balancing.
     fn insert_no_balance(&mut self, node: &Self, store: &mut impl StoreExt<P>) -> Result<()> {
         assert!(node.is_leaf());
-        let NonEmptyNode {
+        let NonEmptyIdAndData {
             id,
             data:
                 NodeData {
@@ -1631,17 +1755,17 @@ impl<P: TreeParams> NonEmptyNode<P> {
         } = self;
         match node.key.cmp_at_rank(parent_key, *parent_rank) {
             Ordering::Less => {
-                if let Node::NonEmpty(mut left) = store.get_node(*left)? {
+                if let IdAndData::NonEmpty(mut left) = store.get_node(*left)? {
                     left.insert_no_balance(node, store)?;
                 } else {
-                    *left = store.put(node)?;
+                    *left = store.create(node)?.into();
                 }
             }
             Ordering::Greater => {
-                if let Node::NonEmpty(mut right) = store.get_node(*right)? {
+                if let IdAndData::NonEmpty(mut right) = store.get_node(*right)? {
                     right.insert_no_balance(node, store)?;
                 } else {
-                    *right = store.put(node)?;
+                    *right = store.create(node)?.into();
                 }
             }
             Ordering::Equal => {
@@ -1668,14 +1792,14 @@ impl<P: TreeParams> NonEmptyNode<P> {
                 Some(old_value)
             }
             Ordering::Less => {
-                if let Node::NonEmpty(mut left) = store.get_node(self.left)? {
+                if let IdAndData::NonEmpty(mut left) = store.get_node(self.left)? {
                     left.update0(data, store)?
                 } else {
                     None
                 }
             }
             Ordering::Greater => {
-                if let Node::NonEmpty(mut right) = store.get_node(self.right)? {
+                if let IdAndData::NonEmpty(mut right) = store.get_node(self.right)? {
                     right.update0(data, store)?
                 } else {
                     None
@@ -1697,17 +1821,17 @@ impl<P: TreeParams> NonEmptyNode<P> {
         Ok(old_value)
     }
 
-    fn insert0(
-        mut root_id: NodeId,
+    fn insert(
+        mut root_id: Node<P>,
         x: NodeData<P>,
         store: &mut impl StoreExt<P>,
-    ) -> Result<NodeId> {
+    ) -> Result<Node<P>> {
         let root = store.get_node(root_id)?;
         let x = store.put_node(x)?;
         tracing::info!("insert0 root_id={} x={:?}", root_id, x);
         let key = x.key.clone();
         let rank = x.rank;
-        let mut prev = Node::Empty;
+        let mut prev = IdAndData::Empty;
         let mut cur = root;
         // while cur != null and (rank < cur.rank or (rank = cur.rank and key > cur.key)) do
         //   prev ← cur
@@ -1732,12 +1856,12 @@ impl<P: TreeParams> NonEmptyNode<P> {
         let mut parts = Vec::new();
         cur.split_all(store, &mut parts)?;
         parts.push(x.clone());
-        let merged = Node::from_unique_nodes(store, parts)?;
+        let merged = IdAndData::from_unique_nodes(store, parts)?;
         if cur.id() == root_id {
             // x is the new root
             root_id = merged.id();
         } else {
-            let prev: &mut NonEmptyNode<P> = prev.non_empty_mut().expect("prev is empty");
+            let prev: &mut NonEmptyIdAndData<P> = prev.non_empty_mut().expect("prev is empty");
             if key.cmp_at_rank(&prev.key, prev.rank) == Ordering::Less {
                 prev.left = merged.id();
             } else {
@@ -1746,54 +1870,6 @@ impl<P: TreeParams> NonEmptyNode<P> {
             prev.persist(store)?;
         }
         Ok(root_id)
-    }
-
-    fn delete(
-        root_id: &mut NodeId,
-        key: Point<P>,
-        store: &mut impl StoreExt<P>,
-    ) -> Result<Option<P::V>> {
-        let initial_count = root_id.count(store)?;
-        let root = store.get_node(*root_id)?;
-        assert!(root.get(key.clone(), store)?.is_some());
-        let mut cur = root.clone();
-        let mut prev = Node::Empty;
-        while let Some(cur_ne) = cur.non_empty() {
-            let key_cmp_cur = key.cmp_at_rank(&cur_ne.key, cur_ne.rank);
-            if key_cmp_cur == Ordering::Equal {
-                break;
-            }
-            prev = cur.clone();
-            let child = match key_cmp_cur {
-                Ordering::Less => cur_ne.left,
-                Ordering::Greater => cur_ne.right,
-                Ordering::Equal => unreachable!(),
-            };
-            cur = store.get_node(child)?;
-        }
-        let cur = if let Node::NonEmpty(cur) = cur {
-            cur
-        } else {
-            return Ok(None);
-        };
-        let removed = cur.value.clone();
-        let mut res = Vec::new();
-        store.get_node(cur.left)?.split_all(store, &mut res)?;
-        store.get_node(cur.right)?.split_all(store, &mut res)?;
-        println!("{}/{}", initial_count, res.len());
-        let merged = Node::from_unique_nodes(store, res)?;
-        if let Some(prev) = prev.non_empty_mut() {
-            if prev.left == cur.id() {
-                prev.left = merged.id();
-            } else {
-                prev.right = merged.id();
-            }
-            prev.persist(store)?;
-        } else {
-            *root_id = merged.id();
-        }
-        Ok(Some(removed))
-        // delete(cur);
     }
 }
 
