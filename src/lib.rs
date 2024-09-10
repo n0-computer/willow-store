@@ -770,6 +770,15 @@ impl NodeId {
     pub fn is_empty(&self) -> bool {
         self == &Self::EMPTY
     }
+
+    pub fn count<P: TreeParams>(&self, store: &impl Store<NodeData<P>>) -> Result<u64> {
+        Ok(if self.is_empty() {
+            0
+        } else {
+            let data = store.data(*self)?;
+            data.left.count(store)? + data.right.count(store)? + 1
+        })
+    }
 }
 
 pub struct NodeData2<P: TreeParams, T: AsRef<[u8]> = Vec<u8>>(T, PhantomData<P>);
@@ -965,6 +974,13 @@ impl<P: TreeParams> Node<P> {
         self.id().is_empty()
     }
 
+    pub fn into_non_empty(self) -> Option<NonEmptyNode<P>> {
+        match self {
+            Node::Empty => None,
+            Node::NonEmpty(node) => Some(node),
+        }
+    }
+
     pub fn non_empty(&self) -> Option<&NonEmptyNode<P>> {
         match self {
             Node::Empty => None,
@@ -1101,6 +1117,17 @@ impl<P: TreeParams> Node<P> {
         Ok(None)
     }
 
+    pub fn delete(&mut self, key: Point<P>, store: &mut impl StoreExt<P>) -> Result<Option<P::V>> {
+        Ok(if let Node::NonEmpty(node) = self {
+            let mut id = node.id();
+            let old = NonEmptyNode::delete(&mut id, key, store)?;
+            *self = store.get_node(id)?;
+            old
+        } else {
+            None
+        })
+    }
+
     pub fn dump(&self, store: &impl StoreExt<P>) -> Result<()> {
         if let Node::NonEmpty(node) = self {
             node.dump0("".into(), store)
@@ -1108,6 +1135,41 @@ impl<P: TreeParams> Node<P> {
             tracing::info!("Empty");
             Ok(())
         }
+    }
+
+    fn split_all(
+        &mut self,
+        store: &mut impl StoreExt<P>,
+        res: &mut Vec<NonEmptyNode<P>>,
+    ) -> Result<()> {
+        if let Some(mut node) = self.non_empty().cloned() {
+            let mut left = store.get_node(node.left)?;
+            let mut right = store.get_node(node.right)?;
+            left.split_all(store, res)?;
+            right.split_all(store, res)?;
+            node.left = NodeId::EMPTY;
+            node.right = NodeId::EMPTY;
+            res.push(node);
+        }
+        Ok(())
+    }
+
+    pub fn from_unique_nodes(
+        store: &mut impl StoreExt<P>,
+        mut nodes: Vec<NonEmptyNode<P>>,
+    ) -> Result<Node<P>> {
+        // if rank is equal, compare keys at rank
+        nodes.sort_by(|p1, p2| {
+            p2.rank
+                .cmp(&p1.rank)
+                .then(p1.key.cmp_at_rank(&p2.key, p1.rank))
+        });
+        let mut tree = Node::Empty;
+        for node in nodes {
+            let node = store.put_node(node.data)?;
+            tree.insert_no_balance(&node, store)?;
+        }
+        Ok(tree)
     }
 
     pub fn from_iter<I: IntoIterator<Item = (Point<P>, P::V)>>(
@@ -1587,7 +1649,7 @@ impl<P: TreeParams> NonEmptyNode<P> {
             }
         }
         *parent_summary = parent_summary.combine(&node.summary);
-        store.update(*id, &self.data)?;
+        self.persist(store)?;
         Ok(())
     }
 
@@ -1641,34 +1703,21 @@ impl<P: TreeParams> NonEmptyNode<P> {
         store: &mut impl StoreExt<P>,
     ) -> Result<NodeId> {
         let root = store.get_node(root_id)?;
-        let mut x = store.put_node(x)?;
+        let x = store.put_node(x)?;
         tracing::info!("insert0 root_id={} x={:?}", root_id, x);
         let key = x.key.clone();
         let rank = x.rank;
-        // Compare with x.key at x.rank
-        let x_lt = |rhs: &Point<P>| {
-            let x_cmp = key.cmp_at_rank(rhs, rank);
-            match x_cmp {
-                Ordering::Less => true,
-                Ordering::Greater => false,
-                Ordering::Equal => {
-                    // println!("x={:?} key={:?}", x, key);
-                    unreachable!("Duplicate keys not supported in insert0");
-                }
-            }
-        };
         let mut prev = Node::Empty;
         let mut cur = root;
         // while cur != null and (rank < cur.rank or (rank = cur.rank and key > cur.key)) do
         //   prev ← cur
         //   cur ← if key < cur.key then cur.left else cur.right
         while !cur.is_empty() {
-            let cur_cmp_key = cur.key().cmp_at_rank(&key, cur.rank());
-            let key_gt_cur = cur_cmp_key == Ordering::Less;
-            if rank < cur.rank() || (rank == cur.rank() && key_gt_cur) {
+            let key_cmp_cur = key.cmp_at_rank(&cur.key(), cur.rank());
+            if rank < cur.rank() || (rank == cur.rank() && key_cmp_cur == Ordering::Greater) {
                 // cur is above x, just go down
                 prev = cur.clone();
-                cur = if key_gt_cur {
+                cur = if key_cmp_cur == Ordering::Less {
                     store.get_node(cur.left())
                 } else {
                     store.get_node(cur.right())
@@ -1678,137 +1727,73 @@ impl<P: TreeParams> NonEmptyNode<P> {
                 break;
             }
         }
-        // if cur = root then root ← x
-        //   else if key < prev.key then prev.left ← x
-        //   else prev.right ← x
-        if prev.is_empty() {
-            assert!(cur.id() == root_id);
-            root_id = x.id;
+        // cur is either empty or below x, see exit condition of while loop
+        // just flatten cur, add x, and build a new tree
+        let mut parts = Vec::new();
+        cur.split_all(store, &mut parts)?;
+        parts.push(x.clone());
+        let merged = Node::from_unique_nodes(store, parts)?;
+        if cur.id() == root_id {
+            // x is the new root
+            root_id = merged.id();
         } else {
-            assert!(prev.rank() > rank || (prev.rank() == rank && !x_lt(prev.key())));
-            assert!(cur.id() != root_id);
-            let prev = prev.non_empty_mut().expect("prev is empty");
-            let prev_cmp_x = prev.key.cmp_at_rank(&x.key, prev.rank);
-            let prev_lt_x = prev_cmp_x == Ordering::Less;
-            if prev_lt_x {
-                tracing::info!("setting x as right child of prev");
-                prev.right = x.id;
+            let prev: &mut NonEmptyNode<P> = prev.non_empty_mut().expect("prev is empty");
+            if key.cmp_at_rank(&prev.key, prev.rank) == Ordering::Less {
+                prev.left = merged.id();
             } else {
-                tracing::info!("setting x as left child of prev");
-                prev.left = x.id;
+                prev.right = merged.id();
             }
-            tracing::info!(
-                "prev.key={:?} x.key={:?} prev_cmp_x={:?} prev_lt_x={} {:?}",
-                prev.key,
-                x.key,
-                prev_cmp_x,
-                prev_lt_x,
-                prev.sort_order()
-            );
             prev.persist(store)?;
         }
-        // if cur = null then {x.left ← x.right ← null; return}
-        if cur.is_empty() {
-            return Ok(root_id);
-        }
-
-        {
-            let cur = cur.non_empty().expect("cur is empty");
-            // if key < cur.key then x.right ← cur else x.left ← cur
-            let x_lt_cur = x_lt(&cur.key);
-            if x_lt_cur {
-                tracing::info!("setting cur {:?} as right child of x {:?}", cur.key, key);
-                x.right = cur.id;
-            } else {
-                tracing::info!("setting cur {:?} as left child of x {:?}", cur.key, key);
-                x.left = cur.id;
-            }
-        }
-        x.persist(store)?;
-        tracing::info!("tree before unzip/repair:");
-        store.get_node(root_id)?.dump(store)?;
-        tracing::info!("---");
-        // prev ← x
-        prev = Node::NonEmpty(x.clone());
-        // while cur 6= null do
-        //   fix ← prev
-        //   if cur .key < key then
-        //     repeat {prev ← cur ; cur ← cur .right}
-        //     until cur = null or cur .key > key
-        //   else
-        //     repeat {prev ← cur ; cur ← cur .left}
-        //     until cur = null or cur .key < key
-        //   if fix.key > key or (fix = x and prev.key > key) then
-        //     fix.left ← cur
-        //   else
-        //     fix.right ← cur
-
-        // while cur != null do
-        while !cur.is_empty() {
-            //   fix ← prev
-            let mut fix = prev;
-            let x_lt_cur = x_lt(&cur.key());
-            let cur_lt_x = !x_lt_cur;
-            tracing::info!(
-                "fix loop x.key={:?} fix.key={:?} cur.key={:?}",
-                x.key,
-                fix.key(),
-                cur.key()
-            );
-            if cur_lt_x {
-                //   if cur.key < key then
-                //     repeat {prev ← cur ; cur ← cur.right}
-                //     until cur = null or cur.key > key
-                loop {
-                    prev = cur.clone();
-                    cur = store.get_node(cur.right())?;
-                    let Node::NonEmpty(cur_ne) = &cur else {
-                        break;
-                    };
-                    if x_lt(&cur_ne.key) {
-                        break;
-                    }
-                }
-            } else {
-                //   else
-                //     repeat {prev ← cur ; cur ← cur.left}
-                //     until cur = null or cur.key < key
-                loop {
-                    prev = cur.clone();
-                    cur = store.get_node(cur.left())?;
-                    let Node::NonEmpty(cur_ne) = &cur else {
-                        break;
-                    };
-                    if !x_lt(&cur_ne.key) {
-                        break;
-                    }
-                }
-            }
-            //   if fix.key > key or (fix = x and prev.key > key) then
-            //     fix.left ← cur
-            //   else
-            //     fix.right ← cur
-            tracing::info!("x.id={} fix.id={} prev.id={}", x.id, fix.id(), prev.id());
-            let fix = fix.non_empty_mut().expect("fix is empty");
-            let prev = prev.non_empty().expect("prev is empty");
-            tracing::info!(
-                "fix.id={}, fix.key={:?} prev.key={:?} x.key={:?} cur={:?}",
-                fix.id,
-                fix.key,
-                prev.key,
-                key,
-                cur
-            );
-            if ((fix.id != x.id) && x_lt(&fix.key)) || ((fix.id == x.id) && x_lt(&prev.key)) {
-                tracing::info!("fixing fix.left to {}", cur.id());
-                fix.left = cur.id();
-            } else {
-                tracing::info!("fixing fix.right to {}", cur.id());
-                fix.right = cur.id();
-            }
-            fix.persist(store)?;
-        }
         Ok(root_id)
+    }
+
+    fn delete(
+        root_id: &mut NodeId,
+        key: Point<P>,
+        store: &mut impl StoreExt<P>,
+    ) -> Result<Option<P::V>> {
+        let initial_count = root_id.count(store)?;
+        let root = store.get_node(*root_id)?;
+        assert!(root.get(key.clone(), store)?.is_some());
+        let mut cur = root.clone();
+        let mut prev = Node::Empty;
+        while let Some(cur_ne) = cur.non_empty() {
+            let key_cmp_cur = key.cmp_at_rank(&cur_ne.key, cur_ne.rank);
+            if key_cmp_cur == Ordering::Equal {
+                break;
+            }
+            prev = cur.clone();
+            let child = match key_cmp_cur {
+                Ordering::Less => cur_ne.left,
+                Ordering::Greater => cur_ne.right,
+                Ordering::Equal => unreachable!(),
+            };
+            cur = store.get_node(child)?;
+        }
+        let cur = if let Node::NonEmpty(cur) = cur {
+            cur
+        } else {
+            return Ok(None);
+        };
+        let removed = cur.value.clone();
+        let mut res = Vec::new();
+        store.get_node(cur.left)?.split_all(store, &mut res)?;
+        store.get_node(cur.right)?.split_all(store, &mut res)?;
+        println!("{}/{}", initial_count, res.len());
+        let merged = Node::from_unique_nodes(store, res)?;
+        if let Some(prev) = prev.non_empty_mut() {
+            if prev.left == cur.id() {
+                prev.left = merged.id();
+            } else {
+                prev.right = merged.id();
+            }
+            prev.persist(store)?;
+        } else {
+            *root_id = merged.id();
+        }
+        Ok(Some(removed))
+        // delete(cur);
     }
 }
 

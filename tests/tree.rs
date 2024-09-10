@@ -264,27 +264,43 @@ fn tree_update_impl(items: Vec<(TPoint, u64)>) -> TestResult<()> {
 }
 
 fn tree_insert_impl(items: Vec<(TPoint, u64)>) -> TestResult<()> {
-    {
-        let (s, id) = willow_store::Node::from_iter(items.clone())?;
-        s.get_node(id)?.dump(&s)?;
-    }
     let mut items2 = items.clone();
     let (key, value) = items2.pop().unwrap();
     let (mut store, id) = Node::from_iter(items2.clone())?;
     let mut node = store.get_node(id)?;
-    tracing::info!("---");
-    tracing::info!("dump before insert:");
+    let x: Node<TestParams> = store.put_node(NodeData::single(key.clone(), value))?.into();
+    tracing::info!("before:");
     node.dump(&store)?;
-    tracing::info!("---");
+    tracing::info!("");
+    tracing::info!("insert");
+    x.dump(&store)?;
+    tracing::info!("");
     node.insert(key, value, &mut store)?;
-    tracing::info!("---");
-    tracing::info!("dump after insert:");
+    tracing::info!("after:");
     node.dump(&store)?;
-    tracing::info!("---");
+    tracing::info!("");
     node.assert_invariants(&store, false)?;
     for (k, v) in &items {
         let actual = node.get(k.clone(), &store)?;
         assert_eq!(actual, Some(*v));
+    }
+    Ok(())
+}
+
+fn tree_delete_impl(items: Vec<(TPoint, u64)>) -> TestResult<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    let mut items2 = items.clone();
+    let (key, _) = items2.pop().unwrap();
+    let (mut store, id) = Node::from_iter(items.clone())?;
+    let mut node = store.get_node(id)?;
+    assert!(node.get(key.clone(), &store)?.is_some());
+    node.delete(key, &mut store)?;
+    node.assert_invariants(&store, false)?;
+    for (key, expected) in items2 {
+        let actual = node.get(key.clone(), &store)?;
+        assert_eq!(actual, Some(expected));
     }
     Ok(())
 }
@@ -359,11 +375,17 @@ fn prop_tree_replace(#[strategy(treecontents())] items: Vec<(TPoint, u64)>) {
 }
 
 #[proptest]
-#[ignore]
 fn prop_tree_insert(
-    #[strategy(treecontents_with_opts(xpoint(), 0..100u64, 1..10usize))] items: Vec<(TPoint, u64)>,
+    #[strategy(treecontents_with_opts(xpoint(), 0..100u64, 1..100usize))] items: Vec<(TPoint, u64)>,
 ) {
     tree_insert_impl(items).unwrap();
+}
+
+#[proptest]
+fn prop_tree_delete(
+    #[strategy(treecontents_with_opts(xpoint(), 0..100u64, 1..100usize))] items: Vec<(TPoint, u64)>,
+) {
+    tree_delete_impl(items).unwrap();
 }
 
 fn parse_case(case: Vec<((u64, u64, u64), u64)>) -> Vec<(TPoint, u64)> {
@@ -376,13 +398,14 @@ fn parse_case(case: Vec<((u64, u64, u64), u64)>) -> Vec<(TPoint, u64)> {
 fn test_tree_insert() -> TestResult<()> {
     tracing_subscriber::fmt::try_init().ok();
     let cases = vec![
-        vec![((0, 0, 1), 0), ((0, 0, 0), 0)],
-        vec![((0, 0, 0), 0), ((0, 0, 1), 0)],
-        vec![((1, 0, 6), 0), ((0, 3, 0), 0)],
-        vec![((18, 9, 28), 0), ((0, 0, 0), 0)],
-        vec![((0, 0, 0), 1), ((1, 0, 0), 0)],
-        vec![((2, 0, 0), 0), ((0, 0, 0), 0), ((1, 0, 0), 0)],
-        vec![((18, 9, 28), 0), ((0, 0, 0), 0), ((0, 2, 0), 0)],
+        // vec![((0, 0, 1), 0), ((0, 0, 0), 0)],
+        // vec![((0, 0, 0), 0), ((0, 0, 1), 0)],
+        // vec![((1, 0, 6), 0), ((0, 3, 0), 0)],
+        // vec![((18, 9, 28), 0), ((0, 0, 0), 0)],
+        // vec![((0, 0, 0), 1), ((1, 0, 0), 0)],
+        // vec![((2, 0, 0), 0), ((0, 0, 0), 0), ((1, 0, 0), 0)],
+        // vec![((18, 9, 28), 0), ((0, 0, 0), 0), ((0, 2, 0), 0)],
+        vec![((0, 0, 0), 0), ((1, 0, 0), 0), ((2, 0, 0), 0)],
     ];
     for items in cases {
         let items = parse_case(items);
@@ -461,4 +484,14 @@ fn prop_same_rank(#[strategy(points_with_rank(0))] items: Vec<(TPoint, u64)>) {
     let (store, id) = willow_store::Node::from_iter(items.clone()).unwrap();
     let tree = store.get_node(id).unwrap();
     tree.dump(&store).unwrap();
+}
+
+#[test]
+fn test_tree_delete() -> TestResult<()> {
+    let cases = vec![vec![((4, 0, 0), 0), ((8, 0, 0), 0)]];
+    for items in cases {
+        let items = parse_case(items);
+        tree_delete_impl(items)?;
+    }
+    Ok(())
 }

@@ -717,8 +717,16 @@ fn insert_no_balance(root: &mut Node, x: Node) {
     }
 }
 
+fn count(node: &Node) -> usize {
+    if node.is_empty() {
+        0
+    } else {
+        1 + count(&node.left()) + count(&node.right())
+    }
+}
+
 fn insert_brute_force(root: &mut Node, x: Node) {
-    println!("insert root={:?} x={:?}", root, x);
+    let initial_count = count(root);
     let rank = x.rank();
     let key = x.key();
     let mut cur = root.clone();
@@ -738,6 +746,8 @@ fn insert_brute_force(root: &mut Node, x: Node) {
     let mut parts = Vec::new();
     split_all(cur.clone(), &mut parts);
     parts.push(x.clone());
+    // print stats
+    // println!("{} {}", initial_count, parts.len());
     // just flatten cur, add x, and build a new tree
     let merged = Node::from_unique_nodes(parts);
     if &cur == root {
@@ -828,26 +838,26 @@ mod tests {
         let (key, rank) = items.pop().unwrap();
         let mut root = Node::from_iter_reference(items.clone());
         {
-            println!("BEFORE");
-            println!("actual:");
-            root.print();
+            // println!("BEFORE");
+            // println!("actual:");
             // root.print();
+            // // root.print();
             root.check_invariants();
-            let reference_node = Node::from_iter_reference(items.clone());
-            println!("reference:");
-            reference_node.print();
-            println!("");
+            // let reference_node = Node::from_iter_reference(items.clone());
+            // println!("reference:");
+            // reference_node.print();
+            // println!("");
         }
         op(&mut root, Node::leaf(key, rank));
         {
-            println!("AFTER");
-            println!("actual:");
-            root.print();
+            // println!("AFTER");
+            // println!("actual:");
+            // root.print();
             // root.print();
             root.check_invariants();
-            let reference_node = Node::from_iter_reference(reference.clone());
-            println!("reference:");
-            reference_node.print();
+            // let reference_node = Node::from_iter_reference(reference.clone());
+            // println!("reference:");
+            // reference_node.print();
         }
         for item in reference {
             assert!(contains_rec(root.clone(), item.0));
@@ -969,7 +979,7 @@ mod tests {
     struct TestSet(Vec<((u64, u64), u8)>);
 
     fn small_key() -> impl Strategy<Value = (u64, u64)> {
-        (0..10u64, 0..10u64)
+        (0..100u64, 0..100u64)
     }
 
     fn small_key_set() -> impl Strategy<Value = BTreeSet<(u64, u64)>> {
@@ -987,7 +997,7 @@ mod tests {
     }
 
     fn random_test_set_2() -> impl Strategy<Value = TestSet> {
-        (any::<BTreeSet<(u64, u64)>>(), any::<u64>()).prop_map(|(items, seed)| {
+        (small_key_set(), any::<u64>()).prop_map(|(items, seed)| {
             let seed = blake3::hash(&seed.to_be_bytes()).into();
             let mut rng = rand::rngs::SmallRng::from_seed(seed);
             let mut items = random_rank(items, &mut rng).collect::<Vec<_>>();
@@ -1061,13 +1071,13 @@ mod tests {
     }
 
     #[proptest]
-    #[ignore]
+    #[ignore = "broken for kd"]
     fn prop_kd_delete_rec(#[strategy(random_test_set())] values: TestSet) {
         delete_rec_impl(values);
     }
 
     #[proptest]
-    #[ignore]
+    #[ignore = "broken for kd"]
     fn prop_kd_delete(#[strategy(random_test_set())] values: TestSet) {
         delete_impl(values, delete);
     }
