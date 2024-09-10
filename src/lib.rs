@@ -851,35 +851,88 @@ impl<P: TreeParams> Node<P> {
         value: P::V,
         store: &mut impl StoreExt<P>,
     ) -> Result<Option<P::V>> {
-        if self.is_empty() {
-            *self = store.create(&NodeData::single(key, value))?.into();
-            return Ok(None);
-        }
+        // if self.is_empty() {
+        //     *self = store.create(&NodeData::single(key, value))?.into();
+        //     return Ok(None);
+        // }
         if self.get(key.clone(), store)?.is_some() {
             panic!("Key already exists");
         }
+        // self.insert_rec(None, NodeData::single(key, value), store)?;
         self.insert_impl(NodeData::single(key, value), store)?;
         Ok(None)
     }
 
-    fn insert_impl(&mut self, x: NodeData<P>, store: &mut impl StoreExt<P>) -> Result<()> {
+    fn insert_rec(
+        &mut self,
+        prev: Option<NonEmptyIdAndData<P>>,
+        x: NodeData<P>,
+        store: &mut impl StoreExt<P>,
+    ) -> Result<Option<P::V>> {
+        if let IdAndData::NonEmpty(mut cur_ne) = store.get_node(*self)? {
+            let x_cmp_cur = x.key.cmp_at_rank(&cur_ne.key, cur_ne.rank);
+            if x_cmp_cur == Ordering::Equal {
+                // just replace the value
+                let mut res = x.value;
+                std::mem::swap(&mut res, &mut cur_ne.value);
+                let res = Some(res);
+                cur_ne.recalculate_summary(store)?;
+                cur_ne.persist(store)?;
+                return Ok(res);
+            } else if x.rank < cur_ne.rank
+                || (x.rank == cur_ne.rank && x_cmp_cur == Ordering::Greater)
+            {
+                // cur is above x, just go down
+                let prev = Some(cur_ne.clone());
+                let value = x.value.clone();
+                let res = match x_cmp_cur {
+                    Ordering::Less => cur_ne.left.insert_rec(prev, x, store)?,
+                    Ordering::Greater => cur_ne.right.insert_rec(prev, x, store)?,
+                    Ordering::Equal => unreachable!(),
+                };
+                if res.is_some() {
+                    cur_ne.recalculate_summary(store)?;
+                } else {
+                    cur_ne.add_summary(value);
+                }
+                cur_ne.persist(store)?;
+                return Ok(res);
+            }
+        }
+        // cur is below x
+        let mut parts = Vec::new();
+        self.split_all(store, &mut parts)?;
         let x = store.put_node(x)?;
-        tracing::info!("insert0 root_id={} x={:?}", self, x);
-        let key = x.key.clone();
-        let rank = x.rank;
+        parts.push(x.clone());
+        let merged = IdAndData::from_unique_nodes(store, parts)?;
+        if let Some(mut prev) = prev {
+            if x.key.cmp_at_rank(&prev.key, prev.rank) == Ordering::Less {
+                prev.left = merged;
+            } else {
+                prev.right = merged;
+            }
+            prev.recalculate_summary(store)?;
+            prev.persist(store)?;
+        } else {
+            *self = merged;
+        }
+        return Ok(None);
+    }
+
+    fn insert_impl(&mut self, x: NodeData<P>, store: &mut impl StoreExt<P>) -> Result<()> {
         let mut prev: Option<NonEmptyIdAndData<P>> = None;
         let mut cur = *self;
         // while cur != null and (rank < cur.rank or (rank = cur.rank and key > cur.key)) do
         //   prev ← cur
         //   cur ← if key < cur.key then cur.left else cur.right
         while let IdAndData::NonEmpty(cur_ne) = store.get_node(cur)? {
-            let key_cmp_cur = key.cmp_at_rank(&cur_ne.key, cur_ne.rank);
-            if rank < cur_ne.rank || (rank == cur_ne.rank && key_cmp_cur == Ordering::Greater) {
+            let x_cmp_cur = x.key.cmp_at_rank(&cur_ne.key, cur_ne.rank);
+            if x.rank < cur_ne.rank || (x.rank == cur_ne.rank && x_cmp_cur == Ordering::Greater) {
                 // cur is above x, just go down
                 let left = cur_ne.left;
                 let right = cur_ne.right;
                 prev = Some(cur_ne);
-                cur = if key_cmp_cur == Ordering::Less {
+                cur = if x_cmp_cur == Ordering::Less {
                     left
                 } else {
                     right
@@ -894,14 +947,14 @@ impl<P: TreeParams> Node<P> {
         let mut parts = Vec::new();
         // this loads cur twice, :shrug:
         cur.split_all(store, &mut parts)?;
-        parts.push(x.clone());
+        parts.push(store.put_node(x.clone())?);
         let merged = IdAndData::from_unique_nodes(store, parts)?;
         if cur == *self {
             // x is the new root
             *self = merged;
         } else {
             let mut prev = prev.expect("prev is empty");
-            if key.cmp_at_rank(&prev.key, prev.rank) == Ordering::Less {
+            if x.key.cmp_at_rank(&prev.key, prev.rank) == Ordering::Less {
                 prev.left = merged;
             } else {
                 prev.right = merged;
@@ -972,23 +1025,26 @@ impl<P: TreeParams> Node<P> {
     }
 
     fn get0(&self, key: Point<P>, store: &impl StoreExt<P>) -> Result<Option<NodeData<P>>> {
-        let data = store.data(*self)?;
-        match key.cmp_at_rank(&data.key, data.rank) {
-            Ordering::Less => {
-                if !data.left.is_empty() {
-                    data.left.get0(key, store)
-                } else {
-                    Ok(None)
+        if let Some(data) = store.data_opt(*self)? {
+            match key.cmp_at_rank(&data.key, data.rank) {
+                Ordering::Less => {
+                    if !data.left.is_empty() {
+                        data.left.get0(key, store)
+                    } else {
+                        Ok(None)
+                    }
                 }
-            }
-            Ordering::Greater => {
-                if !data.right.is_empty() {
-                    data.right.get0(key, store)
-                } else {
-                    Ok(None)
+                Ordering::Greater => {
+                    if !data.right.is_empty() {
+                        data.right.get0(key, store)
+                    } else {
+                        Ok(None)
+                    }
                 }
+                Ordering::Equal => Ok(Some(data)),
             }
-            Ordering::Equal => Ok(Some(data)),
+        } else {
+            Ok(None)
         }
     }
 
@@ -1353,6 +1409,23 @@ impl<P: TreeParams> NodeData<P> {
             }
         }
         Ok(summary)
+    }
+
+    fn recalculate_summary(&mut self, store: &impl StoreExt<P>) -> Result<()> {
+        let mut res = P::M::zero();
+        if let Some(left) = store.data_opt(self.left)? {
+            res = res.combine(&left.summary);
+        }
+        res = res.combine(&P::M::lift((self.key.clone(), self.value.clone())));
+        if let Some(right) = store.data_opt(self.right)? {
+            res = res.combine(&right.summary);
+        }
+        self.summary = res;
+        Ok(())
+    }
+
+    fn add_summary(&mut self, value: P::V) {
+        self.summary = self.summary.combine(&P::M::lift((self.key.clone(), value)));
     }
 }
 

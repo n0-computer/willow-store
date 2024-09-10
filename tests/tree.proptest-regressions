@@ -6,3 +6,4 @@
 # everyone who runs the test benefits from these saved cases.
 cc 4d19b4f5145f8bfa3a3040cd54b8ee0d1fff4e23196f575bfc567f941e417d48 # shrinks to input = _PropTreeInsertArgs { items: [((0, 0, 0), 0)] }
 cc a5e7f5a3f90fa847745906eb39faf0cfb170bc6c061228364796ebac2752cb50 # shrinks to input = _PropTreeInsertArgs { items: [((0, 0, 0), 0), ((19, 0, 0), 0), ((21, 0, 0), 0)] }
+cc 2bdea5b8eaf342b081ede6cba658a2f5f4633edafccaad20c9cf86180f34d770 # shrinks to input = _PropTreeInsertArgs { items: [((0, 0, 0), 0)] }
