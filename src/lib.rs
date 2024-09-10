@@ -858,35 +858,32 @@ impl<P: TreeParams> Node<P> {
         if self.get(key.clone(), store)?.is_some() {
             panic!("Key already exists");
         }
-        *self = Self::insert_impl(*self, NodeData::single(key, value), store)?;
+        self.insert_impl(NodeData::single(key, value), store)?;
         Ok(None)
     }
 
-    fn insert_impl(
-        mut root_id: Self,
-        x: NodeData<P>,
-        store: &mut impl StoreExt<P>,
-    ) -> Result<Self> {
-        let root = store.get_node(root_id)?;
+    fn insert_impl(&mut self, x: NodeData<P>, store: &mut impl StoreExt<P>) -> Result<()> {
         let x = store.put_node(x)?;
-        tracing::info!("insert0 root_id={} x={:?}", root_id, x);
+        tracing::info!("insert0 root_id={} x={:?}", self, x);
         let key = x.key.clone();
         let rank = x.rank;
-        let mut prev = IdAndData::Empty;
-        let mut cur = root;
+        let mut prev: Option<NonEmptyIdAndData<P>> = None;
+        let mut cur = *self;
         // while cur != null and (rank < cur.rank or (rank = cur.rank and key > cur.key)) do
         //   prev ← cur
         //   cur ← if key < cur.key then cur.left else cur.right
-        while !cur.is_empty() {
-            let key_cmp_cur = key.cmp_at_rank(&cur.key(), cur.rank());
-            if rank < cur.rank() || (rank == cur.rank() && key_cmp_cur == Ordering::Greater) {
+        while let IdAndData::NonEmpty(cur_ne) = store.get_node(cur)? {
+            let key_cmp_cur = key.cmp_at_rank(&cur_ne.key, cur_ne.rank);
+            if rank < cur_ne.rank || (rank == cur_ne.rank && key_cmp_cur == Ordering::Greater) {
                 // cur is above x, just go down
-                prev = cur.clone();
+                let left = cur_ne.left;
+                let right = cur_ne.right;
+                prev = Some(cur_ne);
                 cur = if key_cmp_cur == Ordering::Less {
-                    store.get_node(cur.left())
+                    left
                 } else {
-                    store.get_node(cur.right())
-                }?;
+                    right
+                };
             } else {
                 // cur is below x
                 break;
@@ -895,14 +892,15 @@ impl<P: TreeParams> Node<P> {
         // cur is either empty or below x, see exit condition of while loop
         // just flatten cur, add x, and build a new tree
         let mut parts = Vec::new();
+        // this loads cur twice, :shrug:
         cur.split_all(store, &mut parts)?;
         parts.push(x.clone());
         let merged = IdAndData::from_unique_nodes(store, parts)?;
-        if cur.id() == root_id {
+        if cur == *self {
             // x is the new root
-            root_id = merged;
+            *self = merged;
         } else {
-            let prev: &mut NonEmptyIdAndData<P> = prev.non_empty_mut().expect("prev is empty");
+            let mut prev = prev.expect("prev is empty");
             if key.cmp_at_rank(&prev.key, prev.rank) == Ordering::Less {
                 prev.left = merged;
             } else {
@@ -910,7 +908,7 @@ impl<P: TreeParams> Node<P> {
             }
             prev.persist(store)?;
         }
-        Ok(root_id)
+        Ok(())
     }
 
     pub fn delete(&mut self, key: Point<P>, store: &mut impl StoreExt<P>) -> Result<Option<P::V>> {
@@ -943,8 +941,8 @@ impl<P: TreeParams> Node<P> {
         };
         let removed = cur.value.clone();
         let mut res = Vec::new();
-        store.get_node(cur.left)?.split_all(store, &mut res)?;
-        store.get_node(cur.right)?.split_all(store, &mut res)?;
+        cur.left.split_all(store, &mut res)?;
+        cur.right.split_all(store, &mut res)?;
         println!("{}/{}", initial_count, res.len());
         let merged = IdAndData::from_unique_nodes(store, res)?;
         if let Some(prev) = prev.non_empty_mut() {
@@ -1461,23 +1459,6 @@ impl<P: TreeParams> IdAndData<P> {
             IdAndData::Empty => None,
             IdAndData::NonEmpty(node) => Some(node),
         }
-    }
-
-    fn split_all(
-        &mut self,
-        store: &mut impl StoreExt<P>,
-        res: &mut Vec<NonEmptyIdAndData<P>>,
-    ) -> Result<()> {
-        if let Some(mut node) = self.non_empty().cloned() {
-            let mut left = store.get_node(node.left)?;
-            let mut right = store.get_node(node.right)?;
-            left.split_all(store, res)?;
-            right.split_all(store, res)?;
-            node.left = Node::EMPTY;
-            node.right = Node::EMPTY;
-            res.push(node);
-        }
-        Ok(())
     }
 
     pub fn from_unique_nodes(

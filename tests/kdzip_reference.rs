@@ -200,12 +200,6 @@ fn structurally_equal(a: Node, b: Node) -> bool {
     }
 }
 
-fn split_all_to_vec(node: &Node) -> Vec<Node> {
-    let mut res = vec![];
-    split_all(node.clone(), &mut res);
-    res
-}
-
 fn split_to_vec(node: &Node, key: (u64, u64), rank: u8) -> Vec<Node> {
     let mut res = vec![];
     split_rec(node, key, rank, rank, &mut res);
