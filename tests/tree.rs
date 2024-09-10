@@ -148,8 +148,7 @@ fn test_tree_creation() -> TestResult<()> {
 /// The method should return all the points that are contained in the query.
 /// This is tested by comparing with a brute-force implementation.
 fn tree_query_unordered_impl(items: Vec<(TPoint, u64)>, query: TQuery) -> TestResult<()> {
-    let (store, id) = willow_store::IdAndData::from_iter(items.clone())?;
-    let tree = store.get_node(id)?;
+    let (store, tree) = willow_store::IdAndData::from_iter(items.clone())?;
     let mut actual = tree
         .query(&query, &store)
         .map(|x| x.unwrap())
@@ -178,8 +177,7 @@ fn tree_query_ordered_impl(
     query: TQuery,
     ordering: SortOrder,
 ) -> TestResult<()> {
-    let (store, id) = willow_store::IdAndData::from_iter(items.clone())?;
-    let tree: NodeData<TestParams> = store.data(id)?;
+    let (store, tree) = willow_store::IdAndData::from_iter(items.clone())?;
     let actual = tree
         .query_ordered(&query, ordering, &store)
         .map(|x| x.unwrap())
@@ -201,8 +199,7 @@ fn tree_query_ordered_impl(
 /// The method should return the summary of the values of all the points in the query.
 /// This is tested by comparing with a brute-force implementation.
 fn tree_summary_impl(items: Vec<(TPoint, u64)>, query: TQuery) -> TestResult<()> {
-    let (store, id) = willow_store::IdAndData::from_iter(items.clone())?;
-    let tree = store.get_node(id)?;
+    let (store, tree) = willow_store::IdAndData::from_iter(items.clone())?;
     let actual = tree.summary(&query, &store)?;
     let mut expected = ValueSum::zero();
     for (key, value) in &items {
@@ -215,12 +212,11 @@ fn tree_summary_impl(items: Vec<(TPoint, u64)>, query: TQuery) -> TestResult<()>
 }
 
 fn tree_get_impl(items: Vec<(TPoint, u64)>) -> TestResult<()> {
-    let (store, id) = willow_store::IdAndData::from_iter(items.clone())?;
+    let (store, tree) = willow_store::IdAndData::from_iter(items.clone())?;
     let key_set = items
         .iter()
         .map(|(k, _)| k.clone().xyz())
         .collect::<BTreeSet<_>>();
-    let tree = store.get_node(id)?;
     // Compute a set of interesting points that are not in the tree.
     let mut non_keys = BTreeSet::new();
     let mut insert = |p: &TPoint| {
@@ -252,13 +248,12 @@ fn tree_get_impl(items: Vec<(TPoint, u64)>) -> TestResult<()> {
 }
 
 fn tree_update_impl(items: Vec<(TPoint, u64)>) -> TestResult<()> {
-    let (mut store, id) = willow_store::IdAndData::from_iter(items.clone())?;
-    let mut tree = store.get_node(id)?;
+    let (mut store, mut tree) = willow_store::IdAndData::from_iter(items.clone())?;
     for (k, v) in &items {
         let new_v = v + 1;
         tree.update(k.clone(), new_v, &mut store)?;
     }
-    tree.id().assert_invariants(&store, true)?;
+    tree.assert_invariants(&store, true)?;
     Ok(())
 }
 
