@@ -262,17 +262,17 @@ fn tree_insert_impl(items: Vec<(TPoint, u64)>) -> TestResult<()> {
     let (key, value) = items2.pop().unwrap();
     let (mut store, mut node) = IdAndData::from_iter(items2.clone())?;
     let x: IdAndData<TestParams> = store.put_node(NodeData::single(key.clone(), value))?.into();
-    tracing::info!("before:");
+    println!("before:");
     node.dump(&store)?;
-    tracing::info!("");
-    tracing::info!("insert");
+    println!("");
+    println!("insert");
     x.id().dump(&store)?;
-    tracing::info!("");
+    println!("");
     node.insert(key, value, &mut store)?;
-    tracing::info!("after:");
+    println!("after:");
     node.dump(&store)?;
-    tracing::info!("");
-    node.assert_invariants(&store, false)?;
+    println!("");
+    node.assert_invariants(&store, true)?;
     for (k, v) in &items {
         let actual = node.get(k.clone(), &store)?;
         assert_eq!(actual, Some(*v));
@@ -288,6 +288,7 @@ fn tree_delete_impl(items: Vec<(TPoint, u64)>) -> TestResult<()> {
     let (key, _) = items2.pop().unwrap();
     let (mut store, mut node) = IdAndData::from_iter(items.clone())?;
     assert!(node.get(key.clone(), &store)?.is_some());
+    println!("Deleting {:?}", key);
     node.delete(key, &mut store)?;
     node.assert_invariants(&store, false)?;
     for (key, expected) in items2 {
@@ -399,7 +400,8 @@ fn test_tree_insert() -> TestResult<()> {
         // vec![((18, 9, 28), 0), ((0, 0, 0), 0), ((0, 2, 0), 0)],
         // vec![((0, 0, 0), 0), ((1, 0, 0), 0), ((2, 0, 0), 0)],
         // vec![((0, 0, 0), 0)],
-        vec![((0, 0, 0), 0), ((54, 0, 0), 1)],
+        vec![((32, 0, 0), 0), ((54, 0, 0), 1), ((0, 0, 0), 0)],
+        // vec![((0, 0, 0), 0), ((54, 0, 0), 1)],
     ];
     for items in cases {
         let items = parse_case(items);
@@ -481,7 +483,10 @@ fn prop_same_rank(#[strategy(points_with_rank(0))] items: Vec<(TPoint, u64)>) {
 
 #[test]
 fn test_tree_delete() -> TestResult<()> {
-    let cases = vec![vec![((4, 0, 0), 0), ((8, 0, 0), 0)]];
+    let cases = vec![
+        // vec![((4, 0, 0), 0), ((8, 0, 0), 0)]
+        vec![((67, 0, 0), 0), ((54, 0, 0), 0), ((0, 0, 0), 0)],
+    ];
     for items in cases {
         let items = parse_case(items);
         tree_delete_impl(items)?;

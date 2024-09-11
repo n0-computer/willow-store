@@ -845,6 +845,10 @@ impl<P: TreeParams> Node<P> {
         })
     }
 
+    pub fn id(&self) -> NodeId {
+        self.0
+    }
+
     pub fn insert(
         &mut self,
         key: Point<P>,
@@ -858,44 +862,45 @@ impl<P: TreeParams> Node<P> {
         if self.get(key.clone(), store)?.is_some() {
             panic!("Key already exists");
         }
-        // self.insert_rec(None, NodeData::single(key, value), store)?;
-        self.insert_impl(NodeData::single(key, value), store)?;
+        self.insert_rec(None, NodeData::single(key, value), store)?;
+        // self.insert_impl(NodeData::single(key, value), store)?;
         Ok(None)
     }
 
     fn insert_rec(
         &mut self,
-        prev: Option<NonEmptyIdAndData<P>>,
+        prev: Option<&mut NonEmptyIdAndData<P>>,
         x: NodeData<P>,
         store: &mut impl StoreExt<P>,
     ) -> Result<Option<P::V>> {
-        if let IdAndData::NonEmpty(mut cur_ne) = store.get_node(*self)? {
-            let x_cmp_cur = x.key.cmp_at_rank(&cur_ne.key, cur_ne.rank);
+        if let IdAndData::NonEmpty(mut this) = store.get_node(*self)? {
+            let x_cmp_cur = x.key.cmp_at_rank(&this.key, this.rank);
             if x_cmp_cur == Ordering::Equal {
                 // just replace the value
                 let mut res = x.value;
-                std::mem::swap(&mut res, &mut cur_ne.value);
+                std::mem::swap(&mut res, &mut this.value);
                 let res = Some(res);
-                cur_ne.recalculate_summary(store)?;
-                cur_ne.persist(store)?;
+                this.recalculate_summary(store)?;
+                this.persist(store)?;
                 return Ok(res);
-            } else if x.rank < cur_ne.rank
-                || (x.rank == cur_ne.rank && x_cmp_cur == Ordering::Greater)
+            } else if x.rank < this.rank || (x.rank == this.rank && x_cmp_cur == Ordering::Greater)
             {
                 // cur is above x, just go down
-                let prev = Some(cur_ne.clone());
+                let mut left = this.left;
+                let mut right = this.right;
+                let prev = Some(&mut this);
                 let value = x.value.clone();
                 let res = match x_cmp_cur {
-                    Ordering::Less => cur_ne.left.insert_rec(prev, x, store)?,
-                    Ordering::Greater => cur_ne.right.insert_rec(prev, x, store)?,
+                    Ordering::Less => left.insert_rec(prev, x, store)?,
+                    Ordering::Greater => right.insert_rec(prev, x, store)?,
                     Ordering::Equal => unreachable!(),
                 };
                 if res.is_some() {
-                    cur_ne.recalculate_summary(store)?;
+                    this.recalculate_summary(store)?;
                 } else {
-                    cur_ne.add_summary(value);
+                    this.add_summary(value);
                 }
-                cur_ne.persist(store)?;
+                this.persist(store)?;
                 return Ok(res);
             }
         }
@@ -905,14 +910,14 @@ impl<P: TreeParams> Node<P> {
         let x = store.put_node(x)?;
         parts.push(x.clone());
         let merged = IdAndData::from_unique_nodes(store, parts)?;
-        if let Some(mut prev) = prev {
+        println!("merged:");
+        merged.dump(store)?;
+        if let Some(prev) = prev {
             if x.key.cmp_at_rank(&prev.key, prev.rank) == Ordering::Less {
                 prev.left = merged;
             } else {
                 prev.right = merged;
             }
-            prev.recalculate_summary(store)?;
-            prev.persist(store)?;
         } else {
             *self = merged;
         }
@@ -966,6 +971,47 @@ impl<P: TreeParams> Node<P> {
 
     pub fn delete(&mut self, key: Point<P>, store: &mut impl StoreExt<P>) -> Result<Option<P::V>> {
         self.delete_impl(key, store)
+    }
+
+    fn delete_rec(
+        &mut self,
+        prev: Option<&mut NonEmptyIdAndData<P>>,
+        key: Point<P>,
+        store: &mut impl StoreExt<P>,
+    ) -> Result<Option<P::V>> {
+        if let IdAndData::NonEmpty(mut this) = store.get_node(*self)? {
+            let key_cmp_cur = key.cmp_at_rank(&this.key, this.rank);
+            if key_cmp_cur == Ordering::Equal {
+                let removed = this.value.clone();
+                let mut res = Vec::new();
+                this.left.split_all(store, &mut res)?;
+                this.right.split_all(store, &mut res)?;
+                let merged = IdAndData::from_unique_nodes(store, res)?;
+                if let Some(prev) = prev {
+                    if prev.left == this.id() {
+                        prev.left = merged;
+                    } else {
+                        prev.right = merged;
+                    }
+                } else {
+                    *self = merged;
+                }
+                Ok(Some(removed))
+            } else {
+                let mut left = this.left;
+                let mut right = this.right;
+                let prev = Some(&mut this);
+                let res = match key_cmp_cur {
+                    Ordering::Less => left.delete_rec(prev, key, store)?,
+                    Ordering::Greater => right.delete_rec(prev, key, store)?,
+                    Ordering::Equal => unreachable!(),
+                };
+                // update summary
+                Ok(res)
+            }
+        } else {
+            Ok(None)
+        }
     }
 
     fn delete_impl(&mut self, key: Point<P>, store: &mut impl StoreExt<P>) -> Result<Option<P::V>> {
@@ -1054,20 +1100,21 @@ impl<P: TreeParams> Node<P> {
 
     fn dump0(&self, prefix: String, store: &impl StoreExt<P>) -> Result<()> {
         if let Some(data) = store.data_opt(*self)? {
-            tracing::info!("{} left:", prefix);
+            println!("{} left:", prefix);
             data.left.dump0(format!("{}  ", prefix), store)?;
-            tracing::info!(
-                "{}{:?} rank={} order={:?} value={:?}",
+            println!(
+                "{}{:?} rank={} order={:?} value={:?} summary={:?}",
                 prefix,
                 data.key,
                 data.rank,
                 SortOrder::from(data.rank),
-                data.value
+                data.value,
+                data.summary,
             );
-            tracing::info!("{} right:", prefix);
+            println!("{} right:", prefix);
             data.right.dump0(format!("{}  ", prefix), store)?;
         } else {
-            tracing::info!("Empty");
+            println!("{}Empty", prefix);
         }
         Ok(())
     }
@@ -1250,6 +1297,8 @@ impl<P: TreeParams> Node<P> {
         )
     }
 
+    /// Split an entire tree into leafs. The nodes are modified in place, and
+    /// persisted.
     fn split_all(
         &self,
         store: &mut impl StoreExt<P>,
@@ -1258,8 +1307,12 @@ impl<P: TreeParams> Node<P> {
         if let IdAndData::NonEmpty(mut data) = store.get_node(*self)? {
             data.left.split_all(store, res)?;
             data.right.split_all(store, res)?;
+            // turn the node into a leaf
             data.left = Node::EMPTY;
             data.right = Node::EMPTY;
+            data.summary = P::M::lift((data.key.clone(), data.value.clone()));
+            // persist (should we do this here or later?)
+            data.persist(store)?;
             res.push(data);
         }
         Ok(())
@@ -1545,8 +1598,14 @@ impl<P: TreeParams> IdAndData<P> {
                 .then(p1.key.cmp_at_rank(&p2.key, p1.rank))
         });
         let mut tree = Node::EMPTY;
-        for node in nodes {
-            let node = store.put_node(node.data)?;
+        // println!("merging {} nodes", nodes.len());
+        // for node in &nodes {
+        //     println!("{:?} {}", node.key, node.rank);
+        // }
+        for (i, node) in nodes.into_iter().enumerate() {
+            // let node = store.put_node(node.data)?;
+            // println!("{} {}", i, tree.is_empty());
+            // tree.dump(store)?;
             tree.insert_no_balance(&node, store)?;
         }
         Ok(tree)
@@ -1803,18 +1862,20 @@ impl<P: TreeParams> NonEmptyIdAndData<P> {
         } = self;
         match node.key.cmp_at_rank(parent_key, *parent_rank) {
             Ordering::Less => {
-                if let IdAndData::NonEmpty(mut left) = store.get_node(*left)? {
-                    left.insert_no_balance(node, store)?;
-                } else {
-                    *left = store.create(node)?.into();
-                }
+                left.insert_no_balance(node, store)?;
+                // if let IdAndData::NonEmpty(mut left) = store.get_node(*left)? {
+                //     left.insert_no_balance(node, store)?;
+                // } else {
+                //     *left = node.id;
+                // }
             }
             Ordering::Greater => {
-                if let IdAndData::NonEmpty(mut right) = store.get_node(*right)? {
-                    right.insert_no_balance(node, store)?;
-                } else {
-                    *right = store.create(node)?.into();
-                }
+                right.insert_no_balance(node, store)?;
+                // if let IdAndData::NonEmpty(mut right) = store.get_node(*right)? {
+                //     right.insert_no_balance(node, store)?;
+                // } else {
+                //     *right = node.id;
+                // }
             }
             Ordering::Equal => {
                 panic!("Duplicate keys not supported in insert_no_balance");
