@@ -7,7 +7,6 @@ use std::{cell::RefCell, collections::BTreeSet, rc::Rc};
 
 use rand::{seq::SliceRandom, SeedableRng};
 use test_strategy::proptest;
-use willow_store::count_trailing_zeros;
 
 struct NodeData {
     key: u64,

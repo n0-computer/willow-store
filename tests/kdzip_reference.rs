@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Non-persisten reference implementation of a zip tree, closely following the
 //! description in the paper.
 //!
@@ -292,64 +293,6 @@ fn lr_rec(node: &Node, key: (u64, u64), rank: u8) -> (bool, bool) {
         let (rl, rr) = lr_rec(&node.right(), key, rank);
         (ll || sl || rl, lr || sr || rr)
     };
-    (l, r)
-}
-
-fn split_rec_2(
-    node: &Node,
-    key: (u64, u64),
-    rank: u8,
-    parent_rank: u8,
-    res: &mut Vec<Node>,
-) -> (bool, bool) {
-    if node.is_empty() {
-        return (false, false);
-    }
-    tracing::info!("{:?}", node);
-    let same_sort = node.rank() % 2 == rank % 2;
-    let cmp = cmp_at_rank(node.key(), key, rank);
-    let n0 = res.len();
-    let (l, r) = if same_sort {
-        match cmp {
-            Ordering::Less => {
-                let n = res.len();
-                let (left, right) = split_rec_2(&node.right(), key, rank, node.rank(), res);
-                if n != res.len() {
-                    node.set_right(Node::EMPTY);
-                }
-                (true, right)
-            }
-            Ordering::Greater => {
-                let n = res.len();
-                let (left, right) = split_rec_2(&node.left(), key, rank, node.rank(), res);
-                if n != res.len() {
-                    node.set_left(Node::EMPTY);
-                }
-                (left, true)
-            }
-            Ordering::Equal => (true, true),
-        }
-    } else {
-        let n = res.len();
-        let (ll, lr) = split_rec_2(&node.left(), key, rank, node.rank(), res);
-        if n != res.len() {
-            node.set_left(Node::EMPTY);
-        }
-        let (sl, sr) = match cmp {
-            Ordering::Less => (true, false),
-            Ordering::Equal => (true, true),
-            Ordering::Greater => (false, true),
-        };
-        let n = res.len();
-        let (rl, rr) = split_rec_2(&node.right(), key, rank, node.rank(), res);
-        if n != res.len() {
-            node.set_right(Node::EMPTY);
-        }
-        (ll || sl || rl, lr || sr || rr)
-    };
-    if l != r || rank == parent_rank || n0 != res.len() {
-        flatten(node, res);
-    }
     (l, r)
 }
 
@@ -720,7 +663,6 @@ fn count(node: &Node) -> usize {
 }
 
 fn insert_brute_force(root: &mut Node, x: Node) {
-    let initial_count = count(root);
     let rank = x.rank();
     let key = x.key();
     let mut cur = root.clone();
@@ -1064,7 +1006,7 @@ mod tests {
         for case in cases {
             let node = Node::from_iter_reference(case.0.iter().cloned());
             node.print();
-            for (key, rank) in &case.0 {
+            for (key, _rank) in &case.0 {
                 assert!(contains_rec(node.clone(), *key));
             }
         }

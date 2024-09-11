@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Non-persisten reference implementation of a zip tree, closely following the
 //! description in the paper.
 //!
