@@ -1,6 +1,7 @@
 use crate::{FixedSize, KeyParams, SortOrder, VariableSize};
 use serde::Serialize;
 use std::{cmp::Ordering, fmt::Debug};
+use zerocopy::{AsBytes, FromBytes};
 
 /// A point in 3D space, serving as a key for a tree.
 ///
@@ -188,18 +189,18 @@ impl<K: KeyParams> VariableSize for Point<K> {
         let x_start = 0;
         let y_start: usize = K::X::SIZE;
         let z_start: usize = K::X::SIZE + K::Y::SIZE;
-        self.x.write(&mut buf[x_start..y_start]);
-        self.y.write(&mut buf[y_start..z_start]);
-        self.z.write(&mut buf[z_start..]);
+        self.x.write_to_prefix(&mut buf[x_start..]).unwrap();
+        self.y.write_to_prefix(&mut buf[y_start..]).unwrap();
+        self.z.write_to_prefix(&mut buf[z_start..]).unwrap();
     }
 
     fn read(buf: &[u8]) -> Self {
         let x_start = 0;
         let y_start: usize = K::X::SIZE;
         let z_start: usize = K::X::SIZE + K::Y::SIZE;
-        let x = K::X::read(&buf[x_start..y_start]);
-        let y = K::Y::read(&buf[y_start..z_start]);
-        let z = K::Z::read(&buf[z_start..]);
+        let x = K::X::read_from_prefix(&buf[x_start..]).unwrap();
+        let y = K::Y::read_from_prefix(&buf[y_start..]).unwrap();
+        let z = K::Z::read_from_prefix(&buf[z_start..]).unwrap();
         Point::new(x, y, z)
     }
 }

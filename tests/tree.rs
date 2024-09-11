@@ -8,6 +8,7 @@ use willow_store::{
     FixedSize, KeyParams, LiftingCommutativeMonoid, NodeData, Point, QueryRange, QueryRange3d,
     SortOrder, Store, TreeParams, VariableSize,
 };
+use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
 type TPoint = Point<TestParams>;
 type TQuery = QueryRange3d<TestParams>;
@@ -26,21 +27,16 @@ impl TreeParams for TestParams {
     type M = ValueSum;
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, AsBytes, FromZeroes, FromBytes)]
+#[repr(C)]
 struct ValueSum(u64);
 
 impl FixedSize for ValueSum {
     const SIZE: usize = 8;
-    fn read(buf: &[u8]) -> Self {
-        ValueSum(u64::from_le_bytes(buf.try_into().unwrap()))
-    }
-    fn write(&self, buf: &mut [u8]) {
-        buf.copy_from_slice(&self.0.to_le_bytes());
-    }
 }
 
 impl LiftingCommutativeMonoid<(Point<TestParams>, u64)> for ValueSum {
-    fn zero() -> Self {
+    fn neutral() -> Self {
         ValueSum(0)
     }
 
@@ -201,7 +197,7 @@ fn tree_query_ordered_impl(
 fn tree_summary_impl(items: Vec<(TPoint, u64)>, query: TQuery) -> TestResult<()> {
     let (store, tree) = willow_store::Node::from_iter(items.clone())?;
     let actual = tree.summary(&query, &store)?;
-    let mut expected = ValueSum::zero();
+    let mut expected = ValueSum::neutral();
     for (key, value) in &items {
         if query.contains(key) {
             expected = expected.combine(&ValueSum::lift((key.clone(), *value)));

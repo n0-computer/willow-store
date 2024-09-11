@@ -108,11 +108,11 @@ use std::{
 use anyhow::Result;
 use genawaiter::sync::{Co, Gen};
 use point::{XYZ, YZX, ZXY};
-use ref_cast::RefCast;
 use serde::Serialize;
 
 mod point;
 pub use point::Point;
+use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
 macro_rules! assert_lt {
     ($left:expr, $right:expr) => {
@@ -127,14 +127,28 @@ macro_rules! assert_gt {
 }
 
 ///
-pub trait CoordParams: Ord + PartialEq + Eq + Serialize + Clone + Debug + Display {}
+pub trait CoordParams:
+    Ord + PartialEq + Eq + Serialize + Clone + Debug + Display + FromBytes + AsBytes
+{
+}
 
-impl<T: Ord + PartialEq + Eq + Serialize + Clone + Debug + Display> CoordParams for T {}
+impl<
+        T: Ord
+            + PartialEq
+            + Eq
+            + Serialize
+            + Clone
+            + Debug
+            + Display
+            + FromBytes
+            + FromZeroes
+            + AsBytes,
+    > CoordParams for T
+{
+}
 
 pub trait FixedSize {
     const SIZE: usize;
-    fn write(&self, buf: &mut [u8]);
-    fn read(buf: &[u8]) -> Self;
 }
 
 pub trait VariableSize {
@@ -151,12 +165,6 @@ pub trait VariableSize {
 
 impl FixedSize for u64 {
     const SIZE: usize = 8;
-    fn write(&self, buf: &mut [u8]) {
-        buf.copy_from_slice(&self.to_be_bytes());
-    }
-    fn read(buf: &[u8]) -> Self {
-        u64::from_be_bytes(buf.try_into().unwrap())
-    }
 }
 
 impl VariableSize for u64 {
@@ -173,22 +181,10 @@ impl VariableSize for u64 {
 
 impl FixedSize for NodeId {
     const SIZE: usize = 8;
-    fn write(&self, buf: &mut [u8]) {
-        buf.copy_from_slice(&self.0);
-    }
-    fn read(buf: &[u8]) -> Self {
-        NodeId(buf.try_into().unwrap())
-    }
 }
 
 impl FixedSize for u8 {
     const SIZE: usize = 1;
-    fn write(&self, buf: &mut [u8]) {
-        buf[0] = *self;
-    }
-    fn read(buf: &[u8]) -> Self {
-        buf[0]
-    }
 }
 
 pub trait KeyParams {
@@ -198,7 +194,7 @@ pub trait KeyParams {
 }
 
 pub trait LiftingCommutativeMonoid<T> {
-    fn zero() -> Self;
+    fn neutral() -> Self;
     fn lift(value: T) -> Self;
     fn combine(&self, other: &Self) -> Self;
 }
@@ -605,15 +601,27 @@ impl<P: KeyParams> BBox<P> {
 }
 
 ///
-pub trait ValueParams: PartialEq + Eq + Serialize + Clone + Debug + FixedSize {}
+pub trait ValueParams:
+    PartialEq + Eq + Serialize + Clone + Debug + FixedSize + AsBytes + FromBytes
+{
+}
 
-impl<T: PartialEq + Eq + Serialize + Clone + Debug + FixedSize> ValueParams for T {}
+impl<T: PartialEq + Eq + Serialize + Clone + Debug + FixedSize + AsBytes + FromBytes> ValueParams
+    for T
+{
+}
 
 /// Tree params for a 3D tree. This extends `KeyParams` with a value and
 /// summary type.
 pub trait TreeParams: KeyParams + Sized {
     type V: ValueParams;
-    type M: LiftingCommutativeMonoid<(Point<Self>, Self::V)> + Clone + Debug + Eq + FixedSize;
+    type M: LiftingCommutativeMonoid<(Point<Self>, Self::V)>
+        + Clone
+        + Debug
+        + Eq
+        + AsBytes
+        + FixedSize
+        + FromBytes;
 }
 
 #[inline(always)]
@@ -767,7 +775,7 @@ impl<T: VariableSize> Store<T> for MemStore {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, RefCast)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, AsBytes, FromZeroes, FromBytes)]
 #[repr(transparent)]
 pub struct NodeId([u8; 8]);
 
@@ -800,7 +808,7 @@ impl NodeId {
 }
 
 #[repr(transparent)]
-#[derive(RefCast)]
+#[derive(AsBytes, FromZeroes, FromBytes)]
 pub struct Node<P: TreeParams>(NodeId, PhantomData<P>);
 
 impl<P: TreeParams> From<NodeId> for Node<P> {
@@ -1106,7 +1114,7 @@ impl<P: TreeParams> Node<P> {
             let bbox = BBox::all();
             node.summary0(query, &bbox, store)
         } else {
-            Ok(P::M::zero())
+            Ok(P::M::neutral())
         }
     }
 
@@ -1249,19 +1257,19 @@ impl<P: TreeParams, T: AsRef<[u8]>> NodeData2<P, T> {
     }
 
     pub fn left(&self) -> Node<P> {
-        NodeId::read(&self.0.as_ref()[left_offset::<P>()..right_offset::<P>()]).into()
+        Node::read_from_prefix(&&self.0.as_ref()[left_offset::<P>()..]).unwrap()
     }
 
     pub fn right(&self) -> Node<P> {
-        NodeId::read(&self.0.as_ref()[right_offset::<P>()..value_offset::<P>()]).into()
+        Node::read_from_prefix(&&self.0.as_ref()[right_offset::<P>()..]).unwrap()
     }
 
-    pub fn value(&self) -> P::V {
-        P::V::read(&self.0.as_ref()[value_offset::<P>()..summary_offset::<P>()])
+    pub fn value(&self) -> &P::V {
+        P::V::ref_from_prefix(&self.0.as_ref()[value_offset::<P>()..]).unwrap()
     }
 
-    pub fn summary(&self) -> P::M {
-        P::M::read(&self.0.as_ref()[summary_offset::<P>()..rank_offset::<P>()])
+    pub fn summary(&self) -> &P::M {
+        P::M::ref_from_prefix(&self.0.as_ref()[summary_offset::<P>()..]).unwrap()
     }
 
     pub fn rank(&self) -> u8 {
@@ -1275,17 +1283,15 @@ impl<P: TreeParams, T: AsRef<[u8]>> NodeData2<P, T> {
 
 impl<P: TreeParams, T: AsMut<[u8]>> NodeData2<P, T> {
     pub fn left_mut(&mut self) -> &mut Node<P> {
-        let slice_mut: &mut [u8] = &mut self.0.as_mut()[left_offset::<P>()..right_offset::<P>()];
-        let id_mut: &mut [u8; 8] = slice_mut.try_into().unwrap();
-        let id_mut = NodeId::ref_cast_mut(id_mut);
-        Node::ref_cast_mut(id_mut)
+        Node::mut_from_prefix(&mut self.0.as_mut()[left_offset::<P>()..]).unwrap()
     }
 
     pub fn right_mut(&mut self) -> &mut Node<P> {
-        let slice_mut: &mut [u8] = &mut self.0.as_mut()[right_offset::<P>()..value_offset::<P>()];
-        let id_mut: &mut [u8; 8] = slice_mut.try_into().unwrap();
-        let id_mut = NodeId::ref_cast_mut(id_mut);
-        Node::ref_cast_mut(id_mut)
+        Node::mut_from_prefix(&mut self.0.as_mut()[right_offset::<P>()..]).unwrap()
+    }
+
+    pub fn summary_mut(&mut self) -> &mut P::M {
+        P::M::mut_from_prefix(&mut self.0.as_mut()[summary_offset::<P>()..]).unwrap()
     }
 }
 
@@ -1298,15 +1304,15 @@ impl<P: KeyParams, T: AsRef<[u8]>> Point2<P, T> {
     }
 
     pub fn x(&self) -> P::X {
-        P::X::read(&self.0.as_ref()[0..P::X::SIZE])
+        P::X::read_from_prefix(&self.0.as_ref()[0..]).unwrap()
     }
 
     pub fn y(&self) -> P::Y {
-        P::Y::read(&self.0.as_ref()[P::X::SIZE..P::X::SIZE + P::Y::SIZE])
+        P::Y::read_from_prefix(&self.0.as_ref()[P::X::SIZE..]).unwrap()
     }
 
     pub fn z(&self) -> P::Z {
-        P::Z::read(&self.0.as_ref()[P::X::SIZE + P::Y::SIZE..])
+        P::Z::read_from_prefix(&self.0.as_ref()[P::X::SIZE + P::Y::SIZE..]).unwrap()
     }
 }
 
@@ -1404,13 +1410,13 @@ impl<P: TreeParams> NodeData<P> {
             if query.contains(self.key()) {
                 return Ok(self.summary().clone());
             } else {
-                return Ok(P::M::zero());
+                return Ok(P::M::neutral());
             }
         }
         if bbox.contained_in(&query) {
             return Ok(self.summary().clone());
         }
-        let mut summary = P::M::zero();
+        let mut summary = P::M::neutral();
         if query.overlaps_left(self.key(), self.rank()) {
             if let Some(left) = store.data_opt(self.left())? {
                 let left_bbox = bbox.split_left(self.key(), self.rank());
@@ -1430,7 +1436,7 @@ impl<P: TreeParams> NodeData<P> {
     }
 
     fn recalculate_summary(&mut self, store: &impl StoreExt<P>) -> Result<()> {
-        let mut res = P::M::zero();
+        let mut res = P::M::neutral();
         if let Some(left) = store.data_opt(self.left())? {
             res = res.combine(left.summary());
         }
@@ -1511,11 +1517,15 @@ impl<P: TreeParams> VariableSize for NodeData<P> {
         let rank_start: usize = 16 + P::V::SIZE + P::M::SIZE;
         let key_start: usize = 16 + P::V::SIZE + P::M::SIZE + 1;
         assert_eq!(buf.len(), self.size());
-        self.left().0.write(&mut buf[L_START..R_START]);
-        self.right().0.write(&mut buf[R_START..V_START]);
-        self.value().write(&mut buf[V_START..m_start]);
-        self.summary().write(&mut buf[m_start..rank_start]);
-        self.rank().write(&mut buf[rank_start..key_start]);
+        self.left().0.write_to(&mut buf[L_START..R_START]).unwrap();
+        self.right().0.write_to(&mut buf[R_START..V_START]).unwrap();
+        self.value().write_to(&mut buf[V_START..m_start]).unwrap();
+        self.summary()
+            .write_to(&mut buf[m_start..rank_start])
+            .unwrap();
+        self.rank()
+            .write_to(&mut buf[rank_start..key_start])
+            .unwrap();
         self.key().write(&mut buf[key_start..]);
     }
 
@@ -1528,14 +1538,14 @@ impl<P: TreeParams> VariableSize for NodeData<P> {
         let x_start: usize = 16 + P::V::SIZE + P::M::SIZE + 1;
         let y_start: usize = 16 + P::V::SIZE + P::M::SIZE + 1 + P::X::SIZE;
         let z_start: usize = 16 + P::V::SIZE + P::M::SIZE + 1 + P::X::SIZE + P::Y::SIZE;
-        let left = NodeId::read(&buf[L_START..R_START]).into();
-        let right = NodeId::read(&buf[R_START..V_START]).into();
-        let value = P::V::read(&buf[V_START..m_start]);
-        let summary = P::M::read(&buf[m_start..rank_start]);
-        let rank = u8::read(&buf[rank_start..x_start]);
-        let x = P::X::read(&buf[x_start..y_start]);
-        let y = P::Y::read(&buf[y_start..z_start]);
-        let z = P::Z::read(&buf[z_start..]);
+        let left = Node::read_from_prefix(&buf[L_START..]).unwrap();
+        let right = Node::read_from_prefix(&buf[R_START..]).unwrap();
+        let value = P::V::read_from_prefix(&buf[V_START..]).unwrap();
+        let summary = P::M::read_from_prefix(&buf[m_start..]).unwrap();
+        let rank = u8::read_from_prefix(&buf[rank_start..]).unwrap();
+        let x = P::X::read_from_prefix(&buf[x_start..]).unwrap();
+        let y = P::Y::read_from_prefix(&buf[y_start..]).unwrap();
+        let z = P::Z::read_from_prefix(&buf[z_start..]).unwrap();
         Self {
             key: Point { x, y, z },
             rank,
