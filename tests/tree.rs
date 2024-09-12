@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeSet,
     fmt::{Debug, Display},
+    ops::Deref,
 };
 
 use prop::sample::SizeRange;
@@ -488,10 +489,12 @@ fn prop_key_bytes_roundtrip(#[strategy(point())] p: TPoint) {
 #[proptest]
 fn prop_nodedata_create(#[strategy(point())] p: TPoint, v: u64) {
     let p2 = OwnedPoint2::<TestParams>::new(&p.x, &p.y, &p.z);
-    println!("{:?} {:?}", p, p2);
     let node = OwnedNodeData2::leaf(&p2, &v);
-    let key = node.key();
-    println!("{:?}", key);
+    let summary = ValueSum::lift(&p, &v);
+    assert_eq!(node.key(), p2.deref());
+    assert_eq!(node.value(), &v);
+    assert_eq!(node.summary(), &summary);
+    assert!(node.is_leaf());
 }
 
 fn node_bytes_roundtrip_impl(p: TPoint, v: u64) -> TestResult<()> {

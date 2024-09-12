@@ -1157,7 +1157,7 @@ impl<P: TreeParams> OwnedNodeData2<P> {
     /// Creates a leaf data from the given key and value.
     pub fn leaf(key: &Point2<P>, value: &P::V) -> Self {
         let mut data = vec![0; key_offset::<P>() + key.size()];
-        value.write_to_prefix(&mut data[value_offset::<P>()..]);
+        data[key_offset::<P>()..].copy_from_slice(key.as_slice());
         let mut res = Self(PhantomData, data);
         *res.value_mut() = value.clone();
         // todo: change lift to take a Point2
@@ -1226,6 +1226,10 @@ impl<P: TreeParams> NodeData2<P> {
     //     debug_assert!(data.as_ref().len() >= min_data_size::<P>());
     //     Self(data, PhantomData)
     // }
+
+    pub fn hex(&self) -> String {
+        hex::encode(&self.1)
+    }
 
     pub fn is_leaf(&self) -> bool {
         self.left().is_empty() && self.right().is_empty()

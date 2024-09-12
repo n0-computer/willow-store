@@ -140,6 +140,10 @@ impl<P: KeyParams> Point2<P> {
     pub fn zxy(&self) -> &ZXY2<P> {
         ZXY2::ref_cast(self)
     }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.1
+    }
 }
 
 impl<P: KeyParams> std::fmt::Debug for Point2<P> {
