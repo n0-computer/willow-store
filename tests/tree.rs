@@ -9,8 +9,8 @@ use proptest::prelude::*;
 use test_strategy::proptest;
 use testresult::TestResult;
 use willow_store::{
-    FixedSize, KeyParams, LiftingCommutativeMonoid, NodeData, NodeData2, OwnedNodeData2,
-    OwnedPoint2, Point, QueryRange, QueryRange3d, SortOrder, StoreExt, TreeParams, VariableSize,
+    FixedSize, KeyParams, LiftingCommutativeMonoid, NodeData, NodeData2, NodeStore, OwnedNodeData2,
+    OwnedPoint2, Point, QueryRange, QueryRange3d, SortOrder, TreeParams, VariableSize,
 };
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 

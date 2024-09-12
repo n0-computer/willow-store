@@ -624,7 +624,7 @@ fn min_key_size<P: KeyParams>() -> usize {
 
 #[inline(always)]
 fn min_data_size<P: TreeParams>() -> usize {
-    8 + 8 + 1 + P::V::SIZE + P::M::SIZE + min_key_size::<P>()
+    8 + 8 + 8 + P::V::SIZE + P::M::SIZE + min_key_size::<P>()
 }
 
 #[inline(always)]
@@ -658,7 +658,7 @@ fn key_offset<P: TreeParams>() -> usize {
     16 + P::V::SIZE + P::M::SIZE + 8
 }
 
-pub trait StoreExt<P: TreeParams>: store::Store<NodeData<P>> {
+pub trait NodeStore<P: TreeParams>: store::Store {
     fn create_node(&mut self, data: &NodeData<P>) -> Result<Node<P>> {
         let bytes = data.to_vec();
         Ok(Node(self.create(&bytes)?, PhantomData))
@@ -676,7 +676,8 @@ pub trait StoreExt<P: TreeParams>: store::Store<NodeData<P>> {
     }
 
     fn data(&self, id: Node<P>) -> Result<NodeData<P>> {
-        store::Store::read(self, id.0)
+        let data = store::Store::read(self, id.0)?;
+        Ok(NodeData::read(&data))
     }
 
     /// Get a node by id, returning None if the id is None.
@@ -687,7 +688,7 @@ pub trait StoreExt<P: TreeParams>: store::Store<NodeData<P>> {
         Ok(if id.is_empty() {
             None
         } else {
-            Some(self.read(id.0)?)
+            Some(self.data(id)?)
         })
     }
 
@@ -697,7 +698,7 @@ pub trait StoreExt<P: TreeParams>: store::Store<NodeData<P>> {
         Ok(if id.is_empty() {
             None
         } else {
-            IdAndData::new(id, self.read(id.0)?).into()
+            IdAndData::new(id, self.data(id)?).into()
         })
     }
 
@@ -707,11 +708,11 @@ pub trait StoreExt<P: TreeParams>: store::Store<NodeData<P>> {
         if id.is_empty() {
             panic!("Empty id");
         }
-        Ok(IdAndData::new(id, self.read(id.0)?))
+        Ok(IdAndData::new(id, self.data(id)?))
     }
 }
 
-impl<T: store::Store<NodeData<P>>, P: TreeParams> StoreExt<P> for T {}
+impl<T: store::Store, P: TreeParams> NodeStore<P> for T {}
 
 #[repr(transparent)]
 #[derive(AsBytes, FromZeroes, FromBytes)]
@@ -766,7 +767,7 @@ impl<P: TreeParams> Node<P> {
         self.0.is_empty()
     }
 
-    pub fn count(&self, store: &impl StoreExt<P>) -> Result<u64> {
+    pub fn count(&self, store: &impl NodeStore<P>) -> Result<u64> {
         Ok(if let Some(data) = store.data_opt(*self)? {
             1 + data.left().count(store)? + data.right().count(store)?
         } else {
@@ -782,12 +783,16 @@ impl<P: TreeParams> Node<P> {
         &mut self,
         key: Point<P>,
         value: P::V,
-        store: &mut impl StoreExt<P>,
+        store: &mut impl NodeStore<P>,
     ) -> Result<Option<P::V>> {
         self.insert_rec(NodeData::single(key, value), store)
     }
 
-    fn insert_rec(&mut self, x: NodeData<P>, store: &mut impl StoreExt<P>) -> Result<Option<P::V>> {
+    fn insert_rec(
+        &mut self,
+        x: NodeData<P>,
+        store: &mut impl NodeStore<P>,
+    ) -> Result<Option<P::V>> {
         if let Some(mut this) = store.get_node(*self)? {
             let x_cmp_cur = x.key().cmp_at_rank(this.key(), this.rank());
             if x_cmp_cur == Ordering::Equal {
@@ -828,11 +833,11 @@ impl<P: TreeParams> Node<P> {
         }
     }
 
-    pub fn delete(&mut self, key: Point<P>, store: &mut impl StoreExt<P>) -> Result<Option<P::V>> {
+    pub fn delete(&mut self, key: Point<P>, store: &mut impl NodeStore<P>) -> Result<Option<P::V>> {
         self.delete_rec(key, store)
     }
 
-    fn delete_rec(&mut self, key: Point<P>, store: &mut impl StoreExt<P>) -> Result<Option<P::V>> {
+    fn delete_rec(&mut self, key: Point<P>, store: &mut impl NodeStore<P>) -> Result<Option<P::V>> {
         if let Some(mut this) = store.get_node(*self)? {
             let key_cmp_cur = key.cmp_at_rank(this.key(), this.rank);
             if key_cmp_cur == Ordering::Equal {
@@ -862,7 +867,11 @@ impl<P: TreeParams> Node<P> {
         }
     }
 
-    pub fn assert_invariants(&self, store: &impl StoreExt<P>, include_summary: bool) -> Result<()> {
+    pub fn assert_invariants(
+        &self,
+        store: &impl NodeStore<P>,
+        include_summary: bool,
+    ) -> Result<()> {
         if !self.is_empty() {
             let data = store.get_non_empty(*self)?;
             data.assert_invariants(store, include_summary)?;
@@ -870,11 +879,11 @@ impl<P: TreeParams> Node<P> {
         Ok(())
     }
 
-    pub fn get(&self, key: Point<P>, store: &impl StoreExt<P>) -> Result<Option<P::V>> {
+    pub fn get(&self, key: Point<P>, store: &impl NodeStore<P>) -> Result<Option<P::V>> {
         Ok(self.get0(key, store)?.map(|x| x.value().clone()))
     }
 
-    fn get0(&self, key: Point<P>, store: &impl StoreExt<P>) -> Result<Option<NodeData<P>>> {
+    fn get0(&self, key: Point<P>, store: &impl NodeStore<P>) -> Result<Option<NodeData<P>>> {
         if let Some(data) = store.data_opt(*self)? {
             match key.cmp_at_rank(data.key(), data.rank()) {
                 Ordering::Less => {
@@ -898,11 +907,11 @@ impl<P: TreeParams> Node<P> {
         }
     }
 
-    pub fn dump(&self, store: &impl StoreExt<P>) -> Result<()> {
+    pub fn dump(&self, store: &impl NodeStore<P>) -> Result<()> {
         self.dump0("".into(), store)
     }
 
-    fn dump0(&self, prefix: String, store: &impl StoreExt<P>) -> Result<()> {
+    fn dump0(&self, prefix: String, store: &impl NodeStore<P>) -> Result<()> {
         if let Some(data) = store.data_opt(*self)? {
             println!("{} left:", prefix);
             data.left().dump0(format!("{}  ", prefix), store)?;
@@ -925,7 +934,7 @@ impl<P: TreeParams> Node<P> {
 
     pub fn from_iter<I: IntoIterator<Item = (Point<P>, P::V)>>(
         iter: I,
-    ) -> Result<(impl StoreExt<P>, Node<P>)> {
+    ) -> Result<(impl NodeStore<P>, Node<P>)> {
         let mut nodes: Vec<_> = iter
             .into_iter()
             .map(|(key, value)| NodeData::single(key, value))
@@ -944,7 +953,7 @@ impl<P: TreeParams> Node<P> {
     }
 
     pub fn from_unique_nodes(
-        store: &mut impl StoreExt<P>,
+        store: &mut impl NodeStore<P>,
         mut nodes: Vec<IdAndData<P>>,
     ) -> Result<Node<P>> {
         // if rank is equal, compare keys at rank
@@ -964,7 +973,7 @@ impl<P: TreeParams> Node<P> {
     fn insert_no_balance(
         &mut self,
         node: &IdAndData<P>,
-        store: &mut impl StoreExt<P>,
+        store: &mut impl NodeStore<P>,
     ) -> Result<()> {
         if self.is_empty() {
             *self = node.id
@@ -979,7 +988,7 @@ impl<P: TreeParams> Node<P> {
     /// The order is implementation dependent and should not be relied on.
     pub fn iter<'a>(
         &'a self,
-        store: &'a impl StoreExt<P>,
+        store: &'a impl NodeStore<P>,
     ) -> impl Iterator<Item = Result<(Point<P>, P::V)>> + 'a {
         Gen::new(|co| async move {
             if let Err(cause) = self.iter0(store, &co).await {
@@ -991,7 +1000,7 @@ impl<P: TreeParams> Node<P> {
 
     async fn iter0(
         &self,
-        store: &impl StoreExt<P>,
+        store: &impl NodeStore<P>,
         co: &Co<Result<(Point<P>, P::V)>>,
     ) -> Result<()> {
         if let Some(data) = store.data_opt(*self)? {
@@ -1008,7 +1017,7 @@ impl<P: TreeParams> Node<P> {
     /// The result is identical to iterating over the elements in the 3d range
     /// and combining the summaries of each element, but will be much more
     /// efficient for large trees.
-    pub fn summary(&self, query: &QueryRange3d<P>, store: &impl StoreExt<P>) -> Result<P::M> {
+    pub fn summary(&self, query: &QueryRange3d<P>, store: &impl NodeStore<P>) -> Result<P::M> {
         if let Some(node) = store.get_node(*self)? {
             let bbox = BBox::all();
             node.summary0(query, &bbox, store)
@@ -1023,7 +1032,7 @@ impl<P: TreeParams> Node<P> {
     pub fn query<'a>(
         &'a self,
         query: &'a QueryRange3d<P>,
-        store: &'a impl StoreExt<P>,
+        store: &'a impl NodeStore<P>,
     ) -> impl Iterator<Item = Result<(Point<P>, P::V)>> + 'a {
         Gen::new(|co| async move {
             if let Err(cause) = self.query0(query, store, &co).await {
@@ -1036,7 +1045,7 @@ impl<P: TreeParams> Node<P> {
     async fn query0(
         &self,
         query: &QueryRange3d<P>,
-        store: &impl StoreExt<P>,
+        store: &impl NodeStore<P>,
         co: &Co<Result<(Point<P>, P::V)>>,
     ) -> Result<()> {
         if let Some(data) = store.data_opt(*self)? {
@@ -1062,7 +1071,7 @@ impl<P: TreeParams> Node<P> {
         self,
         query: &'a QueryRange3d<P>,
         ordering: SortOrder,
-        store: &'a impl StoreExt<P>,
+        store: &'a impl NodeStore<P>,
     ) -> impl Iterator<Item = Result<(Point<P>, P::V)>> + 'a {
         Gen::new(|co| async move {
             if let Err(cause) = self.query_ordered0(query, ordering, store, &co).await {
@@ -1076,7 +1085,7 @@ impl<P: TreeParams> Node<P> {
         &self,
         query: &QueryRange3d<P>,
         ordering: SortOrder,
-        store: &impl StoreExt<P>,
+        store: &impl NodeStore<P>,
         co: &Co<Result<(Point<P>, P::V)>>,
     ) -> Result<()> {
         let Some(data) = store.data_opt(*self)? else {
@@ -1131,7 +1140,7 @@ impl<P: TreeParams> Node<P> {
     }
 
     /// Split an entire tree into leafs. The nodes are modified in place.
-    fn split_all(&self, store: &mut impl StoreExt<P>, res: &mut Vec<IdAndData<P>>) -> Result<()> {
+    fn split_all(&self, store: &mut impl NodeStore<P>, res: &mut Vec<IdAndData<P>>) -> Result<()> {
         if let Some(mut data) = store.get_node(*self)? {
             data.left().split_all(store, res)?;
             data.right().split_all(store, res)?;
@@ -1227,8 +1236,12 @@ impl<P: TreeParams> NodeData2<P> {
     //     Self(data, PhantomData)
     // }
 
+    pub fn as_slice(&self) -> &[u8] {
+        &self.1
+    }
+
     pub fn hex(&self) -> String {
-        hex::encode(&self.1)
+        hex::encode(self.as_slice())
     }
 
     pub fn is_leaf(&self) -> bool {
@@ -1429,7 +1442,7 @@ impl<P: TreeParams> NodeData<P> {
         &self,
         query: &QueryRange3d<P>,
         bbox: &BBox<P>,
-        store: &impl StoreExt<P>,
+        store: &impl NodeStore<P>,
     ) -> Result<P::M> {
         if self.is_leaf() {
             if query.contains(self.key()) {
@@ -1460,7 +1473,7 @@ impl<P: TreeParams> NodeData<P> {
         Ok(summary)
     }
 
-    fn recalculate_summary(&mut self, store: &impl StoreExt<P>) -> Result<()> {
+    fn recalculate_summary(&mut self, store: &impl NodeStore<P>) -> Result<()> {
         let mut res = P::M::neutral();
         if let Some(left) = store.data_opt(self.left())? {
             res = res.combine(left.summary());
@@ -1614,7 +1627,7 @@ impl<P: TreeParams> NodeData<P> {
 
     pub fn assert_invariants(
         &self,
-        store: &impl StoreExt<P>,
+        store: &impl NodeStore<P>,
         include_summary: bool,
     ) -> Result<AssertInvariantsRes<P>> {
         let left = store.data_opt(self.left())?;
@@ -1680,7 +1693,7 @@ impl<P: TreeParams> IdAndData<P> {
         IdAndData { id, data }
     }
 
-    fn persist(&self, store: &mut impl StoreExt<P>) -> Result<()> {
+    fn persist(&self, store: &mut impl NodeStore<P>) -> Result<()> {
         if !self.left().is_empty() {
             let left = store.data(self.left())?;
             assert!(self.key().cmp_at_rank(left.key(), self.rank()) == Ordering::Greater);
@@ -1695,7 +1708,7 @@ impl<P: TreeParams> IdAndData<P> {
     }
 
     // Insert a new node into the tree without balancing.
-    fn insert_no_balance(&mut self, node: &Self, store: &mut impl StoreExt<P>) -> Result<()> {
+    fn insert_no_balance(&mut self, node: &Self, store: &mut impl NodeStore<P>) -> Result<()> {
         assert!(node.is_leaf());
         let IdAndData {
             data:

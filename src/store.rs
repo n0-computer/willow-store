@@ -6,19 +6,23 @@ use std::fmt::{Debug, Display};
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
 /// A simple store trait for storing blobs.
-pub trait Store<T: VariableSize> {
+pub trait Store {
+    /// Create a new node in the store. The generated ids should not be reused.
     fn create(&mut self, node: &[u8]) -> Result<NodeId>;
-    fn read(&self, id: NodeId) -> Result<T>;
+    /// Read a node from the store.
+    fn read(&self, id: NodeId) -> Result<Vec<u8>>;
+    /// Update a node in the store.
     fn update(&mut self, id: NodeId, node: &[u8]) -> Result<()>;
+    /// Delete a node from the store.
     fn delete(&mut self, id: NodeId) -> Result<()>;
 }
 
-impl<T: VariableSize> Store<T> for Box<dyn Store<T>> {
+impl Store for Box<dyn Store> {
     fn create(&mut self, node: &[u8]) -> Result<NodeId> {
         self.as_mut().create(node)
     }
 
-    fn read(&self, id: NodeId) -> Result<T> {
+    fn read(&self, id: NodeId) -> Result<Vec<u8>> {
         self.as_ref().read(id)
     }
 
@@ -43,7 +47,7 @@ impl MemStore {
     }
 }
 
-impl<T: VariableSize> Store<T> for MemStore {
+impl Store for MemStore {
     fn create(&mut self, node: &[u8]) -> Result<NodeId> {
         let id = NodeId::from((self.nodes.len() as u64) + 1);
         assert!(!id.is_empty());
@@ -57,10 +61,10 @@ impl<T: VariableSize> Store<T> for MemStore {
         Ok(())
     }
 
-    fn read(&self, id: NodeId) -> Result<T> {
+    fn read(&self, id: NodeId) -> Result<Vec<u8>> {
         assert!(!id.is_empty());
         match self.nodes.get(&id) {
-            Some(data) => Ok(T::read(data)),
+            Some(data) => Ok(data.clone()),
             None => Err(anyhow::anyhow!("Node not found")),
         }
     }
