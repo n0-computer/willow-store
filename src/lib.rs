@@ -107,34 +107,23 @@ use std::{
 
 use anyhow::Result;
 use genawaiter::sync::{Co, Gen};
-use point::{Point2, XYZ, YZX, ZXY};
+pub use point::Point;
 
 mod point;
-pub use point::{OwnedPoint2, Point};
+pub use point::OwnedPoint;
 mod store;
 use ref_cast::RefCast;
-pub use store::Store;
+pub use store::BlobStore;
+pub use store::MemStore;
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
-
-macro_rules! assert_lt {
-    ($left:expr, $right:expr) => {
-        assert!($left < $right, "{:?} < {:?}", $left, $right)
-    };
-}
-
-macro_rules! assert_gt {
-    ($left:expr, $right:expr) => {
-        assert!($left > $right, "{:?} > {:?}", $left, $right)
-    };
-}
 
 ///
 pub trait CoordParams:
-    Ord + PartialEq + Eq + Clone + Debug + Display + FromBytes + AsBytes
+    Ord + PartialEq + Eq + Clone + Debug + FromBytes + AsBytes
 {
 }
 
-impl<T: Ord + PartialEq + Eq + Clone + Debug + Display + FromBytes + FromZeroes + AsBytes>
+impl<T: Ord + PartialEq + Eq + Clone + Debug + FromBytes + FromZeroes + AsBytes>
     CoordParams for T
 {
 }
@@ -145,6 +134,9 @@ pub trait FixedSize {
 
 pub trait VariableSize {
     fn size(&self) -> usize;
+}
+
+pub trait SerDe: VariableSize {
     fn write(&self, buf: &mut [u8]);
     fn read(buf: &[u8]) -> Self;
 
@@ -163,6 +155,15 @@ impl VariableSize for u64 {
     fn size(&self) -> usize {
         8
     }
+}
+
+impl VariableSize for [u8] {
+    fn size(&self) -> usize {
+        8
+    }
+}
+
+impl SerDe for u64 {
     fn write(&self, buf: &mut [u8]) {
         buf.copy_from_slice(&self.to_be_bytes());
     }
@@ -185,7 +186,7 @@ pub trait KeyParams {
     type Z: CoordParams + VariableSize;
 }
 
-pub trait LiftingCommutativeMonoid<K, V> {
+pub trait LiftingCommutativeMonoid<K: ?Sized, V> {
     /// The neutral element of the monoid.
     ///
     /// It isn't called zero to avoid name collison with the FromZeroes trait.
@@ -268,7 +269,7 @@ pub struct QueryRange3d<P: KeyParams> {
 
 impl<P: KeyParams> Display for QueryRange3d<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} {} {}", self.x, self.y, self.z)
+        write!(f, "{:?} {:?} {:?}", self.x, self.y, self.z)
     }
 }
 
@@ -288,14 +289,14 @@ impl<P: KeyParams> QueryRange3d<P> {
     }
 
     pub fn contains(&self, point: &Point<P>) -> bool {
-        self.x.contains(&point.x) && self.y.contains(&point.y) && self.z.contains(&point.z)
+        self.x.contains(point.x()) && self.y.contains(point.y()) && self.z.contains(point.z())
     }
 
     pub fn overlaps_left(&self, key: &Point<P>, rank: u8) -> bool {
         match SortOrder::from(rank) {
-            SortOrder::XYZ => self.x.min <= key.x,
-            SortOrder::YZX => self.y.min <= key.y,
-            SortOrder::ZXY => self.z.min <= key.z,
+            SortOrder::XYZ => &self.x.min <= key.x(),
+            SortOrder::YZX => &self.y.min <= key.y(),
+            SortOrder::ZXY => &self.z.min <= key.z(),
         }
     }
 
@@ -305,19 +306,19 @@ impl<P: KeyParams> QueryRange3d<P> {
                 .x
                 .max
                 .as_ref()
-                .map(|x_max| x_max < &key.x)
+                .map(|x_max| x_max < &key.x())
                 .unwrap_or_default(),
             SortOrder::YZX => !self
                 .y
                 .max
                 .as_ref()
-                .map(|y_max| y_max < &key.y)
+                .map(|y_max| y_max < &key.y())
                 .unwrap_or_default(),
             SortOrder::ZXY => !self
                 .z
                 .max
                 .as_ref()
-                .map(|z_max| z_max < &key.z)
+                .map(|z_max| z_max < &key.z())
                 .unwrap_or_default(),
         }
     }
@@ -360,9 +361,9 @@ pub struct RangeInclusiveOpt<T> {
 impl<T: CoordParams> Display for RangeInclusiveOpt<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match (&self.min, &self.max) {
-            (Some(min), Some(max)) => write!(f, "[{}, {}]", min, max),
-            (Some(min), None) => write!(f, "[{}, ∞)", min),
-            (None, Some(max)) => write!(f, "(-∞, {}]", max),
+            (Some(min), Some(max)) => write!(f, "[{:?}, {:?}]", min, max),
+            (Some(min), None) => write!(f, "[{:?}, ∞)", min),
+            (None, Some(max)) => write!(f, "(-∞, {:?}]", max),
             (None, None) => write!(f, "(-∞, ∞)"),
         }
     }
@@ -481,11 +482,14 @@ impl<P: KeyParams> Debug for BBox<P> {
 /// Result of asserting invariants for a node.
 pub struct AssertInvariantsRes<S: TreeParams> {
     /// min and max in xyz order
-    xyz: RangeInclusive<XYZ<S>>,
+    xyz_min: OwnedPoint<S>,
+    xyz_max: OwnedPoint<S>,
     /// min and max in yzx order
-    yzx: RangeInclusive<YZX<S>>,
+    yzx_min: OwnedPoint<S>,
+    yzx_max: OwnedPoint<S>,
     /// min and max in zxy order
-    zxy: RangeInclusive<ZXY<S>>,
+    zxy_min: OwnedPoint<S>,
+    zxy_max: OwnedPoint<S>,
     /// summary of the node
     summary: S::M,
     /// rank of the node
@@ -493,38 +497,65 @@ pub struct AssertInvariantsRes<S: TreeParams> {
 }
 
 impl<T: TreeParams> AssertInvariantsRes<T> {
-    pub fn single(point: Point<T>, rank: u8, value: T::V) -> Self {
-        let xyz = point.clone().xyz();
-        let yzx = point.clone().yzx();
-        let zxy = point.clone().zxy();
+    pub fn single(point: OwnedPoint<T>, rank: u8, value: T::V) -> Self {
         AssertInvariantsRes {
-            xyz: RangeInclusive {
-                min: xyz.clone(),
-                max: xyz,
-            },
-            yzx: RangeInclusive {
-                min: yzx.clone(),
-                max: yzx,
-            },
-            zxy: RangeInclusive {
-                min: zxy.clone(),
-                max: zxy,
-            },
+            xyz_min: point.clone(),
+            xyz_max: point.clone(),
+            yzx_min: point.clone(),
+            yzx_max: point.clone(),
+            zxy_min: point.clone(),
+            zxy_max: point.clone(),
             summary: T::M::lift(&point, &value),
             rank,
         }
     }
 
-    pub fn combine(&self, other: &Self) -> Self {
-        let xyz = self.xyz.union(&other.xyz);
-        let yzx = self.yzx.union(&other.yzx);
-        let zxy = self.zxy.union(&other.zxy);
-        let rank = self.rank.max(other.rank);
-        let summary = self.summary.combine(&other.summary);
+    pub fn combine(&self, that: &Self) -> Self {
+        let xyz_min =
+            if self.xyz_min.cmp_with_order(&that.xyz_min, SortOrder::XYZ) == Ordering::Less {
+                self.xyz_min.clone()
+            } else {
+                that.xyz_min.clone()
+            };
+        let xyz_max =
+            if self.xyz_max.cmp_with_order(&that.xyz_max, SortOrder::XYZ) == Ordering::Greater {
+                self.xyz_max.clone()
+            } else {
+                that.xyz_max.clone()
+            };
+        let yzx_min =
+            if self.yzx_min.cmp_with_order(&that.yzx_min, SortOrder::YZX) == Ordering::Less {
+                self.yzx_min.clone()
+            } else {
+                that.yzx_min.clone()
+            };
+        let yzx_max =
+            if self.yzx_max.cmp_with_order(&that.yzx_max, SortOrder::YZX) == Ordering::Greater {
+                self.yzx_max.clone()
+            } else {
+                that.yzx_max.clone()
+            };
+        let zxy_min =
+            if self.zxy_min.cmp_with_order(&that.zxy_min, SortOrder::ZXY) == Ordering::Less {
+                self.zxy_min.clone()
+            } else {
+                that.zxy_min.clone()
+            };
+        let zxy_max =
+            if self.zxy_max.cmp_with_order(&that.zxy_max, SortOrder::ZXY) == Ordering::Greater {
+                self.zxy_max.clone()
+            } else {
+                that.zxy_max.clone()
+            };
+        let rank = self.rank.max(that.rank);
+        let summary = self.summary.combine(&that.summary);
         AssertInvariantsRes {
-            xyz,
-            yzx,
-            zxy,
+            xyz_min,
+            xyz_max,
+            yzx_min,
+            yzx_max,
+            zxy_min,
+            zxy_max,
             rank,
             summary,
         }
@@ -549,7 +580,7 @@ impl<P: KeyParams> BBox<P> {
     }
 
     pub fn contains(&self, point: &Point<P>) -> bool {
-        self.x.contains(&point.x) && self.y.contains(&point.y) && self.z.contains(&point.z)
+        self.x.contains(point.x()) && self.y.contains(point.y()) && self.z.contains(point.z())
     }
 
     pub fn contained_in(&self, query: &QueryRange3d<P>) -> bool {
@@ -561,19 +592,19 @@ impl<P: KeyParams> BBox<P> {
     pub fn split_left(&self, key: &Point<P>, rank: u8) -> BBox<P> {
         match SortOrder::from(rank) {
             SortOrder::XYZ => BBox {
-                x: RangeInclusiveOpt::new(self.x.min.clone(), Some(key.x.clone())),
+                x: RangeInclusiveOpt::new(self.x.min.clone(), Some(key.x().clone())),
                 y: self.y.clone(),
                 z: self.z.clone(),
             },
             SortOrder::YZX => BBox {
                 x: self.x.clone(),
-                y: RangeInclusiveOpt::new(self.y.min.clone(), Some(key.y.clone())),
+                y: RangeInclusiveOpt::new(self.y.min.clone(), Some(key.y().clone())),
                 z: self.z.clone(),
             },
             SortOrder::ZXY => BBox {
                 x: self.x.clone(),
                 y: self.y.clone(),
-                z: RangeInclusiveOpt::new(self.z.min.clone(), Some(key.z.clone())),
+                z: RangeInclusiveOpt::new(self.z.min.clone(), Some(key.z().clone())),
             },
         }
     }
@@ -581,19 +612,19 @@ impl<P: KeyParams> BBox<P> {
     pub fn split_right(&self, key: &Point<P>, rank: u8) -> BBox<P> {
         match SortOrder::from(rank) {
             SortOrder::XYZ => BBox {
-                x: RangeInclusiveOpt::new(Some(key.x.clone()), self.x.max.clone()),
+                x: RangeInclusiveOpt::new(Some(key.x().clone()), self.x.max.clone()),
                 y: self.y.clone(),
                 z: self.z.clone(),
             },
             SortOrder::YZX => BBox {
                 x: self.x.clone(),
-                y: RangeInclusiveOpt::new(Some(key.y.clone()), self.y.max.clone()),
+                y: RangeInclusiveOpt::new(Some(key.y().clone()), self.y.max.clone()),
                 z: self.z.clone(),
             },
             SortOrder::ZXY => BBox {
                 x: self.x.clone(),
                 y: self.y.clone(),
-                z: RangeInclusiveOpt::new(Some(key.z.clone()), self.z.max.clone()),
+                z: RangeInclusiveOpt::new(Some(key.z().clone()), self.z.max.clone()),
             },
         }
     }
@@ -658,33 +689,30 @@ fn key_offset<P: TreeParams>() -> usize {
     16 + P::V::SIZE + P::M::SIZE + 8
 }
 
-pub trait NodeStore<P: TreeParams>: store::Store {
+pub trait NodeStore<P: TreeParams>: store::BlobStore {
     fn create_node(&mut self, data: &NodeData<P>) -> Result<Node<P>> {
-        let bytes = data.to_vec();
-        Ok(Node(self.create(&bytes)?, PhantomData))
+        Ok(Node(self.create(data.as_slice())?, PhantomData))
     }
 
     fn update_node(&mut self, id: Node<P>, data: &NodeData<P>) -> Result<()> {
-        let bytes = data.to_vec();
-        self.update(id.0, &bytes)
+        self.update(id.0, data.as_slice())
     }
 
-    fn put_node(&mut self, data: NodeData<P>) -> Result<IdAndData<P>> {
-        let bytes = data.to_vec();
-        let id = Node(self.create(&bytes)?, PhantomData);
+    fn put_node(&mut self, data: OwnedNodeData<P>) -> Result<IdAndData<P>> {
+        let id = Node(self.create(data.as_slice())?, PhantomData);
         Ok(IdAndData::new(id, data))
     }
 
-    fn data(&self, id: Node<P>) -> Result<NodeData<P>> {
-        let data = store::Store::read(self, id.0)?;
-        Ok(NodeData::read(&data))
+    fn data(&self, id: Node<P>) -> Result<OwnedNodeData<P>> {
+        let data = store::BlobStore::read(self, id.0)?;
+        Ok(OwnedNodeData::new(data))
     }
 
     /// Get a node by id, returning None if the id is None.
     ///
     /// This is just a convenience method for the common case where you have an
     /// optional id and want to get the node if it exists.
-    fn data_opt(&self, id: Node<P>) -> Result<Option<NodeData<P>>> {
+    fn data_opt(&self, id: Node<P>) -> Result<Option<OwnedNodeData<P>>> {
         Ok(if id.is_empty() {
             None
         } else {
@@ -712,7 +740,7 @@ pub trait NodeStore<P: TreeParams>: store::Store {
     }
 }
 
-impl<T: store::Store, P: TreeParams> NodeStore<P> for T {}
+impl<T: store::BlobStore, P: TreeParams> NodeStore<P> for T {}
 
 #[repr(transparent)]
 #[derive(AsBytes, FromZeroes, FromBytes)]
@@ -781,29 +809,30 @@ impl<P: TreeParams> Node<P> {
 
     pub fn insert(
         &mut self,
-        key: Point<P>,
-        value: P::V,
+        key: &Point<P>,
+        value: &P::V,
         store: &mut impl NodeStore<P>,
     ) -> Result<Option<P::V>> {
-        self.insert_rec(NodeData::single(key, value), store)
+        self.insert_rec(OwnedNodeData::leaf(key, value), store)
     }
 
     fn insert_rec(
         &mut self,
-        x: NodeData<P>,
+        x: OwnedNodeData<P>,
         store: &mut impl NodeStore<P>,
     ) -> Result<Option<P::V>> {
         if let Some(mut this) = store.get_node(*self)? {
             let x_cmp_cur = x.key().cmp_at_rank(this.key(), this.rank());
             if x_cmp_cur == Ordering::Equal {
                 // just replace the value
-                let mut res = x.value;
-                std::mem::swap(&mut res, &mut this.value);
+                let mut res = x.value().clone();
+                std::mem::swap(&mut res, this.value_mut());
                 let res = Some(res);
                 this.recalculate_summary(store)?;
                 this.persist(store)?;
                 Ok(res)
-            } else if x.rank < this.rank || (x.rank == this.rank && x_cmp_cur == Ordering::Greater)
+            } else if x.rank() < this.rank()
+                || (x.rank() == this.rank() && x_cmp_cur == Ordering::Greater)
             {
                 // cur is above x, just go down
                 let value = x.value().clone();
@@ -833,13 +862,21 @@ impl<P: TreeParams> Node<P> {
         }
     }
 
-    pub fn delete(&mut self, key: Point<P>, store: &mut impl NodeStore<P>) -> Result<Option<P::V>> {
+    pub fn delete(
+        &mut self,
+        key: &Point<P>,
+        store: &mut impl NodeStore<P>,
+    ) -> Result<Option<P::V>> {
         self.delete_rec(key, store)
     }
 
-    fn delete_rec(&mut self, key: Point<P>, store: &mut impl NodeStore<P>) -> Result<Option<P::V>> {
+    fn delete_rec(
+        &mut self,
+        key: &Point<P>,
+        store: &mut impl NodeStore<P>,
+    ) -> Result<Option<P::V>> {
         if let Some(mut this) = store.get_node(*self)? {
-            let key_cmp_cur = key.cmp_at_rank(this.key(), this.rank);
+            let key_cmp_cur = key.cmp_at_rank(this.key(), this.rank());
             if key_cmp_cur == Ordering::Equal {
                 let removed = this.value().clone();
                 let mut res = Vec::new();
@@ -879,11 +916,11 @@ impl<P: TreeParams> Node<P> {
         Ok(())
     }
 
-    pub fn get(&self, key: Point<P>, store: &impl NodeStore<P>) -> Result<Option<P::V>> {
+    pub fn get(&self, key: &Point<P>, store: &impl NodeStore<P>) -> Result<Option<P::V>> {
         Ok(self.get0(key, store)?.map(|x| x.value().clone()))
     }
 
-    fn get0(&self, key: Point<P>, store: &impl NodeStore<P>) -> Result<Option<NodeData<P>>> {
+    fn get0(&self, key: &Point<P>, store: &impl NodeStore<P>) -> Result<Option<OwnedNodeData<P>>> {
         if let Some(data) = store.data_opt(*self)? {
             match key.cmp_at_rank(data.key(), data.rank()) {
                 Ordering::Less => {
@@ -932,24 +969,23 @@ impl<P: TreeParams> Node<P> {
         Ok(())
     }
 
-    pub fn from_iter<I: IntoIterator<Item = (Point<P>, P::V)>>(
+    pub fn from_iter<I: IntoIterator<Item = (OwnedPoint<P>, P::V)>>(
         iter: I,
-    ) -> Result<(impl NodeStore<P>, Node<P>)> {
+        store: &mut impl NodeStore<P>,
+    ) -> Result<Node<P>> {
         let mut nodes: Vec<_> = iter
             .into_iter()
-            .map(|(key, value)| NodeData::single(key, value))
+            .map(|(key, value)| OwnedNodeData::leaf(&key, &value))
             .collect();
         // Before we sort, remove all but the first occurence of each point.
         let mut uniques = BTreeSet::new();
-        nodes.retain(|node| uniques.insert(node.key().clone().xyz()));
-        let mut store = store::MemStore::new();
+        nodes.retain(|node| uniques.insert(node.key().to_owned()));
         let nodes = nodes
             .into_iter()
             .map(|data| store.put_node(data))
             .collect::<Result<_>>()?;
-        let node = Node::from_unique_nodes(&mut store, nodes)?;
-        // if rank is equal, compare keys at rank
-        Ok((store, node))
+        let node = Node::from_unique_nodes(store, nodes)?;
+        Ok(node)
     }
 
     pub fn from_unique_nodes(
@@ -989,7 +1025,7 @@ impl<P: TreeParams> Node<P> {
     pub fn iter<'a>(
         &'a self,
         store: &'a impl NodeStore<P>,
-    ) -> impl Iterator<Item = Result<(Point<P>, P::V)>> + 'a {
+    ) -> impl Iterator<Item = Result<(OwnedPoint<P>, P::V)>> + 'a {
         Gen::new(|co| async move {
             if let Err(cause) = self.iter0(store, &co).await {
                 co.yield_(Err(cause)).await;
@@ -1001,7 +1037,7 @@ impl<P: TreeParams> Node<P> {
     async fn iter0(
         &self,
         store: &impl NodeStore<P>,
-        co: &Co<Result<(Point<P>, P::V)>>,
+        co: &Co<Result<(OwnedPoint<P>, P::V)>>,
     ) -> Result<()> {
         if let Some(data) = store.data_opt(*self)? {
             Box::pin(data.left().iter0(store, co)).await?;
@@ -1033,7 +1069,7 @@ impl<P: TreeParams> Node<P> {
         &'a self,
         query: &'a QueryRange3d<P>,
         store: &'a impl NodeStore<P>,
-    ) -> impl Iterator<Item = Result<(Point<P>, P::V)>> + 'a {
+    ) -> impl Iterator<Item = Result<(OwnedPoint<P>, P::V)>> + 'a {
         Gen::new(|co| async move {
             if let Err(cause) = self.query0(query, store, &co).await {
                 co.yield_(Err(cause)).await;
@@ -1046,7 +1082,7 @@ impl<P: TreeParams> Node<P> {
         &self,
         query: &QueryRange3d<P>,
         store: &impl NodeStore<P>,
-        co: &Co<Result<(Point<P>, P::V)>>,
+        co: &Co<Result<(OwnedPoint<P>, P::V)>>,
     ) -> Result<()> {
         if let Some(data) = store.data_opt(*self)? {
             if query.overlaps_left(data.key(), data.rank()) {
@@ -1072,7 +1108,7 @@ impl<P: TreeParams> Node<P> {
         query: &'a QueryRange3d<P>,
         ordering: SortOrder,
         store: &'a impl NodeStore<P>,
-    ) -> impl Iterator<Item = Result<(Point<P>, P::V)>> + 'a {
+    ) -> impl Iterator<Item = Result<(OwnedPoint<P>, P::V)>> + 'a {
         Gen::new(|co| async move {
             if let Err(cause) = self.query_ordered0(query, ordering, store, &co).await {
                 co.yield_(Err(cause)).await;
@@ -1086,7 +1122,7 @@ impl<P: TreeParams> Node<P> {
         query: &QueryRange3d<P>,
         ordering: SortOrder,
         store: &impl NodeStore<P>,
-        co: &Co<Result<(Point<P>, P::V)>>,
+        co: &Co<Result<(OwnedPoint<P>, P::V)>>,
     ) -> Result<()> {
         let Some(data) = store.data_opt(*self)? else {
             return Ok(());
@@ -1147,7 +1183,7 @@ impl<P: TreeParams> Node<P> {
             // turn the node into a leaf
             *data.left_mut() = Node::EMPTY;
             *data.right_mut() = Node::EMPTY;
-            data.summary = P::M::lift(data.key(), data.value());
+            *data.summary_mut() = P::M::lift(data.key(), data.value());
             // persist (should we do this here or later?)
             data.persist(store)?;
             res.push(data);
@@ -1158,24 +1194,36 @@ impl<P: TreeParams> Node<P> {
 
 #[repr(transparent)]
 #[derive(RefCast)]
-pub struct NodeData2<P: TreeParams>(PhantomData<P>, [u8]);
+pub struct NodeData<P: TreeParams>(PhantomData<P>, [u8]);
 
-pub struct OwnedNodeData2<P: TreeParams>(PhantomData<P>, Vec<u8>);
+pub struct OwnedNodeData<P: TreeParams>(PhantomData<P>, Vec<u8>);
 
-impl<P: TreeParams> OwnedNodeData2<P> {
+impl<P: TreeParams> Clone for OwnedNodeData<P> {
+    fn clone(&self) -> Self {
+        Self(PhantomData, self.1.clone())
+    }
+}
+
+impl<P: TreeParams> PartialEq for OwnedNodeData<P> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl<P: TreeParams> Eq for OwnedNodeData<P> {}
+
+impl<P: TreeParams> OwnedNodeData<P> {
+    pub fn new(data: Vec<u8>) -> Self {
+        Self(PhantomData, data)
+    }
+
     /// Creates a leaf data from the given key and value.
-    pub fn leaf(key: &Point2<P>, value: &P::V) -> Self {
+    pub fn leaf(key: &Point<P>, value: &P::V) -> Self {
         let mut data = vec![0; key_offset::<P>() + key.size()];
         data[key_offset::<P>()..].copy_from_slice(key.as_slice());
         let mut res = Self(PhantomData, data);
         *res.value_mut() = value.clone();
-        // todo: change lift to take a Point2
-        let old_key = Point {
-            x: key.x().clone(),
-            y: key.y().clone(),
-            z: key.z().clone(),
-        };
-        *res.summary_mut() = P::M::lift(&old_key, value);
+        *res.summary_mut() = P::M::lift(key, value);
         *res.rank_mut() = key.rank();
         *res.left_mut() = Node::EMPTY; // not strictly necessary, since it's already 0
         *res.right_mut() = Node::EMPTY; // not strictly necessary, since it's already 0
@@ -1183,41 +1231,41 @@ impl<P: TreeParams> OwnedNodeData2<P> {
     }
 }
 
-impl<P: TreeParams> Debug for OwnedNodeData2<P> {
+impl<P: TreeParams> Debug for OwnedNodeData<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}", &self.deref())
     }
 }
 
-impl<P: TreeParams> ToOwned for NodeData2<P> {
-    type Owned = OwnedNodeData2<P>;
+impl<P: TreeParams> ToOwned for NodeData<P> {
+    type Owned = OwnedNodeData<P>;
 
     fn to_owned(&self) -> Self::Owned {
-        OwnedNodeData2(PhantomData, self.1.to_vec())
+        OwnedNodeData(PhantomData, self.1.to_vec())
     }
 }
 
-impl<P: TreeParams> Borrow<NodeData2<P>> for OwnedNodeData2<P> {
-    fn borrow(&self) -> &NodeData2<P> {
-        NodeData2::ref_cast(&self.1)
+impl<P: TreeParams> Borrow<NodeData<P>> for OwnedNodeData<P> {
+    fn borrow(&self) -> &NodeData<P> {
+        NodeData::ref_cast(&self.1)
     }
 }
 
-impl<P: TreeParams> Deref for OwnedNodeData2<P> {
-    type Target = NodeData2<P>;
+impl<P: TreeParams> Deref for OwnedNodeData<P> {
+    type Target = NodeData<P>;
 
     fn deref(&self) -> &Self::Target {
-        NodeData2::ref_cast(&self.1)
+        NodeData::ref_cast(&self.1)
     }
 }
 
-impl<P: TreeParams> DerefMut for OwnedNodeData2<P> {
+impl<P: TreeParams> DerefMut for OwnedNodeData<P> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        NodeData2::ref_cast_mut(&mut self.1)
+        NodeData::ref_cast_mut(&mut self.1)
     }
 }
 
-impl<P: TreeParams> Debug for NodeData2<P> {
+impl<P: TreeParams> Debug for NodeData<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NodeData")
             .field("left", &self.left())
@@ -1230,7 +1278,7 @@ impl<P: TreeParams> Debug for NodeData2<P> {
     }
 }
 
-impl<P: TreeParams> NodeData2<P> {
+impl<P: TreeParams> NodeData<P> {
     // pub fn new(data: T) -> Self {
     //     debug_assert!(data.as_ref().len() >= min_data_size::<P>());
     //     Self(data, PhantomData)
@@ -1268,174 +1316,13 @@ impl<P: TreeParams> NodeData2<P> {
         self.1.as_ref()[rank_offset::<P>()]
     }
 
-    pub fn key(&self) -> &Point2<P> {
+    pub fn sort_order(&self) -> SortOrder {
+        SortOrder::from(self.rank())
+    }
+
+    pub fn key(&self) -> &Point<P> {
         let slice = &self.1[key_offset::<P>()..];
-        Point2::ref_cast(slice)
-    }
-
-    // fn summary0(
-    //     &self,
-    //     query: &QueryRange3d<P>,
-    //     bbox: &BBox<P>,
-    //     store: &impl StoreExt<P>,
-    // ) -> Result<P::M> {
-    //     if self.is_leaf() {
-    //         if query.contains(self.key()) {
-    //             return Ok(self.summary().clone());
-    //         } else {
-    //             return Ok(P::M::neutral());
-    //         }
-    //     }
-    //     if bbox.contained_in(&query) {
-    //         return Ok(self.summary().clone());
-    //     }
-    //     let mut summary = P::M::neutral();
-    //     if query.overlaps_left(self.key(), self.rank()) {
-    //         if let Some(left) = store.data_opt(self.left())? {
-    //             let left_bbox = bbox.split_left(self.key(), self.rank());
-    //             summary = summary.combine(&left.summary0(query, &left_bbox, store)?);
-    //         }
-    //     }
-    //     if query.contains(self.key()) {
-    //         summary = summary.combine(&P::M::lift((self.key().clone(), self.value().clone())));
-    //     }
-    //     if query.overlaps_right(self.key(), self.rank()) {
-    //         if let Some(right) = store.data_opt(self.right())? {
-    //             let right_bbox = bbox.split_right(self.key(), self.rank());
-    //             summary = summary.combine(&right.summary0(query, &right_bbox, store)?);
-    //         }
-    //     }
-    //     Ok(summary)
-    // }
-}
-
-impl<P: TreeParams> NodeData2<P> {
-    pub fn left_mut(&mut self) -> &mut Node<P> {
-        Node::mut_from_prefix(&mut self.1[left_offset::<P>()..]).unwrap()
-    }
-
-    pub fn right_mut(&mut self) -> &mut Node<P> {
-        Node::mut_from_prefix(&mut self.1[right_offset::<P>()..]).unwrap()
-    }
-
-    pub fn summary_mut(&mut self) -> &mut P::M {
-        P::M::mut_from_prefix(&mut self.1[summary_offset::<P>()..]).unwrap()
-    }
-
-    pub fn value_mut(&mut self) -> &mut P::V {
-        P::V::mut_from_prefix(&mut self.1[value_offset::<P>()..]).unwrap()
-    }
-
-    pub fn rank_mut(&mut self) -> &mut u8 {
-        &mut self.1.as_mut()[rank_offset::<P>()]
-    }
-
-    // fn recalculate_summary(&mut self, store: &impl StoreExt<P>) -> Result<()>
-    //     where T: AsRef<[u8]>
-    // {
-    //     let mut res = P::M::neutral();
-    //     if let Some(left) = store.data_opt(self.left())? {
-    //         res = res.combine(left.summary());
-    //     }
-    //     res = res.combine(&P::M::lift((self.key().clone(), self.value().clone())));
-    //     if let Some(right) = store.data_opt(self.right())? {
-    //         res = res.combine(right.summary());
-    //     }
-    //     *self.summary_mut() = res;
-    //     Ok(())
-    // }
-
-    // fn add_summary(&mut self, value: P::V)
-    //     where T: AsRef<[u8]>
-    // {
-    //     *self.summary_mut() = self
-    //         .summary()
-    //         .combine(&P::M::lift((self.key().clone(), value)));
-    // }
-}
-
-/// Data for a node in the tree.
-/// This gets persisted as a single &[u8] in the database, using a [`NodeId`]
-/// as key. However, NodeData can exist in memory without a NodeId.
-///
-/// TODO:
-/// - Use some zero copy stuff to make this more efficient.
-/// - Have dedicated types for owned and borrowed NodeData (?).
-pub struct NodeData<P: TreeParams> {
-    left: Node<P>,  // 8 bytes, 0 if empty
-    right: Node<P>, // 8 bytes, 0 if empty
-    value: P::V,    // fixed size
-    summary: P::M,  // fixed size
-    rank: u8,       // 1 byte
-    key: Point<P>,  // variable size due to path
-}
-
-impl<P: TreeParams> Debug for NodeData<P> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("NodeData")
-            .field("key", &self.key())
-            .field("rank", &self.rank())
-            .field("value", self.value())
-            .field("summary", self.summary())
-            .field("left", &self.left())
-            .field("right", &self.right())
-            .finish()
-    }
-}
-
-impl<P: TreeParams> Clone for NodeData<P> {
-    fn clone(&self) -> Self {
-        Self {
-            key: self.key().clone(),
-            rank: self.rank(),
-            value: self.value().clone(),
-            summary: self.summary().clone(),
-            left: self.left(),
-            right: self.right(),
-        }
-    }
-}
-
-impl<P: TreeParams> PartialEq for NodeData<P> {
-    fn eq(&self, other: &Self) -> bool {
-        self.key() == other.key()
-            && self.rank() == other.rank()
-            && self.value() == other.value()
-            && self.summary() == other.summary()
-            && self.left() == other.left()
-            && self.right() == other.right()
-    }
-}
-
-impl<P: TreeParams> Eq for NodeData<P> {}
-
-impl<P: TreeParams> NodeData<P> {
-    fn key(&self) -> &Point<P> {
-        &self.key
-    }
-
-    fn left(&self) -> Node<P> {
-        self.left
-    }
-
-    fn right(&self) -> Node<P> {
-        self.right
-    }
-
-    fn left_mut(&mut self) -> &mut Node<P> {
-        &mut self.left
-    }
-
-    fn right_mut(&mut self) -> &mut Node<P> {
-        &mut self.right
-    }
-
-    fn value(&self) -> &P::V {
-        &self.value
-    }
-
-    fn summary(&self) -> &P::M {
-        &self.summary
+        Point::ref_cast(slice)
     }
 
     fn summary0(
@@ -1482,13 +1369,187 @@ impl<P: TreeParams> NodeData<P> {
         if let Some(right) = store.data_opt(self.right())? {
             res = res.combine(right.summary());
         }
-        self.summary = res;
+        *self.summary_mut() = res;
         Ok(())
     }
 
     fn add_summary(&mut self, value: P::V) {
-        self.summary = self.summary().combine(&P::M::lift(self.key(), &value));
+        *self.summary_mut() = self.summary().combine(&P::M::lift(self.key(), &value));
     }
+
+    pub fn assert_invariants(
+        &self,
+        store: &impl NodeStore<P>,
+        include_summary: bool,
+    ) -> Result<AssertInvariantsRes<P>> {
+        let left = store.data_opt(self.left())?;
+        let right = store.data_opt(self.right())?;
+        let left_res = left
+            .as_ref()
+            .map(|node| node.assert_invariants(store, include_summary))
+            .transpose()?;
+        let right_res = right
+            .as_ref()
+            .map(|node| node.assert_invariants(store, include_summary))
+            .transpose()?;
+        if let Some(ref left) = left_res {
+            assert!(left.rank < self.rank());
+        }
+        if let Some(ref right) = right_res {
+            assert!(right.rank <= self.rank());
+        }
+        match SortOrder::from(self.rank()) {
+            SortOrder::XYZ => {
+                if let Some(ref left) = left_res {
+                    assert!(
+                        left.xyz_max
+                            .deref()
+                            .cmp_with_order(self.key(), SortOrder::XYZ)
+                            == Ordering::Less
+                    );
+                }
+                if let Some(ref right) = right_res {
+                    assert!(
+                        right
+                            .xyz_min
+                            .deref()
+                            .cmp_with_order(self.key(), SortOrder::XYZ)
+                            == Ordering::Greater
+                    );
+                }
+            }
+            SortOrder::YZX => {
+                if let Some(ref left) = left_res {
+                    assert!(
+                        left.yzx_max
+                            .deref()
+                            .cmp_with_order(self.key(), SortOrder::YZX)
+                            == Ordering::Less
+                    );
+                }
+                if let Some(ref right) = right_res {
+                    assert!(
+                        right
+                            .yzx_min
+                            .deref()
+                            .cmp_with_order(self.key(), SortOrder::YZX)
+                            == Ordering::Greater
+                    );
+                }
+            }
+            SortOrder::ZXY => {
+                if let Some(ref left) = left_res {
+                    assert!(
+                        left.zxy_max
+                            .deref()
+                            .cmp_with_order(self.key(), SortOrder::ZXY)
+                            == Ordering::Less
+                    );
+                }
+                if let Some(ref right) = right_res {
+                    assert!(
+                        right
+                            .zxy_min
+                            .deref()
+                            .cmp_with_order(self.key(), SortOrder::ZXY)
+                            == Ordering::Greater
+                    );
+                }
+            }
+        }
+        let mut res =
+            AssertInvariantsRes::single(self.key().to_owned(), self.rank(), self.value().clone());
+        if let Some(left) = left_res {
+            res = res.combine(&left);
+        }
+        if let Some(right) = right_res {
+            res = res.combine(&right);
+        }
+        if include_summary {
+            assert_eq!(&res.summary, self.summary());
+        }
+        Ok(res)
+    }
+
+    // fn summary0(
+    //     &self,
+    //     query: &QueryRange3d<P>,
+    //     bbox: &BBox<P>,
+    //     store: &impl StoreExt<P>,
+    // ) -> Result<P::M> {
+    //     if self.is_leaf() {
+    //         if query.contains(self.key()) {
+    //             return Ok(self.summary().clone());
+    //         } else {
+    //             return Ok(P::M::neutral());
+    //         }
+    //     }
+    //     if bbox.contained_in(&query) {
+    //         return Ok(self.summary().clone());
+    //     }
+    //     let mut summary = P::M::neutral();
+    //     if query.overlaps_left(self.key(), self.rank()) {
+    //         if let Some(left) = store.data_opt(self.left())? {
+    //             let left_bbox = bbox.split_left(self.key(), self.rank());
+    //             summary = summary.combine(&left.summary0(query, &left_bbox, store)?);
+    //         }
+    //     }
+    //     if query.contains(self.key()) {
+    //         summary = summary.combine(&P::M::lift((self.key().clone(), self.value().clone())));
+    //     }
+    //     if query.overlaps_right(self.key(), self.rank()) {
+    //         if let Some(right) = store.data_opt(self.right())? {
+    //             let right_bbox = bbox.split_right(self.key(), self.rank());
+    //             summary = summary.combine(&right.summary0(query, &right_bbox, store)?);
+    //         }
+    //     }
+    //     Ok(summary)
+    // }
+}
+
+impl<P: TreeParams> NodeData<P> {
+    pub fn left_mut(&mut self) -> &mut Node<P> {
+        Node::mut_from_prefix(&mut self.1[left_offset::<P>()..]).unwrap()
+    }
+
+    pub fn right_mut(&mut self) -> &mut Node<P> {
+        Node::mut_from_prefix(&mut self.1[right_offset::<P>()..]).unwrap()
+    }
+
+    pub fn summary_mut(&mut self) -> &mut P::M {
+        P::M::mut_from_prefix(&mut self.1[summary_offset::<P>()..]).unwrap()
+    }
+
+    pub fn value_mut(&mut self) -> &mut P::V {
+        P::V::mut_from_prefix(&mut self.1[value_offset::<P>()..]).unwrap()
+    }
+
+    pub fn rank_mut(&mut self) -> &mut u8 {
+        &mut self.1.as_mut()[rank_offset::<P>()]
+    }
+
+    // fn recalculate_summary(&mut self, store: &impl StoreExt<P>) -> Result<()>
+    //     where T: AsRef<[u8]>
+    // {
+    //     let mut res = P::M::neutral();
+    //     if let Some(left) = store.data_opt(self.left())? {
+    //         res = res.combine(left.summary());
+    //     }
+    //     res = res.combine(&P::M::lift((self.key().clone(), self.value().clone())));
+    //     if let Some(right) = store.data_opt(self.right())? {
+    //         res = res.combine(right.summary());
+    //     }
+    //     *self.summary_mut() = res;
+    //     Ok(())
+    // }
+
+    // fn add_summary(&mut self, value: P::V)
+    //     where T: AsRef<[u8]>
+    // {
+    //     *self.summary_mut() = self
+    //         .summary()
+    //         .combine(&P::M::lift((self.key().clone(), value)));
+    // }
 }
 
 /// A node combines node data with a node id.
@@ -1498,7 +1559,7 @@ impl<P: TreeParams> NodeData<P> {
 /// inconsistencies.
 pub struct IdAndData<P: TreeParams> {
     id: Node<P>,
-    data: NodeData<P>,
+    data: OwnedNodeData<P>,
 }
 
 impl<P: TreeParams> Debug for IdAndData<P> {
@@ -1533,162 +1594,8 @@ impl<P: TreeParams> DerefMut for IdAndData<P> {
     }
 }
 
-impl<P: TreeParams> VariableSize for NodeData<P> {
-    fn size(&self) -> usize {
-        8 + // left
-        8 + // right
-        P::V::SIZE + // value
-        P::M::SIZE + // summary
-        1 + // rank
-        P::X::SIZE + // x
-        P::Y::SIZE + // y
-        self.key().z.size() // z
-    }
-
-    fn write(&self, buf: &mut [u8]) {
-        const L_START: usize = 0;
-        const R_START: usize = 8;
-        const V_START: usize = 16;
-        let m_start: usize = 16 + P::V::SIZE;
-        let rank_start: usize = 16 + P::V::SIZE + P::M::SIZE;
-        let key_start: usize = 16 + P::V::SIZE + P::M::SIZE + 1;
-        assert_eq!(buf.len(), self.size());
-        self.left().0.write_to(&mut buf[L_START..R_START]).unwrap();
-        self.right().0.write_to(&mut buf[R_START..V_START]).unwrap();
-        self.value().write_to(&mut buf[V_START..m_start]).unwrap();
-        self.summary()
-            .write_to(&mut buf[m_start..rank_start])
-            .unwrap();
-        self.rank()
-            .write_to(&mut buf[rank_start..key_start])
-            .unwrap();
-        self.key().write(&mut buf[key_start..]);
-    }
-
-    fn read(buf: &[u8]) -> Self {
-        const L_START: usize = 0;
-        const R_START: usize = 8;
-        const V_START: usize = 16;
-        let m_start: usize = 16 + P::V::SIZE;
-        let rank_start: usize = 16 + P::V::SIZE + P::M::SIZE;
-        let x_start: usize = 16 + P::V::SIZE + P::M::SIZE + 1;
-        let y_start: usize = 16 + P::V::SIZE + P::M::SIZE + 1 + P::X::SIZE;
-        let z_start: usize = 16 + P::V::SIZE + P::M::SIZE + 1 + P::X::SIZE + P::Y::SIZE;
-        let left = Node::read_from_prefix(&buf[L_START..]).unwrap();
-        let right = Node::read_from_prefix(&buf[R_START..]).unwrap();
-        let value = P::V::read_from_prefix(&buf[V_START..]).unwrap();
-        let summary = P::M::read_from_prefix(&buf[m_start..]).unwrap();
-        let rank = u8::read_from_prefix(&buf[rank_start..]).unwrap();
-        let x = P::X::read_from_prefix(&buf[x_start..]).unwrap();
-        let y = P::Y::read_from_prefix(&buf[y_start..]).unwrap();
-        let z = P::Z::read_from_prefix(&buf[z_start..]).unwrap();
-        Self {
-            key: Point { x, y, z },
-            rank,
-            value,
-            summary,
-            left,
-            right,
-        }
-    }
-}
-
-impl<P: TreeParams> NodeData<P> {
-    /// True if the node is a leaf.
-    fn is_leaf(&self) -> bool {
-        self.left().is_empty() && self.right().is_empty()
-    }
-
-    pub fn rank(&self) -> u8 {
-        self.rank
-    }
-
-    /// Get the sort order for the node, based on the rank.
-    pub fn sort_order(&self) -> SortOrder {
-        self.rank.into()
-    }
-
-    /// Create a new node data with the given key and value.
-    pub fn single(key: Point<P>, value: P::V) -> Self {
-        let summary = P::M::lift(&key, &value);
-        let mut key_bytes = vec![0; key.size()];
-        key.write(&mut key_bytes);
-        let key_hash: [u8; 32] = blake3::hash(&key_bytes).into();
-        let rank = count_trailing_zeros(&key_hash);
-        NodeData {
-            key,
-            rank,
-            value,
-            summary,
-            left: Node::EMPTY,
-            right: Node::EMPTY,
-        }
-    }
-
-    pub fn assert_invariants(
-        &self,
-        store: &impl NodeStore<P>,
-        include_summary: bool,
-    ) -> Result<AssertInvariantsRes<P>> {
-        let left = store.data_opt(self.left())?;
-        let right = store.data_opt(self.right())?;
-        let left_res = left
-            .as_ref()
-            .map(|node| node.assert_invariants(store, include_summary))
-            .transpose()?;
-        let right_res = right
-            .as_ref()
-            .map(|node| node.assert_invariants(store, include_summary))
-            .transpose()?;
-        if let Some(ref left) = left_res {
-            assert!(left.rank < self.rank());
-        }
-        if let Some(ref right) = right_res {
-            assert!(right.rank <= self.rank());
-        }
-        match SortOrder::from(self.rank()) {
-            SortOrder::XYZ => {
-                if let Some(ref left) = left_res {
-                    assert_lt!(left.xyz.max, self.key().clone().xyz());
-                }
-                if let Some(ref right) = right_res {
-                    assert_gt!(right.xyz.min, self.key().clone().xyz());
-                }
-            }
-            SortOrder::YZX => {
-                if let Some(ref left) = left_res {
-                    assert_lt!(left.yzx.max, self.key().clone().yzx());
-                }
-                if let Some(ref right) = right_res {
-                    assert_gt!(right.yzx.min, self.key().clone().yzx());
-                }
-            }
-            SortOrder::ZXY => {
-                if let Some(ref left) = left_res {
-                    assert_lt!(left.zxy.max, self.key().clone().zxy());
-                }
-                if let Some(ref right) = right_res {
-                    assert_gt!(right.zxy.min, self.key().clone().zxy());
-                }
-            }
-        }
-        let mut res =
-            AssertInvariantsRes::single(self.key().clone(), self.rank(), self.value.clone());
-        if let Some(left) = left_res {
-            res = res.combine(&left);
-        }
-        if let Some(right) = right_res {
-            res = res.combine(&right);
-        }
-        if include_summary {
-            assert_eq!(&res.summary, self.summary());
-        }
-        Ok(res)
-    }
-}
-
 impl<P: TreeParams> IdAndData<P> {
-    fn new(id: Node<P>, data: NodeData<P>) -> Self {
+    fn new(id: Node<P>, data: OwnedNodeData<P>) -> Self {
         assert!(!id.is_empty());
         IdAndData { id, data }
     }
@@ -1710,30 +1617,18 @@ impl<P: TreeParams> IdAndData<P> {
     // Insert a new node into the tree without balancing.
     fn insert_no_balance(&mut self, node: &Self, store: &mut impl NodeStore<P>) -> Result<()> {
         assert!(node.is_leaf());
-        let IdAndData {
-            data:
-                NodeData {
-                    key: parent_key,
-                    rank: parent_rank,
-                    summary: parent_summary,
-                    left,
-                    right,
-                    value: _,
-                },
-            ..
-        } = self;
-        match node.key().cmp_at_rank(parent_key, *parent_rank) {
+        match node.key().cmp_at_rank(self.key(), self.rank()) {
             Ordering::Less => {
-                left.insert_no_balance(node, store)?;
+                self.left_mut().insert_no_balance(node, store)?;
             }
             Ordering::Greater => {
-                right.insert_no_balance(node, store)?;
+                self.right_mut().insert_no_balance(node, store)?;
             }
             Ordering::Equal => {
                 panic!("Duplicate keys not supported in insert_no_balance");
             }
         }
-        *parent_summary = parent_summary.combine(&node.summary);
+        *self.summary_mut() = self.summary().combine(node.summary());
         self.persist(store)?;
         Ok(())
     }
@@ -1753,11 +1648,11 @@ pub fn count_trailing_zeros(hash: &[u8; 32]) -> u8 {
 }
 
 async fn merge3<P: TreeParams>(
-    a: impl Iterator<Item = Result<(Point<P>, P::V)>>,
-    b: impl Iterator<Item = Result<(Point<P>, P::V)>>,
-    c: impl Iterator<Item = Result<(Point<P>, P::V)>>,
+    a: impl Iterator<Item = Result<(OwnedPoint<P>, P::V)>>,
+    b: impl Iterator<Item = Result<(OwnedPoint<P>, P::V)>>,
+    c: impl Iterator<Item = Result<(OwnedPoint<P>, P::V)>>,
     ordering: SortOrder,
-    co: &Co<Result<(Point<P>, P::V)>>,
+    co: &Co<Result<(OwnedPoint<P>, P::V)>>,
 ) -> Result<()> {
     enum Smallest {
         A,
@@ -1768,7 +1663,7 @@ async fn merge3<P: TreeParams>(
     let mut a = a.peekable();
     let mut b = b.peekable();
     let mut c = c.peekable();
-    let cmp = |a: &Result<(Point<P>, P::V)>, b: &Result<(Point<P>, P::V)>| match (a, b) {
+    let cmp = |a: &Result<(OwnedPoint<P>, P::V)>, b: &Result<(OwnedPoint<P>, P::V)>| match (a, b) {
         (Ok((ak, _)), Ok((bk, _))) => ak.cmp_with_order(&bk, ordering),
         (Err(_), Ok(_)) => Ordering::Less,
         (Ok(_), Err(_)) => Ordering::Greater,

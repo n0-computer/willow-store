@@ -1,12 +1,11 @@
 use std::collections::BTreeMap;
 
-use crate::VariableSize;
 use anyhow::Result;
 use std::fmt::{Debug, Display};
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
 /// A simple store trait for storing blobs.
-pub trait Store {
+pub trait BlobStore {
     /// Create a new node in the store. The generated ids should not be reused.
     fn create(&mut self, node: &[u8]) -> Result<NodeId>;
     /// Read a node from the store.
@@ -17,7 +16,7 @@ pub trait Store {
     fn delete(&mut self, id: NodeId) -> Result<()>;
 }
 
-impl Store for Box<dyn Store> {
+impl BlobStore for Box<dyn BlobStore> {
     fn create(&mut self, node: &[u8]) -> Result<NodeId> {
         self.as_mut().create(node)
     }
@@ -47,7 +46,7 @@ impl MemStore {
     }
 }
 
-impl Store for MemStore {
+impl BlobStore for MemStore {
     fn create(&mut self, node: &[u8]) -> Result<NodeId> {
         let id = NodeId::from((self.nodes.len() as u64) + 1);
         assert!(!id.is_empty());
