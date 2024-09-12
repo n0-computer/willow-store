@@ -1,12 +1,15 @@
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    fmt::{Debug, Display},
+};
 
 use prop::sample::SizeRange;
 use proptest::prelude::*;
 use test_strategy::proptest;
 use testresult::TestResult;
 use willow_store::{
-    FixedSize, KeyParams, LiftingCommutativeMonoid, NodeData, Point, QueryRange, QueryRange3d,
-    SortOrder, Store, TreeParams, VariableSize,
+    FixedSize, KeyParams, LiftingCommutativeMonoid, NodeData, NodeData2, OwnedNodeData2,
+    OwnedPoint2, Point, QueryRange, QueryRange3d, SortOrder, StoreExt, TreeParams, VariableSize,
 };
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
@@ -22,6 +25,46 @@ impl KeyParams for TestParams {
     type Z = u64;
 }
 
+#[derive(PartialEq, Eq, PartialOrd, Ord, AsBytes, FromZeroes, FromBytes, Clone, Copy)]
+#[repr(transparent)]
+struct TestCoord([u8; 8]);
+
+impl From<u64> for TestCoord {
+    fn from(x: u64) -> Self {
+        TestCoord(x.to_be_bytes())
+    }
+}
+
+impl From<TestCoord> for u64 {
+    fn from(x: TestCoord) -> Self {
+        u64::from_be_bytes(x.0)
+    }
+}
+
+impl Debug for TestCoord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let x: u64 = (*self).into();
+        write!(f, "{}", x)
+    }
+}
+
+impl Display for TestCoord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let x: u64 = (*self).into();
+        write!(f, "{}", x)
+    }
+}
+
+impl FixedSize for TestCoord {
+    const SIZE: usize = 8;
+}
+
+// impl VariableSize for TestCoord {
+//     fn size(&self) -> usize {
+//         8
+//     }
+// }
+
 impl TreeParams for TestParams {
     type V = u64;
     type M = ValueSum;
@@ -35,13 +78,13 @@ impl FixedSize for ValueSum {
     const SIZE: usize = 8;
 }
 
-impl LiftingCommutativeMonoid<(Point<TestParams>, u64)> for ValueSum {
+impl LiftingCommutativeMonoid<Point<TestParams>, u64> for ValueSum {
     fn neutral() -> Self {
         ValueSum(0)
     }
 
-    fn lift(v: (Point<TestParams>, u64)) -> Self {
-        ValueSum(v.1)
+    fn lift(_k: &Point<TestParams>, v: &u64) -> Self {
+        ValueSum(*v)
     }
 
     fn combine(&self, other: &Self) -> Self {
@@ -200,7 +243,7 @@ fn tree_summary_impl(items: Vec<(TPoint, u64)>, query: TQuery) -> TestResult<()>
     let mut expected = ValueSum::neutral();
     for (key, value) in &items {
         if query.contains(key) {
-            expected = expected.combine(&ValueSum::lift((key.clone(), *value)));
+            expected = expected.combine(&ValueSum::lift(key, value));
         }
     }
     assert_eq!(actual, expected);
@@ -258,8 +301,9 @@ fn tree_insert_impl(items: Vec<(TPoint, u64)>) -> TestResult<()> {
     let mut items2 = items.clone();
     let (key, value) = items2.pop().unwrap();
     let (mut store, mut node) = willow_store::Node::from_iter(items2.clone())?;
-    let x: willow_store::Node<TestParams> =
-        store.create(&NodeData::single(key.clone(), value))?.into();
+    let x: willow_store::Node<TestParams> = store
+        .create_node(&NodeData::single(key.clone(), value))?
+        .into();
     println!("before:");
     node.dump(&store)?;
     println!("");
@@ -439,6 +483,15 @@ fn key_bytes_roundtrip_impl(p: TPoint) -> TestResult<()> {
 #[proptest]
 fn prop_key_bytes_roundtrip(#[strategy(point())] p: TPoint) {
     key_bytes_roundtrip_impl(p).unwrap();
+}
+
+#[proptest]
+fn prop_nodedata_create(#[strategy(point())] p: TPoint, v: u64) {
+    let p2 = OwnedPoint2::<TestParams>::new(&p.x, &p.y, &p.z);
+    println!("{:?} {:?}", p, p2);
+    let node = OwnedNodeData2::leaf(&p2, &v);
+    let key = node.key();
+    println!("{:?}", key);
 }
 
 fn node_bytes_roundtrip_impl(p: TPoint, v: u64) -> TestResult<()> {

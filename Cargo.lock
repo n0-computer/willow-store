@@ -785,7 +785,6 @@ dependencies = [
  "redb",
  "ref-cast",
  "self_cell",
- "serde",
  "smallvec",
  "test-strategy",
  "testresult",

@@ -96,10 +96,10 @@
 //! [Aljoscha Meyer]: https://aljoscha-meyer.de/
 //! [kv_3d_storage]: https://github.com/AljoschaMeyer/kv_3d_storage/blob/d311cdee31ce7f5b5f50f9798507b958fe0f887b/src/lib.rs
 //! [willow]: https://willowprotocol.org/
-use core::panic;
 use std::{
+    borrow::Borrow,
     cmp::Ordering,
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     fmt::{Debug, Display},
     marker::PhantomData,
     ops::{Deref, DerefMut},
@@ -107,11 +107,13 @@ use std::{
 
 use anyhow::Result;
 use genawaiter::sync::{Co, Gen};
-use point::{XYZ, YZX, ZXY};
-use serde::Serialize;
+use point::{Point2, XYZ, YZX, ZXY};
 
 mod point;
-pub use point::Point;
+pub use point::{OwnedPoint2, Point};
+mod store;
+use ref_cast::RefCast;
+pub use store::Store;
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
 macro_rules! assert_lt {
@@ -128,22 +130,12 @@ macro_rules! assert_gt {
 
 ///
 pub trait CoordParams:
-    Ord + PartialEq + Eq + Serialize + Clone + Debug + Display + FromBytes + AsBytes
+    Ord + PartialEq + Eq + Clone + Debug + Display + FromBytes + AsBytes
 {
 }
 
-impl<
-        T: Ord
-            + PartialEq
-            + Eq
-            + Serialize
-            + Clone
-            + Debug
-            + Display
-            + FromBytes
-            + FromZeroes
-            + AsBytes,
-    > CoordParams for T
+impl<T: Ord + PartialEq + Eq + Clone + Debug + Display + FromBytes + FromZeroes + AsBytes>
+    CoordParams for T
 {
 }
 
@@ -179,7 +171,7 @@ impl VariableSize for u64 {
     }
 }
 
-impl FixedSize for NodeId {
+impl FixedSize for store::NodeId {
     const SIZE: usize = 8;
 }
 
@@ -193,9 +185,16 @@ pub trait KeyParams {
     type Z: CoordParams + VariableSize;
 }
 
-pub trait LiftingCommutativeMonoid<T> {
+pub trait LiftingCommutativeMonoid<K, V> {
+    /// The neutral element of the monoid.
+    ///
+    /// It isn't called zero to avoid name collison with the FromZeroes trait.
     fn neutral() -> Self;
-    fn lift(value: T) -> Self;
+    /// Lift a key value pair into the monoid.
+    ///
+    /// This is taking both key and value by reference to avoid cloning.
+    fn lift(key: &K, value: &V) -> Self;
+    /// Combine op. This must be commutative, and `neutral` must be the identity.
     fn combine(&self, other: &Self) -> Self;
 }
 
@@ -511,7 +510,7 @@ impl<T: TreeParams> AssertInvariantsRes<T> {
                 min: zxy.clone(),
                 max: zxy,
             },
-            summary: T::M::lift((point, value)),
+            summary: T::M::lift(&point, &value),
             rank,
         }
     }
@@ -601,21 +600,15 @@ impl<P: KeyParams> BBox<P> {
 }
 
 ///
-pub trait ValueParams:
-    PartialEq + Eq + Serialize + Clone + Debug + FixedSize + AsBytes + FromBytes
-{
-}
+pub trait ValueParams: PartialEq + Eq + Clone + Debug + FixedSize + AsBytes + FromBytes {}
 
-impl<T: PartialEq + Eq + Serialize + Clone + Debug + FixedSize + AsBytes + FromBytes> ValueParams
-    for T
-{
-}
+impl<T: PartialEq + Eq + Clone + Debug + FixedSize + AsBytes + FromBytes> ValueParams for T {}
 
 /// Tree params for a 3D tree. This extends `KeyParams` with a value and
 /// summary type.
 pub trait TreeParams: KeyParams + Sized {
     type V: ValueParams;
-    type M: LiftingCommutativeMonoid<(Point<Self>, Self::V)>
+    type M: LiftingCommutativeMonoid<Point<Self>, Self::V>
         + Clone
         + Debug
         + Eq
@@ -661,43 +654,29 @@ fn rank_offset<P: TreeParams>() -> usize {
 
 #[inline(always)]
 fn key_offset<P: TreeParams>() -> usize {
-    16 + P::V::SIZE + P::M::SIZE + 1
+    // pad rank to 8 bytes to align key
+    16 + P::V::SIZE + P::M::SIZE + 8
 }
 
-/// A simple store trait for storing blobs.
-pub trait Store<T: VariableSize> {
-    fn create(&mut self, node: &T) -> Result<NodeId>;
-    fn read(&self, id: NodeId) -> Result<T>;
-    fn update(&mut self, id: NodeId, node: &T) -> Result<()>;
-    fn delete(&mut self, id: NodeId) -> Result<()>;
-}
-
-impl<T: VariableSize> Store<T> for Box<dyn Store<T>> {
-    fn create(&mut self, node: &T) -> Result<NodeId> {
-        self.as_mut().create(node)
+pub trait StoreExt<P: TreeParams>: store::Store<NodeData<P>> {
+    fn create_node(&mut self, data: &NodeData<P>) -> Result<Node<P>> {
+        let bytes = data.to_vec();
+        Ok(Node(self.create(&bytes)?, PhantomData))
     }
 
-    fn read(&self, id: NodeId) -> Result<T> {
-        self.as_ref().read(id)
+    fn update_node(&mut self, id: Node<P>, data: &NodeData<P>) -> Result<()> {
+        let bytes = data.to_vec();
+        self.update(id.0, &bytes)
     }
 
-    fn update(&mut self, id: NodeId, node: &T) -> Result<()> {
-        self.as_mut().update(id, node)
-    }
-
-    fn delete(&mut self, id: NodeId) -> Result<()> {
-        self.as_mut().delete(id)
-    }
-}
-
-pub trait StoreExt<P: TreeParams>: Store<NodeData<P>> {
     fn put_node(&mut self, data: NodeData<P>) -> Result<IdAndData<P>> {
-        let id = Node(self.create(&data)?, PhantomData);
+        let bytes = data.to_vec();
+        let id = Node(self.create(&bytes)?, PhantomData);
         Ok(IdAndData::new(id, data))
     }
 
     fn data(&self, id: Node<P>) -> Result<NodeData<P>> {
-        Store::read(self, id.0)
+        store::Store::read(self, id.0)
     }
 
     /// Get a node by id, returning None if the id is None.
@@ -732,87 +711,14 @@ pub trait StoreExt<P: TreeParams>: Store<NodeData<P>> {
     }
 }
 
-impl<T: Store<NodeData<P>>, P: TreeParams> StoreExt<P> for T {}
-
-pub struct MemStore {
-    nodes: BTreeMap<NodeId, Vec<u8>>,
-}
-
-impl MemStore {
-    pub fn new() -> Self {
-        MemStore {
-            nodes: BTreeMap::new(),
-        }
-    }
-}
-
-impl<T: VariableSize> Store<T> for MemStore {
-    fn create(&mut self, node: &T) -> Result<NodeId> {
-        let id = NodeId::from((self.nodes.len() as u64) + 1);
-        assert!(!id.is_empty());
-        self.nodes.insert(id, node.to_vec());
-        Ok(id)
-    }
-
-    fn update(&mut self, id: NodeId, node: &T) -> Result<()> {
-        assert!(!id.is_empty());
-        self.nodes.insert(id, node.to_vec());
-        Ok(())
-    }
-
-    fn read(&self, id: NodeId) -> Result<T> {
-        assert!(!id.is_empty());
-        match self.nodes.get(&id) {
-            Some(data) => Ok(T::read(data)),
-            None => Err(anyhow::anyhow!("Node not found")),
-        }
-    }
-
-    fn delete(&mut self, id: NodeId) -> Result<()> {
-        assert!(!id.is_empty());
-        self.nodes.remove(&id);
-        Ok(())
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, AsBytes, FromZeroes, FromBytes)]
-#[repr(transparent)]
-pub struct NodeId([u8; 8]);
-
-impl Debug for NodeId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let id = u64::from_be_bytes(self.0);
-        write!(f, "NodeId({})", id)
-    }
-}
-
-impl Display for NodeId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let id = u64::from_be_bytes(self.0);
-        write!(f, "{}", id)
-    }
-}
-
-impl From<u64> for NodeId {
-    fn from(id: u64) -> Self {
-        NodeId(id.to_be_bytes())
-    }
-}
-
-impl NodeId {
-    pub const EMPTY: Self = NodeId([0; 8]);
-
-    pub fn is_empty(&self) -> bool {
-        self == &Self::EMPTY
-    }
-}
+impl<T: store::Store<NodeData<P>>, P: TreeParams> StoreExt<P> for T {}
 
 #[repr(transparent)]
 #[derive(AsBytes, FromZeroes, FromBytes)]
-pub struct Node<P: TreeParams>(NodeId, PhantomData<P>);
+pub struct Node<P: TreeParams>(store::NodeId, PhantomData<P>);
 
-impl<P: TreeParams> From<NodeId> for Node<P> {
-    fn from(id: NodeId) -> Self {
+impl<P: TreeParams> From<store::NodeId> for Node<P> {
+    fn from(id: store::NodeId) -> Self {
         Node(id, PhantomData)
     }
 }
@@ -854,7 +760,7 @@ impl<P: TreeParams> PartialEq for Node<P> {
 impl<P: TreeParams> Eq for Node<P> {}
 
 impl<P: TreeParams> Node<P> {
-    pub const EMPTY: Self = Self(NodeId::EMPTY, PhantomData);
+    pub const EMPTY: Self = Self(store::NodeId::EMPTY, PhantomData);
 
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
@@ -868,7 +774,7 @@ impl<P: TreeParams> Node<P> {
         })
     }
 
-    pub fn id(&self) -> NodeId {
+    pub fn id(&self) -> store::NodeId {
         self.0
     }
 
@@ -917,7 +823,7 @@ impl<P: TreeParams> Node<P> {
             }
         } else {
             // self is empty
-            *self = store.create(&x)?.into();
+            *self = store.create_node(&x)?.into();
             Ok(None)
         }
     }
@@ -1027,7 +933,7 @@ impl<P: TreeParams> Node<P> {
         // Before we sort, remove all but the first occurence of each point.
         let mut uniques = BTreeSet::new();
         nodes.retain(|node| uniques.insert(node.key().clone().xyz()));
-        let mut store = MemStore::new();
+        let mut store = store::MemStore::new();
         let nodes = nodes
             .into_iter()
             .map(|data| store.put_node(data))
@@ -1048,14 +954,7 @@ impl<P: TreeParams> Node<P> {
                 .then(p1.key().cmp_at_rank(p2.key(), p1.rank()))
         });
         let mut tree = Node::EMPTY;
-        // println!("merging {} nodes", nodes.len());
-        // for node in &nodes {
-        //     println!("{:?} {}", node.key, node.rank);
-        // }
         for node in nodes {
-            // let node = store.put_node(node.data)?;
-            // println!("{} {}", i, tree.is_empty());
-            // tree.dump(store)?;
             node.persist(store)?;
             tree.insert_no_balance(&node, store)?;
         }
@@ -1097,7 +996,7 @@ impl<P: TreeParams> Node<P> {
     ) -> Result<()> {
         if let Some(data) = store.data_opt(*self)? {
             Box::pin(data.left().iter0(store, co)).await?;
-            co.yield_(Ok((data.key().clone(), data.value().clone())))
+            co.yield_(Ok((data.key().to_owned(), data.value().to_owned())))
                 .await;
             Box::pin(data.right().iter0(store, co)).await?;
         }
@@ -1145,7 +1044,7 @@ impl<P: TreeParams> Node<P> {
                 Box::pin(data.left().query0(query, store, co)).await?;
             }
             if query.contains(data.key()) {
-                co.yield_(Ok((data.key().clone(), data.value().clone())))
+                co.yield_(Ok((data.key().to_owned(), data.value().to_owned())))
                     .await;
             }
             if query.overlaps_right(data.key(), data.rank()) {
@@ -1190,7 +1089,7 @@ impl<P: TreeParams> Node<P> {
                 Box::pin(data.left().query_ordered0(query, ordering, store, co)).await?;
             }
             if query.contains(data.key()) {
-                co.yield_(Ok((data.key().clone(), data.value().clone())))
+                co.yield_(Ok((data.key().to_owned(), data.value().to_owned())))
                     .await;
             }
             if query.overlaps_right(data.key(), data.rank()) {
@@ -1211,8 +1110,8 @@ impl<P: TreeParams> Node<P> {
             };
             let iter2 = if query.contains(data.key()) {
                 itertools::Either::Left(std::iter::once(Ok((
-                    data.key().clone(),
-                    data.value().clone(),
+                    data.key().to_owned(),
+                    data.value().to_owned(),
                 ))))
             } else {
                 itertools::Either::Right(std::iter::empty())
@@ -1239,7 +1138,7 @@ impl<P: TreeParams> Node<P> {
             // turn the node into a leaf
             *data.left_mut() = Node::EMPTY;
             *data.right_mut() = Node::EMPTY;
-            data.summary = P::M::lift((data.key().clone(), data.value().clone()));
+            data.summary = P::M::lift(data.key(), data.value());
             // persist (should we do this here or later?)
             data.persist(store)?;
             res.push(data);
@@ -1248,72 +1147,194 @@ impl<P: TreeParams> Node<P> {
     }
 }
 
-pub struct NodeData2<P: TreeParams, T = Vec<u8>>(T, PhantomData<P>);
+#[repr(transparent)]
+#[derive(RefCast)]
+pub struct NodeData2<P: TreeParams>(PhantomData<P>, [u8]);
 
-impl<P: TreeParams, T: AsRef<[u8]>> NodeData2<P, T> {
-    pub fn new(data: T) -> Self {
-        debug_assert!(data.as_ref().len() >= min_data_size::<P>());
-        Self(data, PhantomData)
+pub struct OwnedNodeData2<P: TreeParams>(PhantomData<P>, Vec<u8>);
+
+impl<P: TreeParams> OwnedNodeData2<P> {
+    /// Creates a leaf data from the given key and value.
+    pub fn leaf(key: &Point2<P>, value: &P::V) -> Self {
+        let mut data = vec![0; key_offset::<P>() + key.size()];
+        value.write_to_prefix(&mut data[value_offset::<P>()..]);
+        let mut res = Self(PhantomData, data);
+        *res.value_mut() = value.clone();
+        // todo: change lift to take a Point2
+        let old_key = Point {
+            x: key.x().clone(),
+            y: key.y().clone(),
+            z: key.z().clone(),
+        };
+        *res.summary_mut() = P::M::lift(&old_key, value);
+        *res.rank_mut() = key.rank();
+        *res.left_mut() = Node::EMPTY; // not strictly necessary, since it's already 0
+        *res.right_mut() = Node::EMPTY; // not strictly necessary, since it's already 0
+        res
+    }
+}
+
+impl<P: TreeParams> Debug for OwnedNodeData2<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", &self.deref())
+    }
+}
+
+impl<P: TreeParams> ToOwned for NodeData2<P> {
+    type Owned = OwnedNodeData2<P>;
+
+    fn to_owned(&self) -> Self::Owned {
+        OwnedNodeData2(PhantomData, self.1.to_vec())
+    }
+}
+
+impl<P: TreeParams> Borrow<NodeData2<P>> for OwnedNodeData2<P> {
+    fn borrow(&self) -> &NodeData2<P> {
+        NodeData2::ref_cast(&self.1)
+    }
+}
+
+impl<P: TreeParams> Deref for OwnedNodeData2<P> {
+    type Target = NodeData2<P>;
+
+    fn deref(&self) -> &Self::Target {
+        NodeData2::ref_cast(&self.1)
+    }
+}
+
+impl<P: TreeParams> DerefMut for OwnedNodeData2<P> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        NodeData2::ref_cast_mut(&mut self.1)
+    }
+}
+
+impl<P: TreeParams> Debug for NodeData2<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeData")
+            .field("left", &self.left())
+            .field("right", &self.right())
+            .field("value", &self.value())
+            .field("summary", &self.summary())
+            .field("rank", &self.rank())
+            .field("key", &self.key())
+            .finish()
+    }
+}
+
+impl<P: TreeParams> NodeData2<P> {
+    // pub fn new(data: T) -> Self {
+    //     debug_assert!(data.as_ref().len() >= min_data_size::<P>());
+    //     Self(data, PhantomData)
+    // }
+
+    pub fn is_leaf(&self) -> bool {
+        self.left().is_empty() && self.right().is_empty()
     }
 
     pub fn left(&self) -> Node<P> {
-        Node::read_from_prefix(&&self.0.as_ref()[left_offset::<P>()..]).unwrap()
+        Node::read_from_prefix(&self.1[left_offset::<P>()..]).unwrap()
     }
 
     pub fn right(&self) -> Node<P> {
-        Node::read_from_prefix(&&self.0.as_ref()[right_offset::<P>()..]).unwrap()
+        Node::read_from_prefix(&self.1[right_offset::<P>()..]).unwrap()
     }
 
     pub fn value(&self) -> &P::V {
-        P::V::ref_from_prefix(&self.0.as_ref()[value_offset::<P>()..]).unwrap()
+        P::V::ref_from_prefix(&self.1[value_offset::<P>()..]).unwrap()
     }
 
     pub fn summary(&self) -> &P::M {
-        P::M::ref_from_prefix(&self.0.as_ref()[summary_offset::<P>()..]).unwrap()
+        P::M::ref_from_prefix(&self.1[summary_offset::<P>()..]).unwrap()
     }
 
     pub fn rank(&self) -> u8 {
-        self.0.as_ref()[rank_offset::<P>()]
+        self.1.as_ref()[rank_offset::<P>()]
     }
 
-    pub fn key(&self) -> Point2<P, &[u8]> {
-        Point2::new(&self.0.as_ref()[key_offset::<P>()..])
+    pub fn key(&self) -> &Point2<P> {
+        let slice = &self.1[key_offset::<P>()..];
+        Point2::ref_cast(slice)
     }
+
+    // fn summary0(
+    //     &self,
+    //     query: &QueryRange3d<P>,
+    //     bbox: &BBox<P>,
+    //     store: &impl StoreExt<P>,
+    // ) -> Result<P::M> {
+    //     if self.is_leaf() {
+    //         if query.contains(self.key()) {
+    //             return Ok(self.summary().clone());
+    //         } else {
+    //             return Ok(P::M::neutral());
+    //         }
+    //     }
+    //     if bbox.contained_in(&query) {
+    //         return Ok(self.summary().clone());
+    //     }
+    //     let mut summary = P::M::neutral();
+    //     if query.overlaps_left(self.key(), self.rank()) {
+    //         if let Some(left) = store.data_opt(self.left())? {
+    //             let left_bbox = bbox.split_left(self.key(), self.rank());
+    //             summary = summary.combine(&left.summary0(query, &left_bbox, store)?);
+    //         }
+    //     }
+    //     if query.contains(self.key()) {
+    //         summary = summary.combine(&P::M::lift((self.key().clone(), self.value().clone())));
+    //     }
+    //     if query.overlaps_right(self.key(), self.rank()) {
+    //         if let Some(right) = store.data_opt(self.right())? {
+    //             let right_bbox = bbox.split_right(self.key(), self.rank());
+    //             summary = summary.combine(&right.summary0(query, &right_bbox, store)?);
+    //         }
+    //     }
+    //     Ok(summary)
+    // }
 }
 
-impl<P: TreeParams, T: AsMut<[u8]>> NodeData2<P, T> {
+impl<P: TreeParams> NodeData2<P> {
     pub fn left_mut(&mut self) -> &mut Node<P> {
-        Node::mut_from_prefix(&mut self.0.as_mut()[left_offset::<P>()..]).unwrap()
+        Node::mut_from_prefix(&mut self.1[left_offset::<P>()..]).unwrap()
     }
 
     pub fn right_mut(&mut self) -> &mut Node<P> {
-        Node::mut_from_prefix(&mut self.0.as_mut()[right_offset::<P>()..]).unwrap()
+        Node::mut_from_prefix(&mut self.1[right_offset::<P>()..]).unwrap()
     }
 
     pub fn summary_mut(&mut self) -> &mut P::M {
-        P::M::mut_from_prefix(&mut self.0.as_mut()[summary_offset::<P>()..]).unwrap()
-    }
-}
-
-pub struct Point2<P: KeyParams, T: AsRef<[u8]> = Vec<u8>>(T, PhantomData<P>);
-
-impl<P: KeyParams, T: AsRef<[u8]>> Point2<P, T> {
-    pub fn new(data: T) -> Self {
-        debug_assert!(data.as_ref().len() >= min_key_size::<P>());
-        Self(data, PhantomData)
+        P::M::mut_from_prefix(&mut self.1[summary_offset::<P>()..]).unwrap()
     }
 
-    pub fn x(&self) -> P::X {
-        P::X::read_from_prefix(&self.0.as_ref()[0..]).unwrap()
+    pub fn value_mut(&mut self) -> &mut P::V {
+        P::V::mut_from_prefix(&mut self.1[value_offset::<P>()..]).unwrap()
     }
 
-    pub fn y(&self) -> P::Y {
-        P::Y::read_from_prefix(&self.0.as_ref()[P::X::SIZE..]).unwrap()
+    pub fn rank_mut(&mut self) -> &mut u8 {
+        &mut self.1.as_mut()[rank_offset::<P>()]
     }
 
-    pub fn z(&self) -> P::Z {
-        P::Z::read_from_prefix(&self.0.as_ref()[P::X::SIZE + P::Y::SIZE..]).unwrap()
-    }
+    // fn recalculate_summary(&mut self, store: &impl StoreExt<P>) -> Result<()>
+    //     where T: AsRef<[u8]>
+    // {
+    //     let mut res = P::M::neutral();
+    //     if let Some(left) = store.data_opt(self.left())? {
+    //         res = res.combine(left.summary());
+    //     }
+    //     res = res.combine(&P::M::lift((self.key().clone(), self.value().clone())));
+    //     if let Some(right) = store.data_opt(self.right())? {
+    //         res = res.combine(right.summary());
+    //     }
+    //     *self.summary_mut() = res;
+    //     Ok(())
+    // }
+
+    // fn add_summary(&mut self, value: P::V)
+    //     where T: AsRef<[u8]>
+    // {
+    //     *self.summary_mut() = self
+    //         .summary()
+    //         .combine(&P::M::lift((self.key().clone(), value)));
+    // }
 }
 
 /// Data for a node in the tree.
@@ -1424,7 +1445,7 @@ impl<P: TreeParams> NodeData<P> {
             }
         }
         if query.contains(self.key()) {
-            summary = summary.combine(&P::M::lift((self.key().clone(), self.value().clone())));
+            summary = summary.combine(&P::M::lift(self.key(), self.value()));
         }
         if query.overlaps_right(self.key(), self.rank()) {
             if let Some(right) = store.data_opt(self.right())? {
@@ -1440,7 +1461,7 @@ impl<P: TreeParams> NodeData<P> {
         if let Some(left) = store.data_opt(self.left())? {
             res = res.combine(left.summary());
         }
-        res = res.combine(&P::M::lift((self.key().clone(), self.value().clone())));
+        res = res.combine(&P::M::lift(self.key(), self.value()));
         if let Some(right) = store.data_opt(self.right())? {
             res = res.combine(right.summary());
         }
@@ -1449,9 +1470,7 @@ impl<P: TreeParams> NodeData<P> {
     }
 
     fn add_summary(&mut self, value: P::V) {
-        self.summary = self
-            .summary()
-            .combine(&P::M::lift((self.key().clone(), value)));
+        self.summary = self.summary().combine(&P::M::lift(self.key(), &value));
     }
 }
 
@@ -1574,7 +1593,7 @@ impl<P: TreeParams> NodeData<P> {
 
     /// Create a new node data with the given key and value.
     pub fn single(key: Point<P>, value: P::V) -> Self {
-        let summary = P::M::lift((key.clone(), value.clone()));
+        let summary = P::M::lift(&key, &value);
         let mut key_bytes = vec![0; key.size()];
         key.write(&mut key_bytes);
         let key_hash: [u8; 32] = blake3::hash(&key_bytes).into();
@@ -1668,7 +1687,7 @@ impl<P: TreeParams> IdAndData<P> {
             assert!(self.key().cmp_at_rank(right.key(), self.rank()) == Ordering::Less);
             assert!(right.rank() <= self.rank());
         }
-        store.update(self.id.0, &self.data)
+        store.update_node(self.id, &self.data)
     }
 
     // Insert a new node into the tree without balancing.
