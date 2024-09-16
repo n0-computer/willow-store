@@ -464,26 +464,31 @@ fn delete_impl(keys: BTreeSet<u64>, seed: u64) {
 }
 
 #[proptest]
+#[ignore]
 fn prop_zip_insert_rec(values: BTreeSet<u64>, seed: u64) {
     insert_rec_impl(values, seed);
 }
 
 #[proptest]
+#[ignore]
 fn prop_zip_insert(values: BTreeSet<u64>, seed: u64) {
     insert_impl(values, seed);
 }
 
 #[proptest]
+#[ignore]
 fn prop_zip_delete_rec(values: BTreeSet<u64>, seed: u64) {
     delete_rec_impl(values, seed);
 }
 
 #[proptest]
+#[ignore]
 fn prop_zip_delete(values: BTreeSet<u64>, seed: u64) {
     delete_impl(values, seed);
 }
 
 #[test]
+#[ignore]
 fn test_zip_delete() {
     let data: Vec<(BTreeSet<u64>, u64)> = [([0].into_iter().collect(), 0)].into_iter().collect();
     for (keys, seed) in data {

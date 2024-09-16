@@ -1,4 +1,4 @@
-use crate::{count_trailing_zeros, FixedSize, KeyParams, SortOrder, VariableSize};
+use crate::{count_trailing_zeros, FixedSize, KeyParams, RefFromSlice, SortOrder, VariableSize};
 use ref_cast::RefCast;
 use std::{borrow::Borrow, cmp::Ordering, fmt::Debug, marker::PhantomData, ops::Deref, sync::Arc};
 use zerocopy::{AsBytes, FromBytes};
@@ -46,7 +46,6 @@ impl<P: KeyParams> Borrow<Point<P>> for OwnedPoint<P> {
         Point::ref_cast(&self.1)
     }
 }
-
 
 impl<P: KeyParams> OwnedPoint<P> {
     pub fn new(x: &P::X, y: &P::Y, z: &P::Z) -> Self {
@@ -120,7 +119,7 @@ impl<P: KeyParams> Point<P> {
     }
 
     pub fn z(&self) -> &P::Z {
-        P::Z::ref_from_prefix(&self.1[P::X::SIZE + P::Y::SIZE..]).unwrap()
+        P::Z::ref_from_slice(&self.1[P::X::SIZE + P::Y::SIZE..])
     }
 
     fn cmp_xyz(&self, other: &Self) -> std::cmp::Ordering {

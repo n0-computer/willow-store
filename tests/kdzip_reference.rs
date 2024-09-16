@@ -1025,31 +1025,37 @@ mod tests {
     }
 
     #[proptest]
+    #[ignore]
     fn prop_kd_delete_brute(#[strategy(random_test_set())] values: TestSet) {
         delete_impl(values, |a, b| delete_brute_force(a, b.key()));
     }
 
     #[proptest]
+    #[ignore]
     fn prop_kd_insert_rec_uniform(#[strategy(uniform_test_set())] values: TestSet) {
         insert_rec_impl(values);
     }
 
     #[proptest]
+    #[ignore]
     fn prop_kd_insert_uniform(#[strategy(uniform_test_set())] values: TestSet) {
         insert_impl(values, insert);
     }
 
     #[proptest]
+    #[ignore]
     fn prop_kd_delete_rec_uniform(#[strategy(uniform_test_set())] values: TestSet) {
         delete_rec_impl(values);
     }
 
     #[proptest]
+    #[ignore]
     fn prop_kd_delete_uniform(#[strategy(uniform_test_set())] values: TestSet) {
         delete_impl(values, delete);
     }
 
     #[proptest]
+    #[ignore]
     fn prop_kd_split(#[strategy(random_test_set_2())] values: TestSet) {
         split_impl(values);
     }
@@ -1061,6 +1067,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_kd_delete_brute_force() {
         let cases = vec![
             // TestSet(

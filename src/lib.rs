@@ -113,20 +113,11 @@ mod point;
 pub use point::OwnedPoint;
 mod store;
 use ref_cast::RefCast;
+mod layout;
+use layout::*;
 pub use store::BlobStore;
 pub use store::MemStore;
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
-
-///
-pub trait CoordParams:
-    Ord + PartialEq + Eq + Clone + Debug + FromBytes + AsBytes
-{
-}
-
-impl<T: Ord + PartialEq + Eq + Clone + Debug + FromBytes + FromZeroes + AsBytes>
-    CoordParams for T
-{
-}
 
 pub trait FixedSize {
     const SIZE: usize;
@@ -180,10 +171,33 @@ impl FixedSize for u8 {
     const SIZE: usize = 1;
 }
 
+pub trait RefFromSlice {
+    fn ref_from_slice(slice: &[u8]) -> &Self;
+}
+
+impl RefFromSlice for [u8] {
+    fn ref_from_slice(slice: &[u8]) -> &Self {
+        slice
+    }
+}
+
+impl RefFromSlice for u64 {
+    fn ref_from_slice(slice: &[u8]) -> &Self {
+        u64::ref_from(slice).unwrap()
+    }
+}
+
 pub trait KeyParams {
-    type X: CoordParams + FixedSize;
-    type Y: CoordParams + FixedSize;
-    type Z: CoordParams + VariableSize;
+    type X: Ord + Debug + AsBytes + FromBytes + FixedSize + Clone;
+    type Y: Ord + Debug + AsBytes + FromBytes + FixedSize + Clone;
+    type Z: Ord
+        + Debug
+        + AsBytes
+        + VariableSize
+        + ToOwned<Owned = Self::ZOwned>
+        + ?Sized
+        + RefFromSlice;
+    type ZOwned: Debug + Borrow<Self::Z> + Ord + Clone;
 }
 
 pub trait LiftingCommutativeMonoid<K: ?Sized, V> {
@@ -221,12 +235,15 @@ impl<T: Ord> QueryRange<T> {
         Self { min, max }
     }
 
-    pub fn contains(&self, value: &T) -> bool {
-        if value < &self.min {
+    pub fn contains<U: Ord + ?Sized>(&self, value: &U) -> bool
+    where
+        T: Borrow<U>,
+    {
+        if value < self.min.borrow() {
             return false;
         }
         if let Some(max) = &self.max {
-            if value >= max {
+            if value >= max.borrow() {
                 return false;
             }
         }
@@ -264,7 +281,7 @@ impl<T: Ord> QueryRange<T> {
 pub struct QueryRange3d<P: KeyParams> {
     x: QueryRange<P::X>,
     y: QueryRange<P::Y>,
-    z: QueryRange<P::Z>,
+    z: QueryRange<P::ZOwned>,
 }
 
 impl<P: KeyParams> Display for QueryRange3d<P> {
@@ -284,7 +301,7 @@ impl<P: KeyParams> Debug for QueryRange3d<P> {
 }
 
 impl<P: KeyParams> QueryRange3d<P> {
-    pub fn new(x: QueryRange<P::X>, y: QueryRange<P::Y>, z: QueryRange<P::Z>) -> Self {
+    pub fn new(x: QueryRange<P::X>, y: QueryRange<P::Y>, z: QueryRange<P::ZOwned>) -> Self {
         Self { x, y, z }
     }
 
@@ -296,7 +313,7 @@ impl<P: KeyParams> QueryRange3d<P> {
         match SortOrder::from(rank) {
             SortOrder::XYZ => &self.x.min <= key.x(),
             SortOrder::YZX => &self.y.min <= key.y(),
-            SortOrder::ZXY => &self.z.min <= key.z(),
+            SortOrder::ZXY => &self.z.min.borrow() <= &key.z(),
         }
     }
 
@@ -318,7 +335,7 @@ impl<P: KeyParams> QueryRange3d<P> {
                 .z
                 .max
                 .as_ref()
-                .map(|z_max| z_max < &key.z())
+                .map(|z_max| z_max.borrow() < &key.z())
                 .unwrap_or_default(),
         }
     }
@@ -358,7 +375,7 @@ pub struct RangeInclusiveOpt<T> {
     max: Option<T>,
 }
 
-impl<T: CoordParams> Display for RangeInclusiveOpt<T> {
+impl<T: Debug> Display for RangeInclusiveOpt<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match (&self.min, &self.max) {
             (Some(min), Some(max)) => write!(f, "[{:?}, {:?}]", min, max),
@@ -369,7 +386,7 @@ impl<T: CoordParams> Display for RangeInclusiveOpt<T> {
     }
 }
 
-impl<T: CoordParams> Debug for RangeInclusiveOpt<T> {
+impl<T: Debug> Debug for RangeInclusiveOpt<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RangeInclusiveOpt")
             .field("min", &self.min)
@@ -378,7 +395,7 @@ impl<T: CoordParams> Debug for RangeInclusiveOpt<T> {
     }
 }
 
-impl<T: CoordParams> Clone for RangeInclusiveOpt<T> {
+impl<T: Clone> Clone for RangeInclusiveOpt<T> {
     fn clone(&self) -> Self {
         Self {
             min: self.min.clone(),
@@ -387,7 +404,7 @@ impl<T: CoordParams> Clone for RangeInclusiveOpt<T> {
     }
 }
 
-impl<T: CoordParams> RangeInclusiveOpt<T> {
+impl<T: Clone> RangeInclusiveOpt<T> {
     pub fn new(min: Option<T>, max: Option<T>) -> Self {
         RangeInclusiveOpt { min, max }
     }
@@ -420,7 +437,10 @@ impl<T: CoordParams> RangeInclusiveOpt<T> {
         }
     }
 
-    pub fn union(&self, that: RangeInclusiveOpt<T>) -> Self {
+    pub fn union(&self, that: RangeInclusiveOpt<T>) -> Self
+    where
+        T: Ord,
+    {
         let min = match (&self.min, &that.min) {
             (Some(a), Some(b)) => Some(std::cmp::min(a, b)),
             (Some(a), None) => Some(a),
@@ -439,14 +459,18 @@ impl<T: CoordParams> RangeInclusiveOpt<T> {
         }
     }
 
-    pub fn contains(&self, value: &T) -> bool {
+    pub fn contains<U: ?Sized>(&self, value: &U) -> bool
+    where
+        U: Ord,
+        T: Borrow<U>,
+    {
         if let Some(min) = &self.min {
-            if value < &min {
+            if value < min.borrow() {
                 return false;
             }
         }
         if let Some(max) = &self.max {
-            if value > &max {
+            if value > max.borrow() {
                 return false;
             }
         }
@@ -460,7 +484,7 @@ impl<T: CoordParams> RangeInclusiveOpt<T> {
 pub struct BBox<P: KeyParams> {
     x: RangeInclusiveOpt<P::X>,
     y: RangeInclusiveOpt<P::Y>,
-    z: RangeInclusiveOpt<P::Z>,
+    z: RangeInclusiveOpt<P::ZOwned>,
 }
 
 impl<P: KeyParams> Display for BBox<P> {
@@ -494,6 +518,8 @@ pub struct AssertInvariantsRes<S: TreeParams> {
     summary: S::M,
     /// rank of the node
     rank: u8,
+    /// Count of the node
+    count: u64,
 }
 
 impl<T: TreeParams> AssertInvariantsRes<T> {
@@ -507,6 +533,7 @@ impl<T: TreeParams> AssertInvariantsRes<T> {
             zxy_max: point.clone(),
             summary: T::M::lift(&point, &value),
             rank,
+            count: 1,
         }
     }
 
@@ -549,6 +576,7 @@ impl<T: TreeParams> AssertInvariantsRes<T> {
             };
         let rank = self.rank.max(that.rank);
         let summary = self.summary.combine(&that.summary);
+        let count = self.count + that.count;
         AssertInvariantsRes {
             xyz_min,
             xyz_max,
@@ -558,6 +586,7 @@ impl<T: TreeParams> AssertInvariantsRes<T> {
             zxy_max,
             rank,
             summary,
+            count,
         }
     }
 }
@@ -566,7 +595,7 @@ impl<P: KeyParams> BBox<P> {
     pub fn new(
         x: RangeInclusiveOpt<P::X>,
         y: RangeInclusiveOpt<P::Y>,
-        z: RangeInclusiveOpt<P::Z>,
+        z: RangeInclusiveOpt<P::ZOwned>,
     ) -> Self {
         BBox { x, y, z }
     }
@@ -604,7 +633,7 @@ impl<P: KeyParams> BBox<P> {
             SortOrder::ZXY => BBox {
                 x: self.x.clone(),
                 y: self.y.clone(),
-                z: RangeInclusiveOpt::new(self.z.min.clone(), Some(key.z().clone())),
+                z: RangeInclusiveOpt::new(self.z.min.clone(), Some(key.z().to_owned())),
             },
         }
     }
@@ -624,7 +653,7 @@ impl<P: KeyParams> BBox<P> {
             SortOrder::ZXY => BBox {
                 x: self.x.clone(),
                 y: self.y.clone(),
-                z: RangeInclusiveOpt::new(Some(key.z().clone()), self.z.max.clone()),
+                z: RangeInclusiveOpt::new(Some(key.z().to_owned()), self.z.max.clone()),
             },
         }
     }
@@ -646,47 +675,6 @@ pub trait TreeParams: KeyParams + Sized {
         + AsBytes
         + FixedSize
         + FromBytes;
-}
-
-#[inline(always)]
-fn min_key_size<P: KeyParams>() -> usize {
-    P::X::SIZE + P::Y::SIZE
-}
-
-#[inline(always)]
-fn min_data_size<P: TreeParams>() -> usize {
-    8 + 8 + 8 + P::V::SIZE + P::M::SIZE + min_key_size::<P>()
-}
-
-#[inline(always)]
-fn left_offset<P: TreeParams>() -> usize {
-    0
-}
-
-#[inline(always)]
-fn right_offset<P: TreeParams>() -> usize {
-    8
-}
-
-#[inline(always)]
-fn value_offset<P: TreeParams>() -> usize {
-    16
-}
-
-#[inline(always)]
-fn summary_offset<P: TreeParams>() -> usize {
-    16 + P::V::SIZE
-}
-
-#[inline(always)]
-fn rank_offset<P: TreeParams>() -> usize {
-    16 + P::V::SIZE + P::M::SIZE
-}
-
-#[inline(always)]
-fn key_offset<P: TreeParams>() -> usize {
-    // pad rank to 8 bytes to align key
-    16 + P::V::SIZE + P::M::SIZE + 8
 }
 
 pub trait NodeStore<P: TreeParams>: store::BlobStore {
@@ -1176,16 +1164,17 @@ impl<P: TreeParams> Node<P> {
     }
 
     /// Split an entire tree into leafs. The nodes are modified in place.
+    ///
+    /// Caution: the nodes are not persisted, so the returned vec is inconsistent
+    /// with the store. You need to persist the nodes yourself.
     fn split_all(&self, store: &mut impl NodeStore<P>, res: &mut Vec<IdAndData<P>>) -> Result<()> {
         if let Some(mut data) = store.get_node(*self)? {
             data.left().split_all(store, res)?;
             data.right().split_all(store, res)?;
             // turn the node into a leaf
-            *data.left_mut() = Node::EMPTY;
-            *data.right_mut() = Node::EMPTY;
-            *data.summary_mut() = P::M::lift(data.key(), data.value());
+            data.deref_mut().make_leaf();
             // persist (should we do this here or later?)
-            data.persist(store)?;
+            // data.persist(store)?;
             res.push(data);
         }
         Ok(())
@@ -1219,14 +1208,15 @@ impl<P: TreeParams> OwnedNodeData<P> {
 
     /// Creates a leaf data from the given key and value.
     pub fn leaf(key: &Point<P>, value: &P::V) -> Self {
-        let mut data = vec![0; key_offset::<P>() + key.size()];
-        data[key_offset::<P>()..].copy_from_slice(key.as_slice());
+        let data = vec![0; key_offset::<P>() + key.size()];
         let mut res = Self(PhantomData, data);
-        *res.value_mut() = value.clone();
-        *res.summary_mut() = P::M::lift(key, value);
-        *res.rank_mut() = key.rank();
         *res.left_mut() = Node::EMPTY; // not strictly necessary, since it's already 0
         *res.right_mut() = Node::EMPTY; // not strictly necessary, since it's already 0
+        *res.rank_mut() = key.rank();
+        *res.count_mut() = 1.into();
+        *res.value_mut() = value.clone();
+        *res.summary_mut() = P::M::lift(key, value);
+        res.1[key_offset::<P>()..].copy_from_slice(key.as_slice());
         res
     }
 }
@@ -1297,15 +1287,15 @@ impl<P: TreeParams> NodeData<P> {
     }
 
     pub fn left(&self) -> Node<P> {
-        Node::read_from_prefix(&self.1[left_offset::<P>()..]).unwrap()
+        Node::read_from_prefix(&self.1[LEFT_OFFSET..]).unwrap()
     }
 
     pub fn right(&self) -> Node<P> {
-        Node::read_from_prefix(&self.1[right_offset::<P>()..]).unwrap()
+        Node::read_from_prefix(&self.1[RIGHT_OFFSET..]).unwrap()
     }
 
     pub fn value(&self) -> &P::V {
-        P::V::ref_from_prefix(&self.1[value_offset::<P>()..]).unwrap()
+        P::V::ref_from_prefix(&self.1[VALUE_OFFSET..]).unwrap()
     }
 
     pub fn summary(&self) -> &P::M {
@@ -1313,7 +1303,13 @@ impl<P: TreeParams> NodeData<P> {
     }
 
     pub fn rank(&self) -> u8 {
-        self.1.as_ref()[rank_offset::<P>()]
+        self.1.as_ref()[RANK_OFFSET]
+    }
+
+    pub fn count(&self) -> u64 {
+        zerocopy::big_endian::U64::read_from_prefix(&self.1[COUNT_OFFSET..])
+            .unwrap()
+            .into()
     }
 
     pub fn sort_order(&self) -> SortOrder {
@@ -1323,6 +1319,13 @@ impl<P: TreeParams> NodeData<P> {
     pub fn key(&self) -> &Point<P> {
         let slice = &self.1[key_offset::<P>()..];
         Point::ref_cast(slice)
+    }
+
+    pub fn make_leaf(&mut self) {
+        *self.left_mut() = Node::EMPTY;
+        *self.right_mut() = Node::EMPTY;
+        *self.summary_mut() = P::M::lift(self.key(), self.value());
+        *self.count_mut() = 1.into();
     }
 
     fn summary0(
@@ -1362,19 +1365,24 @@ impl<P: TreeParams> NodeData<P> {
 
     fn recalculate_summary(&mut self, store: &impl NodeStore<P>) -> Result<()> {
         let mut res = P::M::neutral();
+        let mut count = 1;
         if let Some(left) = store.data_opt(self.left())? {
             res = res.combine(left.summary());
+            count += left.count();
         }
         res = res.combine(&P::M::lift(self.key(), self.value()));
         if let Some(right) = store.data_opt(self.right())? {
             res = res.combine(right.summary());
+            count += right.count();
         }
         *self.summary_mut() = res;
+        *self.count_mut() = count.into();
         Ok(())
     }
 
     fn add_summary(&mut self, value: P::V) {
         *self.summary_mut() = self.summary().combine(&P::M::lift(self.key(), &value));
+        *self.count_mut() = (self.count() + 1).into();
     }
 
     pub fn assert_invariants(
@@ -1457,16 +1465,20 @@ impl<P: TreeParams> NodeData<P> {
                 }
             }
         }
+        let mut count = 1;
         let mut res =
             AssertInvariantsRes::single(self.key().to_owned(), self.rank(), self.value().clone());
         if let Some(left) = left_res {
             res = res.combine(&left);
+            count += left.count;
         }
         if let Some(right) = right_res {
             res = res.combine(&right);
+            count += right.count;
         }
         if include_summary {
             assert_eq!(&res.summary, self.summary());
+            assert_eq!(res.count, count);
         }
         Ok(res)
     }
@@ -1509,23 +1521,27 @@ impl<P: TreeParams> NodeData<P> {
 
 impl<P: TreeParams> NodeData<P> {
     pub fn left_mut(&mut self) -> &mut Node<P> {
-        Node::mut_from_prefix(&mut self.1[left_offset::<P>()..]).unwrap()
+        Node::mut_from_prefix(&mut self.1[LEFT_OFFSET..]).unwrap()
     }
 
     pub fn right_mut(&mut self) -> &mut Node<P> {
-        Node::mut_from_prefix(&mut self.1[right_offset::<P>()..]).unwrap()
+        Node::mut_from_prefix(&mut self.1[RIGHT_OFFSET..]).unwrap()
     }
 
     pub fn summary_mut(&mut self) -> &mut P::M {
         P::M::mut_from_prefix(&mut self.1[summary_offset::<P>()..]).unwrap()
     }
 
+    pub fn count_mut(&mut self) -> &mut zerocopy::big_endian::U64 {
+        zerocopy::big_endian::U64::mut_from_prefix(&mut self.1[COUNT_OFFSET..]).unwrap()
+    }
+
     pub fn value_mut(&mut self) -> &mut P::V {
-        P::V::mut_from_prefix(&mut self.1[value_offset::<P>()..]).unwrap()
+        P::V::mut_from_prefix(&mut self.1[VALUE_OFFSET..]).unwrap()
     }
 
     pub fn rank_mut(&mut self) -> &mut u8 {
-        &mut self.1.as_mut()[rank_offset::<P>()]
+        &mut self.1.as_mut()[RANK_OFFSET]
     }
 
     // fn recalculate_summary(&mut self, store: &impl StoreExt<P>) -> Result<()>
@@ -1629,6 +1645,7 @@ impl<P: TreeParams> IdAndData<P> {
             }
         }
         *self.summary_mut() = self.summary().combine(node.summary());
+        *self.count_mut() = (self.count() + node.count()).into();
         self.persist(store)?;
         Ok(())
     }

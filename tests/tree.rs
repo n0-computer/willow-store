@@ -10,7 +10,7 @@ use test_strategy::proptest;
 use testresult::TestResult;
 use willow_store::{
     FixedSize, KeyParams, LiftingCommutativeMonoid, MemStore, NodeStore, OwnedNodeData, OwnedPoint,
-    Point, QueryRange, QueryRange3d, SortOrder, TreeParams, VariableSize,
+    Point, QueryRange, QueryRange3d, SortOrder, TreeParams,
 };
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
@@ -24,6 +24,17 @@ impl KeyParams for TestParams {
     type X = u64;
     type Y = u64;
     type Z = u64;
+    type ZOwned = u64;
+}
+
+#[derive(Debug)]
+struct TestParams2;
+
+impl KeyParams for TestParams2 {
+    type X = u64;
+    type Y = u64;
+    type Z = [u8];
+    type ZOwned = Vec<u8>;
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, AsBytes, FromZeroes, FromBytes, Clone, Copy)]
