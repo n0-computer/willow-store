@@ -117,6 +117,7 @@ mod layout;
 use layout::*;
 pub use store::BlobStore;
 pub use store::MemStore;
+use tracing::info;
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
 pub trait FixedSize {
@@ -224,8 +225,8 @@ pub struct QueryRange<T> {
 impl<T: Display> Display for QueryRange<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.max {
-            Some(max) => write!(f, "[{}, {})", self.min, max),
-            None => write!(f, "[{}, ∞)", self.min),
+            Some(max) => write!(f, "{}..{}", self.min, max),
+            None => write!(f, "{}..", self.min),
         }
     }
 }
@@ -276,6 +277,42 @@ impl<T: Ord> QueryRange<T> {
         }
         true
     }
+
+    pub fn left(&self, key: &T) -> QueryRange<T>
+    where
+        T: Clone,
+    {
+        if &self.min < key {
+            let min = self.min.clone();
+            if let Some(max) = &self.max {
+                let max = std::cmp::min(max, key).clone();
+                QueryRange::new(min, Some(max))
+            } else {
+                QueryRange::new(min, Some(key.clone()))
+            }
+        } else {
+            // empty range
+            QueryRange::new(key.clone(), Some(key.clone()))
+        }
+    }
+
+    pub fn right(&self, key: &T) -> QueryRange<T>
+    where
+        T: Clone,
+    {
+        if let Some(max) = &self.max {
+            if max > key {
+                let min = std::cmp::max(&self.min, key).clone();
+                QueryRange::new(min, Some(max.clone()))
+            } else {
+                // empty range
+                QueryRange::new(key.clone(), Some(key.clone()))
+            }
+        } else {
+            let min = std::cmp::max(&self.min, key).clone();
+            QueryRange::new(min, None)
+        }
+    }
 }
 
 pub struct QueryRange3d<P: KeyParams> {
@@ -297,6 +334,24 @@ impl<P: KeyParams> Debug for QueryRange3d<P> {
             .field("y", &self.y)
             .field("z", &self.z)
             .finish()
+    }
+}
+
+struct DD<T>(T);
+
+impl<T: Display> Debug for DD<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl<P: KeyParams> Clone for QueryRange3d<P> {
+    fn clone(&self) -> Self {
+        QueryRange3d {
+            x: self.x.clone(),
+            y: self.y.clone(),
+            z: self.z.clone(),
+        }
     }
 }
 
@@ -338,6 +393,55 @@ impl<P: KeyParams> QueryRange3d<P> {
                 .map(|z_max| z_max.borrow() < &key.z())
                 .unwrap_or_default(),
         }
+    }
+
+    pub fn split_left(&self, key: &Point<P>, rank: u8) -> Self {
+        match SortOrder::from(rank) {
+            SortOrder::XYZ => Self {
+                x: self.x.left(key.x()),
+                y: self.y.clone(),
+                z: self.z.clone(),
+            },
+            SortOrder::YZX => Self {
+                x: self.x.clone(),
+                y: self.y.left(key.y()),
+                z: self.z.clone(),
+            },
+            SortOrder::ZXY => Self {
+                x: self.x.clone(),
+                y: self.y.clone(),
+                z: self.z.left(&key.z().to_owned()),
+            },
+        }
+    }
+
+    pub fn split_right(&self, key: &Point<P>, rank: u8) -> Self {
+        match SortOrder::from(rank) {
+            SortOrder::XYZ => Self {
+                x: self.x.right(key.x()),
+                y: self.y.clone(),
+                z: self.z.clone(),
+            },
+            SortOrder::YZX => Self {
+                x: self.x.clone(),
+                y: self.y.right(key.y()),
+                z: self.z.clone(),
+            },
+            SortOrder::ZXY => Self {
+                x: self.x.clone(),
+                y: self.y.clone(),
+                z: self.z.right(&key.z().to_owned()),
+            },
+        }
+    }
+
+    pub fn pretty(&self) -> String
+    where
+        P::X: Display,
+        P::Y: Display,
+        P::ZOwned: Display,
+    {
+        format!("(x:{}, y:{}, z:{})", self.x, self.y, self.z)
     }
 }
 
@@ -485,6 +589,16 @@ pub struct BBox<P: KeyParams> {
     x: RangeInclusiveOpt<P::X>,
     y: RangeInclusiveOpt<P::Y>,
     z: RangeInclusiveOpt<P::ZOwned>,
+}
+
+impl<P: KeyParams> Clone for BBox<P> {
+    fn clone(&self) -> Self {
+        BBox {
+            x: self.x.clone(),
+            y: self.y.clone(),
+            z: self.z.clone(),
+        }
+    }
 }
 
 impl<P: KeyParams> Display for BBox<P> {
@@ -659,6 +773,16 @@ impl<P: KeyParams> BBox<P> {
     }
 }
 
+pub trait LowerBound {
+    fn min_value() -> Self;
+}
+
+impl LowerBound for u64 {
+    fn min_value() -> Self {
+        0
+    }
+}
+
 ///
 pub trait ValueParams: PartialEq + Eq + Clone + Debug + FixedSize + AsBytes + FromBytes {}
 
@@ -729,6 +853,31 @@ pub trait NodeStore<P: TreeParams>: store::BlobStore {
 }
 
 impl<T: store::BlobStore, P: TreeParams> NodeStore<P> for T {}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SplitOpts {
+    /// Up to how many values to send immediately, before sending only a fingerprint.
+    pub max_set_size: usize,
+    /// `k` in the protocol, how many splits to generate. at least 2
+    pub split_factor: usize,
+}
+
+impl Default for SplitOpts {
+    fn default() -> Self {
+        SplitOpts {
+            max_set_size: 1,
+            split_factor: 2,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum SplitAction<P: TreeParams> {
+    SendFingerprint(P::M),
+    SendEntries(u64),
+}
+
+pub type RangeSplit<P> = (QueryRange3d<P>, SplitAction<P>);
 
 #[repr(transparent)]
 #[derive(AsBytes, FromZeroes, FromBytes)]
@@ -938,7 +1087,6 @@ impl<P: TreeParams> Node<P> {
 
     fn dump0(&self, prefix: String, store: &impl NodeStore<P>) -> Result<()> {
         if let Some(data) = store.data_opt(*self)? {
-            println!("{} left:", prefix);
             data.left().dump0(format!("{}  ", prefix), store)?;
             println!(
                 "{}{:?} rank={} order={:?} value={:?} summary={:?}",
@@ -949,7 +1097,6 @@ impl<P: TreeParams> Node<P> {
                 data.value(),
                 data.summary(),
             );
-            println!("{} right:", prefix);
             data.right().dump0(format!("{}  ", prefix), store)?;
         } else {
             println!("{}Empty", prefix);
@@ -1048,6 +1195,134 @@ impl<P: TreeParams> Node<P> {
         } else {
             Ok(P::M::neutral())
         }
+    }
+
+    /// Count the number of elements in a 3d range.
+    pub fn count_range(&self, query: &QueryRange3d<P>, store: &impl NodeStore<P>) -> Result<u64> {
+        let bbox = BBox::all();
+        self.count_range0(query, &bbox, store)
+    }
+
+    fn count_range0(
+        &self,
+        query: &QueryRange3d<P>,
+        bbox: &BBox<P>,
+        store: &impl NodeStore<P>,
+    ) -> Result<u64> {
+        Ok(if let Some(data) = store.data_opt(*self)? {
+            let mut count = 0;
+            if query.contains(data.key()) {
+                count += 1;
+            }
+            if query.overlaps_left(data.key(), data.rank()) {
+                count += data.left().count_range0(
+                    query,
+                    &bbox.split_left(data.key(), data.rank()),
+                    store,
+                )?;
+            }
+            if query.overlaps_right(data.key(), data.rank()) {
+                count += data.right().count_range0(
+                    query,
+                    &bbox.split_right(data.key(), data.rank()),
+                    store,
+                )?;
+            }
+            count
+        } else {
+            0
+        })
+    }
+
+    pub fn split_range<'a>(
+        &'a self,
+        query: QueryRange3d<P>,
+        split_factor: u64,
+        store: &'a impl NodeStore<P>,
+    ) -> impl Iterator<Item = Result<(QueryRange3d<P>, u64)>> + 'a
+    where
+        P::X: Display,
+        P::Y: Display,
+        P::ZOwned: Display,
+    {
+        Gen::new(|co| async move {
+            if let Err(cause) = self
+                .split_range0(*self, query, split_factor, &co, store)
+                .await
+            {
+                co.yield_(Err(cause)).await;
+            }
+        })
+        .into_iter()
+    }
+
+    async fn split_range0<'a>(
+        &'a self,
+        root: Node<P>,
+        query: QueryRange3d<P>,
+        split_factor: u64,
+        co: &'a Co<Result<(QueryRange3d<P>, u64)>>,
+        store: &'a impl NodeStore<P>,
+    ) -> Result<()>
+    where
+        P::X: Display,
+        P::Y: Display,
+        P::ZOwned: Display,
+    {
+        if let Some(data) = store.data_opt(*self)? {
+            if !data.is_leaf() {
+                let left = query.split_left(data.key(), data.rank());
+                let right = query.split_right(data.key(), data.rank());
+                // println!("splitting\n{} into\n{}\nand\n{}\nin\n{:?}", query.pretty(), left.pretty(), right.pretty(), data.sort_order());
+                let left_count = root.count_range(&left, store)?;
+                let right_count = root.count_range(&right, store)?;
+                let total_count = left_count + right_count;
+                if total_count == 0 {
+                    return Ok(());
+                }
+                if split_factor == 1 {
+                    co.yield_(Ok((query.clone(), total_count))).await;
+                    return Ok(());
+                }
+                let (left_factor, right_factor) = if left_count == 0 {
+                    // just go right
+                    (0, split_factor)
+                } else if right_count == 0 {
+                    // just go left
+                    (split_factor, 0)
+                } else {
+                    // split in proportion to the number of elements, making sure that
+                    // both sides get at least one element
+                    let left_factor = ((left_count * split_factor) / total_count).max(1);
+                    let right_factor = split_factor - left_factor;
+                    (left_factor, right_factor)
+                };
+                if left_factor > 0 {
+                    let left_query = query.split_left(data.key(), data.rank());
+                    Box::pin(
+                        data.left()
+                            .split_range0(root, left_query, left_factor, co, store),
+                    )
+                    .await?;
+                }
+                if right_factor > 0 {
+                    let right_query = query.split_right(data.key(), data.rank());
+                    Box::pin(
+                        data.right()
+                            .split_range0(root, right_query, right_factor, co, store),
+                    )
+                    .await?;
+                }
+                return Ok(());
+            }
+        }
+        // this is not necessarily 1, since we could have points from "above" that
+        // are inside the query range
+        let total_count = root.count_range(&query, store)?;
+        if total_count > 0 {
+            co.yield_(Ok((query.clone(), total_count))).await;
+        }
+        Ok(())
     }
 
     /// Query a 3d range in the tree in its natural order.

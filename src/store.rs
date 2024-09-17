@@ -44,6 +44,10 @@ impl MemStore {
             nodes: BTreeMap::new(),
         }
     }
+
+    pub fn size(&self) -> usize {
+        self.nodes.len()
+    }
 }
 
 impl BlobStore for MemStore {
