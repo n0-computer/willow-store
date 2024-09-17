@@ -338,6 +338,24 @@ fn tree_count_range_impl(items: Vec<(TPoint, u64)>, query: TQuery) -> TestResult
     Ok(())
 }
 
+fn tree_find_split_plane_impl(items: Vec<(TPoint, u64)>, query: TQuery) -> TestResult<()> {
+    let mut store = MemStore::new();
+    let tree = willow_store::Node::from_iter(items.clone(), &mut store)?;
+    let total_count = tree.count_range(&query, &store)?;
+    let Some((left_node, left, left_count, right_node, right, right_count)) =
+        tree.find_split_plane(&query, &store)?
+    else {
+        assert!(total_count <= 1);
+        return Ok(());
+    };
+    assert_eq!(left_count + right_count, total_count);
+    assert_eq!(left_count, tree.count_range(&left, &store)?);
+    assert_eq!(right_count, tree.count_range(&right, &store)?);
+    assert_eq!(left_count, left_node.count_range(&left, &store)?);
+    assert_eq!(right_count, right_node.count_range(&right, &store)?);
+    Ok(())
+}
+
 fn tree_split_impl(items: Vec<(TPoint, u64)>, query: TQuery) -> TestResult<()> {
     // println!("Query: {}", query.pretty());
     let mut store = MemStore::new();
@@ -345,10 +363,17 @@ fn tree_split_impl(items: Vec<(TPoint, u64)>, query: TQuery) -> TestResult<()> {
     let total_count = tree.count_range(&query, &store)?;
     // println!("total count: {}", total_count);
     let ranges = tree
-        .split_range(query.clone(), 4, &store)
+        .split_range(query.clone(), 3, &store)
         .collect::<Vec<_>>();
     let ranges = ranges.into_iter().map(|x| x.unwrap()).collect::<Vec<_>>();
     // tree.dump(&store)?;
+    if total_count == 0 {
+        assert_eq!(ranges.len(), 0);
+        return Ok(());
+    }
+    if total_count > 1 {
+        assert!(ranges.len() > 1);
+    }
     println!("Ranges:");
     for (range, count) in ranges.iter() {
         println!("{} {}", range.pretty(), count);
@@ -487,6 +512,14 @@ fn prop_tree_split_range(
     tree_split_impl(items, query).unwrap();
 }
 
+#[proptest]
+fn prop_tree_find_split_plane(
+    #[strategy(flattreecontents())] items: Vec<(TPoint, u64)>,
+    #[strategy(flatquery())] query: TQuery,
+) {
+    tree_find_split_plane_impl(items, query).unwrap();
+}
+
 #[test]
 fn test_tree_split_range() -> TestResult<()> {
     /*
@@ -494,7 +527,7 @@ fn test_tree_split_range() -> TestResult<()> {
         items: [
             (
                 (
-                    0,
+                    3,
                     0,
                     0,
                 ),
@@ -502,8 +535,24 @@ fn test_tree_split_range() -> TestResult<()> {
             ),
             (
                 (
-                    9,
-                    1,
+                    0,
+                    6,
+                    0,
+                ),
+                0,
+            ),
+            (
+                (
+                    0,
+                    7,
+                    0,
+                ),
+                0,
+            ),
+            (
+                (
+                    5,
+                    0,
                     0,
                 ),
                 0,
@@ -511,15 +560,15 @@ fn test_tree_split_range() -> TestResult<()> {
         ],
         query: QueryRange3d {
             x: QueryRange {
-                min: 7,
+                min: 0,
                 max: Some(
-                    10,
+                    1,
                 ),
             },
             y: QueryRange {
-                min: 0,
+                min: 5,
                 max: Some(
-                    2,
+                    8,
                 ),
             },
             z: QueryRange {
@@ -531,8 +580,7 @@ fn test_tree_split_range() -> TestResult<()> {
         },
     }
 
-
-     */
+         */
     let cases = vec![
         // (
         //     vec![
@@ -592,11 +640,24 @@ fn test_tree_split_range() -> TestResult<()> {
         //         QueryRange::new(0, Some(1)),
         //     ),
         // ),
+        // (
+        //     vec![(tpoint(0, 0, 0), 0), (tpoint(9, 1, 0), 0)],
+        //     TQuery::new(
+        //         QueryRange::new(7, Some(10)),
+        //         QueryRange::new(0, Some(2)),
+        //         QueryRange::new(0, Some(1)),
+        //     ),
+        // ),
         (
-            vec![(tpoint(0, 0, 0), 0), (tpoint(9, 1, 0), 0)],
+            vec![
+                (tpoint(3, 0, 0), 0),
+                (tpoint(0, 6, 0), 0),
+                (tpoint(0, 7, 0), 0),
+                (tpoint(5, 0, 0), 0),
+            ],
             TQuery::new(
-                QueryRange::new(7, Some(10)),
-                QueryRange::new(0, Some(2)),
+                QueryRange::new(0, Some(1)),
+                QueryRange::new(5, Some(8)),
                 QueryRange::new(0, Some(1)),
             ),
         ),

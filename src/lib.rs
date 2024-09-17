@@ -395,8 +395,8 @@ impl<P: KeyParams> QueryRange3d<P> {
         }
     }
 
-    pub fn split_left(&self, key: &Point<P>, rank: u8) -> Self {
-        match SortOrder::from(rank) {
+    pub fn left(&self, key: &Point<P>, order: SortOrder) -> Self {
+        match order {
             SortOrder::XYZ => Self {
                 x: self.x.left(key.x()),
                 y: self.y.clone(),
@@ -415,8 +415,8 @@ impl<P: KeyParams> QueryRange3d<P> {
         }
     }
 
-    pub fn split_right(&self, key: &Point<P>, rank: u8) -> Self {
-        match SortOrder::from(rank) {
+    pub fn right(&self, key: &Point<P>, order: SortOrder) -> Self {
+        match order {
             SortOrder::XYZ => Self {
                 x: self.x.right(key.x()),
                 y: self.y.clone(),
@@ -1200,37 +1200,48 @@ impl<P: TreeParams> Node<P> {
     /// Count the number of elements in a 3d range.
     pub fn count_range(&self, query: &QueryRange3d<P>, store: &impl NodeStore<P>) -> Result<u64> {
         let bbox = BBox::all();
-        self.count_range0(query, &bbox, store)
+        self.count_range_rec(query, &bbox, store)
     }
 
-    fn count_range0(
+    fn count_range_rec(
         &self,
         query: &QueryRange3d<P>,
         bbox: &BBox<P>,
         store: &impl NodeStore<P>,
     ) -> Result<u64> {
+        let (lc, sc, rc) = self.count_range_parts(query, bbox, store)?;
+        Ok(lc + sc + rc)
+    }
+
+    fn count_range_parts(
+        &self,
+        query: &QueryRange3d<P>,
+        bbox: &BBox<P>,
+        store: &impl NodeStore<P>,
+    ) -> Result<(u64, u64, u64)> {
         Ok(if let Some(data) = store.data_opt(*self)? {
-            let mut count = 0;
-            if query.contains(data.key()) {
-                count += 1;
-            }
-            if query.overlaps_left(data.key(), data.rank()) {
-                count += data.left().count_range0(
+            let sc = if query.contains(data.key()) { 1 } else { 0 };
+            let lc = if query.overlaps_left(data.key(), data.rank()) {
+                data.left().count_range_rec(
                     query,
                     &bbox.split_left(data.key(), data.rank()),
                     store,
-                )?;
-            }
-            if query.overlaps_right(data.key(), data.rank()) {
-                count += data.right().count_range0(
+                )?
+            } else {
+                0
+            };
+            let rc = if query.overlaps_right(data.key(), data.rank()) {
+                data.right().count_range_rec(
                     query,
                     &bbox.split_right(data.key(), data.rank()),
                     store,
-                )?;
-            }
-            count
+                )?
+            } else {
+                0
+            };
+            (lc, sc, rc)
         } else {
-            0
+            (0, 0, 0)
         })
     }
 
@@ -1246,8 +1257,11 @@ impl<P: TreeParams> Node<P> {
         P::ZOwned: Display,
     {
         Gen::new(|co| async move {
+            let Ok(total_count) = self.count_range(&query, store) else {
+                return;
+            };
             if let Err(cause) = self
-                .split_range0(*self, query, split_factor, &co, store)
+                .split_range2(query, total_count, split_factor, &co, store)
                 .await
             {
                 co.yield_(Err(cause)).await;
@@ -1256,10 +1270,86 @@ impl<P: TreeParams> Node<P> {
         .into_iter()
     }
 
+    pub fn find_split_plane(
+        &self,
+        query: &QueryRange3d<P>,
+        store: &impl NodeStore<P>,
+    ) -> Result<Option<(Node<P>, QueryRange3d<P>, u64, Node<P>, QueryRange3d<P>, u64)>> {
+        let total_count = self.count_range(query, store)?;
+        self.find_split_plane0(*self, query, total_count, store)
+    }
+
+    fn find_split_plane0(
+        &self,
+        root: Node<P>,
+        query: &QueryRange3d<P>,
+        total_count: u64,
+        store: &impl NodeStore<P>,
+    ) -> Result<Option<(Node<P>, QueryRange3d<P>, u64, Node<P>, QueryRange3d<P>, u64)>> {
+        if total_count <= 1 {
+            return Ok(None);
+        }
+        if let Some(data) = store.data_opt(*self)? {
+            let o = data.sort_order();
+            for sort_order in [o, o.inc(), o.inc().inc()] {
+                let left = query.left(data.key(), sort_order);
+                let left_count = root.count_range(&left, store)?;
+                if left_count < total_count && left_count > 0 {
+                    let right_count = total_count - left_count;
+                    let right = query.right(data.key(), sort_order);
+                    return Ok(Some((root, left, left_count, root, right, right_count)));
+                }
+            }
+            if let Some(res) = data
+                .left()
+                .find_split_plane0(root, query, total_count, store)?
+            {
+                return Ok(Some(res));
+            }
+            if let Some(res) = data
+                .right()
+                .find_split_plane0(root, query, total_count, store)?
+            {
+                return Ok(Some(res));
+            }
+            return Ok(None);
+        } else {
+            return Ok(None);
+        }
+    }
+
+    async fn split_range2<'a>(
+        &'a self,
+        query: QueryRange3d<P>,
+        total_count: u64,
+        split_factor: u64,
+        co: &'a Co<Result<(QueryRange3d<P>, u64)>>,
+        store: &'a impl NodeStore<P>,
+    ) -> Result<()> {
+        if total_count == 0 {
+            // nothing to split
+            return Ok(());
+        }
+        if split_factor == 1 || total_count == 1 {
+            // just send the whole thing
+            co.yield_(Ok((query, total_count))).await;
+            return Ok(());
+        }
+        let (left_node, left, left_count, right_node, right, right_count) = self
+            .find_split_plane(&query, store)?
+            .expect("must find split plane");
+        let left_factor = ((left_count * split_factor) / total_count).max(1);
+        let right_factor = split_factor - left_factor;
+        Box::pin(left_node.split_range2(left, left_count, left_factor, co, store)).await?;
+        Box::pin(right_node.split_range2(right, right_count, right_factor, co, store)).await?;
+        Ok(())
+    }
+
     async fn split_range0<'a>(
         &'a self,
         root: Node<P>,
         query: QueryRange3d<P>,
+        total_count: u64,
         split_factor: u64,
         co: &'a Co<Result<(QueryRange3d<P>, u64)>>,
         store: &'a impl NodeStore<P>,
@@ -1269,58 +1359,86 @@ impl<P: TreeParams> Node<P> {
         P::Y: Display,
         P::ZOwned: Display,
     {
+        if total_count == 0 {
+            return Ok(());
+        }
+        if total_count == 1 || split_factor == 1 {
+            co.yield_(Ok((query.clone(), total_count))).await;
+            return Ok(());
+        }
         if let Some(data) = store.data_opt(*self)? {
-            if !data.is_leaf() {
-                let left = query.split_left(data.key(), data.rank());
-                let right = query.split_right(data.key(), data.rank());
-                // println!("splitting\n{} into\n{}\nand\n{}\nin\n{:?}", query.pretty(), left.pretty(), right.pretty(), data.sort_order());
-                let left_count = root.count_range(&left, store)?;
-                let right_count = root.count_range(&right, store)?;
-                let total_count = left_count + right_count;
-                if total_count == 0 {
-                    return Ok(());
-                }
-                if split_factor == 1 {
-                    co.yield_(Ok((query.clone(), total_count))).await;
-                    return Ok(());
-                }
-                let (left_factor, right_factor) = if left_count == 0 {
-                    // just go right
-                    (0, split_factor)
-                } else if right_count == 0 {
-                    // just go left
-                    (split_factor, 0)
-                } else {
-                    // split in proportion to the number of elements, making sure that
-                    // both sides get at least one element
-                    let left_factor = ((left_count * split_factor) / total_count).max(1);
-                    let right_factor = split_factor - left_factor;
-                    (left_factor, right_factor)
-                };
-                if left_factor > 0 {
-                    let left_query = query.split_left(data.key(), data.rank());
-                    Box::pin(
-                        data.left()
-                            .split_range0(root, left_query, left_factor, co, store),
-                    )
-                    .await?;
-                }
-                if right_factor > 0 {
-                    let right_query = query.split_right(data.key(), data.rank());
-                    Box::pin(
-                        data.right()
-                            .split_range0(root, right_query, right_factor, co, store),
-                    )
-                    .await?;
-                }
+            // let ((n1, q1, c1), (n2, q2, c2)) = root.find_split(total_count, &data, &query, store)?;
+            // let (f1, f2) = if c1 == 0 {
+            //     // just go right
+            //     (0, split_factor)
+            // } else if c2 == 0 {
+            //     // just go left
+            //     (split_factor, 0)
+            // } else {
+            //     // split in proportion to the number of elements, making sure that
+            //     // both sides get at least one element
+            //     assert!(c1 + c2 == total_count);
+            //     assert!(total_count >= 2);
+            //     assert!(split_factor >= 2);
+            //     let f1 = ((c1 * split_factor) / total_count).max(1);
+            //     let f2 = split_factor - f1;
+            //     (f1, f2)
+            // };
+            // if c1 > 0 {
+            //     Box::pin(n1.split_range0(root, q1, c1, f1, co, store)).await?;
+            // }
+            // if c2 > 0 {
+            //     Box::pin(n2.split_range0(root, q2, c2, f2, co, store)).await?;
+            // }
+            // return Ok(());
+            let sort_order = data.sort_order();
+            let left = query.left(data.key(), sort_order);
+            let right = query.right(data.key(), sort_order);
+            // println!("splitting\n{} into\n{}\nand\n{}\nin\n{:?}", query.pretty(), left.pretty(), right.pretty(), data.sort_order());
+            let left_count = root.count_range(&left, store)?;
+            let right_count = total_count - left_count;
+            if split_factor == 1 {
+                co.yield_(Ok((query.clone(), total_count))).await;
                 return Ok(());
             }
-        }
-        // this is not necessarily 1, since we could have points from "above" that
-        // are inside the query range
-        let total_count = root.count_range(&query, store)?;
-        if total_count > 0 {
-            co.yield_(Ok((query.clone(), total_count))).await;
+            let (left_factor, right_factor) = if left_count == 0 {
+                // just go right
+                (0, split_factor)
+            } else if right_count == 0 {
+                // just go left
+                (split_factor, 0)
+            } else {
+                // split in proportion to the number of elements, making sure that
+                // both sides get at least one element
+                let left_factor = ((left_count * split_factor) / total_count).max(1);
+                let right_factor = split_factor - left_factor;
+                (left_factor, right_factor)
+            };
+            if left_factor > 0 {
+                Box::pin(
+                    data.left()
+                        .split_range0(root, left, left_count, left_factor, co, store),
+                )
+                .await?;
+            }
+            if right_factor > 0 {
+                Box::pin(data.right().split_range0(
+                    root,
+                    right,
+                    right_count,
+                    right_factor,
+                    co,
+                    store,
+                ))
+                .await?;
+            }
+        } else {
+            // this is not necessarily 1, since we could have points from "above" that
+            // are inside the query range
+            let total_count = root.count_range(&query, store)?;
+            if total_count > 0 {
+                co.yield_(Ok((query.clone(), total_count))).await;
+            }
         }
         Ok(())
     }
@@ -2027,6 +2145,16 @@ impl From<u8> for SortOrder {
             1 => SortOrder::YZX,
             0 => SortOrder::ZXY,
             _ => unreachable!(),
+        }
+    }
+}
+
+impl SortOrder {
+    fn inc(self) -> Self {
+        match self {
+            SortOrder::XYZ => SortOrder::YZX,
+            SortOrder::YZX => SortOrder::ZXY,
+            SortOrder::ZXY => SortOrder::XYZ,
         }
     }
 }
