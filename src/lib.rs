@@ -107,17 +107,17 @@ use std::{
 
 use anyhow::Result;
 use genawaiter::sync::{Co, Gen};
-pub use point::Point;
+pub use point::PointRef;
 
 mod point;
-pub use point::OwnedPoint;
+pub use point::Point;
 mod store;
 use ref_cast::RefCast;
 mod layout;
+mod path;
 use layout::*;
 pub use store::BlobStore;
 pub use store::MemStore;
-use tracing::info;
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
 pub trait FixedSize {
@@ -189,16 +189,17 @@ impl RefFromSlice for u64 {
 }
 
 pub trait KeyParams {
-    type X: Ord + Debug + AsBytes + FromBytes + FixedSize + Clone;
-    type Y: Ord + Debug + AsBytes + FromBytes + FixedSize + Clone;
+    type X: Ord + Debug + Display + AsBytes + FromBytes + FixedSize + Clone;
+    type Y: Ord + Debug + Display + AsBytes + FromBytes + FixedSize + Clone;
     type Z: Ord
         + Debug
+        + Display
         + AsBytes
         + VariableSize
         + ToOwned<Owned = Self::ZOwned>
-        + ?Sized
-        + RefFromSlice;
-    type ZOwned: Debug + Borrow<Self::Z> + Ord + Clone;
+        + RefFromSlice
+        + ?Sized;
+    type ZOwned: Debug + Display + Borrow<Self::Z> + Ord + Clone;
 }
 
 pub trait LiftingCommutativeMonoid<K: ?Sized, V> {
@@ -252,6 +253,16 @@ impl<T: Display> Display for QueryRange<T> {
 impl<T: Ord> QueryRange<T> {
     pub fn new(min: T, max: Option<T>) -> Self {
         Self { min, max }
+    }
+
+    pub fn all() -> Self
+    where
+        T: LowerBound,
+    {
+        Self {
+            min: T::min_value(),
+            max: None,
+        }
     }
 
     pub fn contains<U: Ord + ?Sized>(&self, value: &U) -> bool
@@ -348,10 +359,18 @@ impl<P: KeyParams> Display for QueryRange3d<P> {
 impl<P: KeyParams> Debug for QueryRange3d<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QueryRange3d")
-            .field("x", &self.x)
-            .field("y", &self.y)
-            .field("z", &self.z)
+            .field("x", &DD(&self.x))
+            .field("y", &DD(&self.y))
+            .field("z", &DD(&self.z))
             .finish()
+    }
+}
+
+struct NoQuotes<'a>(&'a str);
+
+impl<'a> Debug for NoQuotes<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
@@ -378,11 +397,24 @@ impl<P: KeyParams> QueryRange3d<P> {
         Self { x, y, z }
     }
 
-    pub fn contains(&self, point: &Point<P>) -> bool {
+    pub fn all() -> Self
+    where
+        P::X: LowerBound,
+        P::Y: LowerBound,
+        P::ZOwned: LowerBound,
+    {
+        Self {
+            x: QueryRange::all(),
+            y: QueryRange::all(),
+            z: QueryRange::all(),
+        }
+    }
+
+    pub fn contains(&self, point: &PointRef<P>) -> bool {
         self.x.contains(point.x()) && self.y.contains(point.y()) && self.z.contains(point.z())
     }
 
-    pub fn overlaps_left(&self, key: &Point<P>, rank: u8) -> bool {
+    pub fn overlaps_left(&self, key: &PointRef<P>, rank: u8) -> bool {
         match SortOrder::from(rank) {
             SortOrder::XYZ => &self.x.min <= key.x(),
             SortOrder::YZX => &self.y.min <= key.y(),
@@ -390,7 +422,7 @@ impl<P: KeyParams> QueryRange3d<P> {
         }
     }
 
-    pub fn overlaps_right(&self, key: &Point<P>, rank: u8) -> bool {
+    pub fn overlaps_right(&self, key: &PointRef<P>, rank: u8) -> bool {
         match SortOrder::from(rank) {
             SortOrder::XYZ => !self
                 .x
@@ -413,7 +445,7 @@ impl<P: KeyParams> QueryRange3d<P> {
         }
     }
 
-    pub fn left(&self, key: &Point<P>, order: SortOrder) -> Self {
+    pub fn left(&self, key: &PointRef<P>, order: SortOrder) -> Self {
         match order {
             SortOrder::XYZ => Self {
                 x: self.x.left(key.x()),
@@ -433,7 +465,7 @@ impl<P: KeyParams> QueryRange3d<P> {
         }
     }
 
-    pub fn right(&self, key: &Point<P>, order: SortOrder) -> Self {
+    pub fn right(&self, key: &PointRef<P>, order: SortOrder) -> Self {
         match order {
             SortOrder::XYZ => Self {
                 x: self.x.right(key.x()),
@@ -638,14 +670,14 @@ impl<P: KeyParams> Debug for BBox<P> {
 /// Result of asserting invariants for a node.
 pub struct AssertInvariantsRes<S: TreeParams> {
     /// min and max in xyz order
-    xyz_min: OwnedPoint<S>,
-    xyz_max: OwnedPoint<S>,
+    xyz_min: Point<S>,
+    xyz_max: Point<S>,
     /// min and max in yzx order
-    yzx_min: OwnedPoint<S>,
-    yzx_max: OwnedPoint<S>,
+    yzx_min: Point<S>,
+    yzx_max: Point<S>,
     /// min and max in zxy order
-    zxy_min: OwnedPoint<S>,
-    zxy_max: OwnedPoint<S>,
+    zxy_min: Point<S>,
+    zxy_max: Point<S>,
     /// summary of the node
     summary: S::M,
     /// rank of the node
@@ -655,7 +687,7 @@ pub struct AssertInvariantsRes<S: TreeParams> {
 }
 
 impl<T: TreeParams> AssertInvariantsRes<T> {
-    pub fn single(point: OwnedPoint<T>, rank: u8, value: T::V) -> Self {
+    pub fn single(point: Point<T>, rank: u8, value: T::V) -> Self {
         AssertInvariantsRes {
             xyz_min: point.clone(),
             xyz_max: point.clone(),
@@ -740,7 +772,7 @@ impl<P: KeyParams> BBox<P> {
         }
     }
 
-    pub fn contains(&self, point: &Point<P>) -> bool {
+    pub fn contains(&self, point: &PointRef<P>) -> bool {
         self.x.contains(point.x()) && self.y.contains(point.y()) && self.z.contains(point.z())
     }
 
@@ -750,7 +782,7 @@ impl<P: KeyParams> BBox<P> {
             && query.z.contains_range_inclusive_opt(&self.z)
     }
 
-    pub fn split_left(&self, key: &Point<P>, rank: u8) -> BBox<P> {
+    pub fn split_left(&self, key: &PointRef<P>, rank: u8) -> BBox<P> {
         match SortOrder::from(rank) {
             SortOrder::XYZ => BBox {
                 x: RangeInclusiveOpt::new(self.x.min.clone(), Some(key.x().clone())),
@@ -770,7 +802,7 @@ impl<P: KeyParams> BBox<P> {
         }
     }
 
-    pub fn split_right(&self, key: &Point<P>, rank: u8) -> BBox<P> {
+    pub fn split_right(&self, key: &PointRef<P>, rank: u8) -> BBox<P> {
         match SortOrder::from(rank) {
             SortOrder::XYZ => BBox {
                 x: RangeInclusiveOpt::new(Some(key.x().clone()), self.x.max.clone()),
@@ -793,11 +825,17 @@ impl<P: KeyParams> BBox<P> {
 
 pub trait LowerBound {
     fn min_value() -> Self;
+
+    fn is_min_value(&self) -> bool;
 }
 
 impl LowerBound for u64 {
     fn min_value() -> Self {
         0
+    }
+
+    fn is_min_value(&self) -> bool {
+        *self == 0
     }
 }
 
@@ -810,7 +848,7 @@ impl<T: PartialEq + Eq + Clone + Debug + FixedSize + AsBytes + FromBytes> ValueP
 /// summary type.
 pub trait TreeParams: KeyParams + Sized {
     type V: ValueParams;
-    type M: LiftingCommutativeMonoid<Point<Self>, Self::V>
+    type M: LiftingCommutativeMonoid<PointRef<Self>, Self::V>
         + Clone
         + Debug
         + Eq
@@ -964,7 +1002,7 @@ impl<P: TreeParams> Node<P> {
 
     pub fn insert(
         &mut self,
-        key: &Point<P>,
+        key: &PointRef<P>,
         value: &P::V,
         store: &mut impl NodeStore<P>,
     ) -> Result<Option<P::V>> {
@@ -1019,7 +1057,7 @@ impl<P: TreeParams> Node<P> {
 
     pub fn delete(
         &mut self,
-        key: &Point<P>,
+        key: &PointRef<P>,
         store: &mut impl NodeStore<P>,
     ) -> Result<Option<P::V>> {
         self.delete_rec(key, store)
@@ -1027,7 +1065,7 @@ impl<P: TreeParams> Node<P> {
 
     fn delete_rec(
         &mut self,
-        key: &Point<P>,
+        key: &PointRef<P>,
         store: &mut impl NodeStore<P>,
     ) -> Result<Option<P::V>> {
         if let Some(mut this) = store.get_node(*self)? {
@@ -1071,11 +1109,15 @@ impl<P: TreeParams> Node<P> {
         Ok(())
     }
 
-    pub fn get(&self, key: &Point<P>, store: &impl NodeStore<P>) -> Result<Option<P::V>> {
+    pub fn get(&self, key: &PointRef<P>, store: &impl NodeStore<P>) -> Result<Option<P::V>> {
         Ok(self.get0(key, store)?.map(|x| x.value().clone()))
     }
 
-    fn get0(&self, key: &Point<P>, store: &impl NodeStore<P>) -> Result<Option<OwnedNodeData<P>>> {
+    fn get0(
+        &self,
+        key: &PointRef<P>,
+        store: &impl NodeStore<P>,
+    ) -> Result<Option<OwnedNodeData<P>>> {
         if let Some(data) = store.data_opt(*self)? {
             match key.cmp_at_rank(data.key(), data.rank()) {
                 Ordering::Less => {
@@ -1107,7 +1149,7 @@ impl<P: TreeParams> Node<P> {
         if let Some(data) = store.data_opt(*self)? {
             data.left().dump0(format!("{}  ", prefix), store)?;
             println!(
-                "{}{:?} rank={} order={:?} value={:?} summary={:?}",
+                "{}{} rank={} order={:?} value={:?} summary={:?}",
                 prefix,
                 data.key(),
                 data.rank(),
@@ -1122,7 +1164,7 @@ impl<P: TreeParams> Node<P> {
         Ok(())
     }
 
-    pub fn from_iter<I: IntoIterator<Item = (OwnedPoint<P>, P::V)>>(
+    pub fn from_iter<I: IntoIterator<Item = (Point<P>, P::V)>>(
         iter: I,
         store: &mut impl NodeStore<P>,
     ) -> Result<Node<P>> {
@@ -1178,7 +1220,7 @@ impl<P: TreeParams> Node<P> {
     pub fn iter<'a>(
         &'a self,
         store: &'a impl NodeStore<P>,
-    ) -> impl Iterator<Item = Result<(OwnedPoint<P>, P::V)>> + 'a {
+    ) -> impl Iterator<Item = Result<(Point<P>, P::V)>> + 'a {
         Gen::new(|co| async move {
             if let Err(cause) = self.iter0(store, &co).await {
                 co.yield_(Err(cause)).await;
@@ -1190,7 +1232,7 @@ impl<P: TreeParams> Node<P> {
     async fn iter0(
         &self,
         store: &impl NodeStore<P>,
-        co: &Co<Result<(OwnedPoint<P>, P::V)>>,
+        co: &Co<Result<(Point<P>, P::V)>>,
     ) -> Result<()> {
         if let Some(data) = store.data_opt(*self)? {
             Box::pin(data.left().iter0(store, co)).await?;
@@ -1468,7 +1510,7 @@ impl<P: TreeParams> Node<P> {
         &'a self,
         query: &'a QueryRange3d<P>,
         store: &'a impl NodeStore<P>,
-    ) -> impl Iterator<Item = Result<(OwnedPoint<P>, P::V)>> + 'a {
+    ) -> impl Iterator<Item = Result<(Point<P>, P::V)>> + 'a {
         Gen::new(|co| async move {
             if let Err(cause) = self.query0(query, store, &co).await {
                 co.yield_(Err(cause)).await;
@@ -1481,7 +1523,7 @@ impl<P: TreeParams> Node<P> {
         &self,
         query: &QueryRange3d<P>,
         store: &impl NodeStore<P>,
-        co: &Co<Result<(OwnedPoint<P>, P::V)>>,
+        co: &Co<Result<(Point<P>, P::V)>>,
     ) -> Result<()> {
         if let Some(data) = store.data_opt(*self)? {
             if query.overlaps_left(data.key(), data.rank()) {
@@ -1507,7 +1549,7 @@ impl<P: TreeParams> Node<P> {
         query: &'a QueryRange3d<P>,
         ordering: SortOrder,
         store: &'a impl NodeStore<P>,
-    ) -> impl Iterator<Item = Result<(OwnedPoint<P>, P::V)>> + 'a {
+    ) -> impl Iterator<Item = Result<(Point<P>, P::V)>> + 'a {
         Gen::new(|co| async move {
             if let Err(cause) = self.query_ordered0(query, ordering, store, &co).await {
                 co.yield_(Err(cause)).await;
@@ -1521,7 +1563,7 @@ impl<P: TreeParams> Node<P> {
         query: &QueryRange3d<P>,
         ordering: SortOrder,
         store: &impl NodeStore<P>,
-        co: &Co<Result<(OwnedPoint<P>, P::V)>>,
+        co: &Co<Result<(Point<P>, P::V)>>,
     ) -> Result<()> {
         let Some(data) = store.data_opt(*self)? else {
             return Ok(());
@@ -1618,7 +1660,7 @@ impl<P: TreeParams> OwnedNodeData<P> {
     }
 
     /// Creates a leaf data from the given key and value.
-    pub fn leaf(key: &Point<P>, value: &P::V) -> Self {
+    pub fn leaf(key: &PointRef<P>, value: &P::V) -> Self {
         let data = vec![0; key_offset::<P>() + key.size()];
         let mut res = Self(PhantomData, data);
         *res.left_mut() = Node::EMPTY; // not strictly necessary, since it's already 0
@@ -1727,9 +1769,9 @@ impl<P: TreeParams> NodeData<P> {
         SortOrder::from(self.rank())
     }
 
-    pub fn key(&self) -> &Point<P> {
+    pub fn key(&self) -> &PointRef<P> {
         let slice = &self.1[key_offset::<P>()..];
-        Point::ref_cast(slice)
+        PointRef::ref_cast(slice)
     }
 
     pub fn make_leaf(&mut self) {
@@ -2076,11 +2118,11 @@ pub fn count_trailing_zeros(hash: &[u8; 32]) -> u8 {
 }
 
 async fn merge3<P: TreeParams>(
-    a: impl Iterator<Item = Result<(OwnedPoint<P>, P::V)>>,
-    b: impl Iterator<Item = Result<(OwnedPoint<P>, P::V)>>,
-    c: impl Iterator<Item = Result<(OwnedPoint<P>, P::V)>>,
+    a: impl Iterator<Item = Result<(Point<P>, P::V)>>,
+    b: impl Iterator<Item = Result<(Point<P>, P::V)>>,
+    c: impl Iterator<Item = Result<(Point<P>, P::V)>>,
     ordering: SortOrder,
-    co: &Co<Result<(OwnedPoint<P>, P::V)>>,
+    co: &Co<Result<(Point<P>, P::V)>>,
 ) -> Result<()> {
     enum Smallest {
         A,
@@ -2091,7 +2133,7 @@ async fn merge3<P: TreeParams>(
     let mut a = a.peekable();
     let mut b = b.peekable();
     let mut c = c.peekable();
-    let cmp = |a: &Result<(OwnedPoint<P>, P::V)>, b: &Result<(OwnedPoint<P>, P::V)>| match (a, b) {
+    let cmp = |a: &Result<(Point<P>, P::V)>, b: &Result<(Point<P>, P::V)>| match (a, b) {
         (Ok((ak, _)), Ok((bk, _))) => ak.cmp_with_order(&bk, ordering),
         (Err(_), Ok(_)) => Ordering::Less,
         (Ok(_), Err(_)) => Ordering::Greater,

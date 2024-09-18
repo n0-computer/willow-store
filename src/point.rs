@@ -11,96 +11,96 @@ use zerocopy::{AsBytes, FromBytes};
 /// there are comparison functions that take a `SortOrder` enum.
 #[repr(transparent)]
 #[derive(RefCast)]
-pub struct Point<P: KeyParams>(PhantomData<P>, [u8]);
+pub struct PointRef<P: KeyParams>(PhantomData<P>, [u8]);
 
-impl<K: KeyParams> PartialEq for Point<K> {
+impl<K: KeyParams> PartialEq for PointRef<K> {
     fn eq(&self, other: &Self) -> bool {
         self.1 == other.1
     }
 }
 
-impl<K: KeyParams> Eq for Point<K> {}
+impl<K: KeyParams> Eq for PointRef<K> {}
 
-impl<K: KeyParams> PartialOrd for Point<K> {
+impl<K: KeyParams> PartialOrd for PointRef<K> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         self.0.partial_cmp(&other.0)
     }
 }
 
-impl<K: KeyParams> Ord for Point<K> {
+impl<K: KeyParams> Ord for PointRef<K> {
     fn cmp(&self, other: &Self) -> Ordering {
         self.0.cmp(&other.0)
     }
 }
 
-pub struct OwnedPoint<P: KeyParams>(PhantomData<P>, Arc<[u8]>);
+pub struct Point<P: KeyParams>(PhantomData<P>, Arc<[u8]>);
 
-impl<P: KeyParams> Clone for OwnedPoint<P> {
+impl<P: KeyParams> Clone for Point<P> {
     fn clone(&self) -> Self {
-        OwnedPoint(PhantomData, self.1.clone())
+        Point(PhantomData, self.1.clone())
     }
 }
 
-impl<P: KeyParams> Borrow<Point<P>> for OwnedPoint<P> {
-    fn borrow(&self) -> &Point<P> {
-        Point::ref_cast(&self.1)
+impl<P: KeyParams> Borrow<PointRef<P>> for Point<P> {
+    fn borrow(&self) -> &PointRef<P> {
+        PointRef::ref_cast(&self.1)
     }
 }
 
-impl<P: KeyParams> OwnedPoint<P> {
+impl<P: KeyParams> Point<P> {
     pub fn new(x: &P::X, y: &P::Y, z: &P::Z) -> Self {
         let mut buf = vec![0; P::X::SIZE + P::Y::SIZE + z.size()];
         x.write_to_prefix(&mut buf[0..]).unwrap();
         y.write_to_prefix(&mut buf[P::X::SIZE..]).unwrap();
         z.write_to_prefix(&mut buf[P::X::SIZE + P::Y::SIZE..])
             .unwrap();
-        OwnedPoint(PhantomData, buf.into())
+        Point(PhantomData, buf.into())
     }
 }
 
-impl<P: KeyParams> Debug for OwnedPoint<P> {
+impl<P: KeyParams> Debug for Point<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.deref().fmt(f)
     }
 }
 
-impl<P: KeyParams> Deref for OwnedPoint<P> {
-    type Target = Point<P>;
+impl<P: KeyParams> Deref for Point<P> {
+    type Target = PointRef<P>;
 
     fn deref(&self) -> &Self::Target {
         self.borrow()
     }
 }
 
-impl<P: KeyParams> PartialOrd for OwnedPoint<P> {
+impl<P: KeyParams> PartialOrd for Point<P> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         self.as_slice().partial_cmp(other.as_slice())
     }
 }
 
-impl<P: KeyParams> Ord for OwnedPoint<P> {
+impl<P: KeyParams> Ord for Point<P> {
     fn cmp(&self, other: &Self) -> Ordering {
         self.as_slice().cmp(other.as_slice())
     }
 }
 
-impl<P: KeyParams> PartialEq for OwnedPoint<P> {
+impl<P: KeyParams> PartialEq for Point<P> {
     fn eq(&self, other: &Self) -> bool {
         self.as_slice() == other.as_slice()
     }
 }
 
-impl<P: KeyParams> Eq for OwnedPoint<P> {}
+impl<P: KeyParams> Eq for Point<P> {}
 
-impl<P: KeyParams> ToOwned for Point<P> {
-    type Owned = OwnedPoint<P>;
+impl<P: KeyParams> ToOwned for PointRef<P> {
+    type Owned = Point<P>;
 
     fn to_owned(&self) -> Self::Owned {
-        OwnedPoint(PhantomData, self.1.to_vec().into())
+        Point(PhantomData, self.1.to_vec().into())
     }
 }
 
-impl<P: KeyParams> Point<P> {
+impl<P: KeyParams> PointRef<P> {
     pub fn size(&self) -> usize {
         self.1.len()
     }
@@ -160,12 +160,30 @@ impl<P: KeyParams> Point<P> {
     }
 }
 
-impl<P: KeyParams> std::fmt::Debug for Point<P> {
+impl<P: KeyParams> std::fmt::Debug for PointRef<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("")
             .field(&self.x())
             .field(&self.y())
             .field(&self.z())
             .finish()
+    }
+}
+
+impl<P: KeyParams> std::fmt::Display for PointRef<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("")
+            .field(&DD(self.x()))
+            .field(&DD(self.y()))
+            .field(&DD(self.z()))
+            .finish()
+    }
+}
+
+struct DD<T>(T);
+
+impl<T: std::fmt::Display> Debug for DD<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
     }
 }

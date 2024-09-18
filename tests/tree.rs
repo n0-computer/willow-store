@@ -9,12 +9,12 @@ use proptest::prelude::*;
 use test_strategy::proptest;
 use testresult::TestResult;
 use willow_store::{
-    FixedSize, KeyParams, LiftingCommutativeMonoid, MemStore, NodeStore, OwnedNodeData, OwnedPoint,
-    Point, QueryRange, QueryRange3d, SortOrder, TreeParams,
+    FixedSize, KeyParams, LiftingCommutativeMonoid, MemStore, NodeStore, OwnedNodeData, Point,
+    PointRef, QueryRange, QueryRange3d, SortOrder, TreeParams,
 };
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
-type TPoint = OwnedPoint<TestParams>;
+type TPoint = Point<TestParams>;
 type TQuery = QueryRange3d<TestParams>;
 
 #[derive(Debug)]
@@ -25,16 +25,6 @@ impl KeyParams for TestParams {
     type Y = u64;
     type Z = u64;
     type ZOwned = u64;
-}
-
-#[derive(Debug)]
-struct TestParams2;
-
-impl KeyParams for TestParams2 {
-    type X = u64;
-    type Y = u64;
-    type Z = [u8];
-    type ZOwned = Vec<u8>;
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, AsBytes, FromZeroes, FromBytes, Clone, Copy)]
@@ -90,39 +80,17 @@ impl FixedSize for ValueSum {
     const SIZE: usize = 8;
 }
 
-impl LiftingCommutativeMonoid<Point<TestParams>, u64> for ValueSum {
+impl LiftingCommutativeMonoid<PointRef<TestParams>, u64> for ValueSum {
     fn neutral() -> Self {
         ValueSum(0)
     }
 
-    fn lift(_k: &Point<TestParams>, v: &u64) -> Self {
+    fn lift(_k: &PointRef<TestParams>, v: &u64) -> Self {
         ValueSum(*v)
     }
 
     fn combine(&self, other: &Self) -> Self {
         ValueSum(self.0 + other.0)
-    }
-}
-
-#[derive(Clone, PartialEq, Eq, Debug, AsBytes, FromZeroes, FromBytes)]
-#[repr(C)]
-struct ValueSum2(u64);
-
-impl FixedSize for ValueSum2 {
-    const SIZE: usize = 8;
-}
-
-impl LiftingCommutativeMonoid<Point<TestParams2>, u64> for ValueSum2 {
-    fn neutral() -> Self {
-        ValueSum2(0)
-    }
-
-    fn lift(_k: &Point<TestParams2>, v: &u64) -> Self {
-        ValueSum2(*v)
-    }
-
-    fn combine(&self, other: &Self) -> Self {
-        ValueSum2(self.0 + other.0)
     }
 }
 
@@ -405,11 +373,11 @@ fn tree_get_impl(items: Vec<(TPoint, u64)>) -> TestResult<()> {
         }
     };
     for (k, _) in &items {
-        let t = OwnedPoint::new(&(*k.x() + 1), k.y(), k.z());
+        let t = Point::new(&(*k.x() + 1), k.y(), k.z());
         insert(&t);
-        let t = OwnedPoint::new(k.x(), &(*k.y() + 1), k.z());
+        let t = Point::new(k.x(), &(*k.y() + 1), k.z());
         insert(&t);
-        let t = OwnedPoint::new(k.x(), k.y(), &(*k.z() + 1));
+        let t = Point::new(k.x(), k.y(), &(*k.z() + 1));
         insert(&t);
     }
     for (key, value) in items {
