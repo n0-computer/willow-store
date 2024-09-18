@@ -342,8 +342,7 @@ fn tree_find_split_plane_impl(items: Vec<(TPoint, u64)>, query: TQuery) -> TestR
     let mut store = MemStore::new();
     let tree = willow_store::Node::from_iter(items.clone(), &mut store)?;
     let total_count = tree.count_range(&query, &store)?;
-    let Some((left_node, left, left_count, right_node, right, right_count)) =
-        tree.find_split_plane(&query, &store)?
+    let Some((left, left_count, right, right_count)) = tree.find_split_plane(&query, &store)?
     else {
         assert!(total_count <= 1);
         return Ok(());
@@ -351,8 +350,6 @@ fn tree_find_split_plane_impl(items: Vec<(TPoint, u64)>, query: TQuery) -> TestR
     assert_eq!(left_count + right_count, total_count);
     assert_eq!(left_count, tree.count_range(&left, &store)?);
     assert_eq!(right_count, tree.count_range(&right, &store)?);
-    assert_eq!(left_count, left_node.count_range(&left, &store)?);
-    assert_eq!(right_count, right_node.count_range(&right, &store)?);
     Ok(())
 }
 

@@ -222,6 +222,24 @@ pub struct QueryRange<T> {
     max: Option<T>,
 }
 
+impl<T> From<std::ops::Range<T>> for QueryRange<T> {
+    fn from(range: std::ops::Range<T>) -> Self {
+        QueryRange {
+            min: range.start,
+            max: Some(range.end),
+        }
+    }
+}
+
+impl<T> From<std::ops::RangeFrom<T>> for QueryRange<T> {
+    fn from(range: std::ops::RangeFrom<T>) -> Self {
+        QueryRange {
+            min: range.start,
+            max: None,
+        }
+    }
+}
+
 impl<T: Display> Display for QueryRange<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.max {
@@ -1221,7 +1239,7 @@ impl<P: TreeParams> Node<P> {
     ) -> Result<(u64, u64, u64)> {
         Ok(if let Some(data) = store.data_opt(*self)? {
             let sc = if query.contains(data.key()) { 1 } else { 0 };
-            let lc = if query.overlaps_left(data.key(), data.rank()) {
+            let lc = if !data.left().is_empty() && query.overlaps_left(data.key(), data.rank()) {
                 data.left().count_range_rec(
                     query,
                     &bbox.split_left(data.key(), data.rank()),
@@ -1230,7 +1248,7 @@ impl<P: TreeParams> Node<P> {
             } else {
                 0
             };
-            let rc = if query.overlaps_right(data.key(), data.rank()) {
+            let rc = if !data.right().is_empty() && query.overlaps_right(data.key(), data.rank()) {
                 data.right().count_range_rec(
                     query,
                     &bbox.split_right(data.key(), data.rank()),
@@ -1274,7 +1292,7 @@ impl<P: TreeParams> Node<P> {
         &self,
         query: &QueryRange3d<P>,
         store: &impl NodeStore<P>,
-    ) -> Result<Option<(Node<P>, QueryRange3d<P>, u64, Node<P>, QueryRange3d<P>, u64)>> {
+    ) -> Result<Option<(QueryRange3d<P>, u64, QueryRange3d<P>, u64)>> {
         let total_count = self.count_range(query, store)?;
         self.find_split_plane0(*self, query, total_count, store)
     }
@@ -1285,7 +1303,7 @@ impl<P: TreeParams> Node<P> {
         query: &QueryRange3d<P>,
         total_count: u64,
         store: &impl NodeStore<P>,
-    ) -> Result<Option<(Node<P>, QueryRange3d<P>, u64, Node<P>, QueryRange3d<P>, u64)>> {
+    ) -> Result<Option<(QueryRange3d<P>, u64, QueryRange3d<P>, u64)>> {
         if total_count <= 1 {
             return Ok(None);
         }
@@ -1297,7 +1315,7 @@ impl<P: TreeParams> Node<P> {
                 if left_count < total_count && left_count > 0 {
                     let right_count = total_count - left_count;
                     let right = query.right(data.key(), sort_order);
-                    return Ok(Some((root, left, left_count, root, right, right_count)));
+                    return Ok(Some((left, left_count, right, right_count)));
                 }
             }
             if let Some(res) = data
@@ -1335,13 +1353,13 @@ impl<P: TreeParams> Node<P> {
             co.yield_(Ok((query, total_count))).await;
             return Ok(());
         }
-        let (left_node, left, left_count, right_node, right, right_count) = self
+        let (left, left_count, right, right_count) = self
             .find_split_plane(&query, store)?
             .expect("must find split plane");
         let left_factor = ((left_count * split_factor) / total_count).max(1);
         let right_factor = split_factor - left_factor;
-        Box::pin(left_node.split_range2(left, left_count, left_factor, co, store)).await?;
-        Box::pin(right_node.split_range2(right, right_count, right_factor, co, store)).await?;
+        Box::pin(self.split_range2(left, left_count, left_factor, co, store)).await?;
+        Box::pin(self.split_range2(right, right_count, right_factor, co, store)).await?;
         Ok(())
     }
 

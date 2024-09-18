@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use anyhow::Result;
 use std::fmt::{Debug, Display};
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
+mod redb;
 
 /// A simple store trait for storing blobs.
 pub trait BlobStore {
