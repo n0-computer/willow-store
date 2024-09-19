@@ -1380,7 +1380,7 @@ impl<P: TreeParams> Node<P> {
         store: &impl NodeStore<P>,
     ) -> Result<P::M> {
         if let Some(node) = store.data_opt(*self)? {
-            let bbox = BBox::all();
+            let bbox = BBoxRef::all();
             node.range_summary_rec(query, &bbox, store)
         } else {
             Ok(P::M::neutral())
@@ -1389,95 +1389,33 @@ impl<P: TreeParams> Node<P> {
 
     /// Count the number of elements in a 3d range.
     pub fn range_count(&self, query: &QueryRange3d<P>, store: &impl NodeStore<P>) -> Result<u64> {
-        let bbox = BBox::all();
+        let bbox = BBoxRef::all();
         self.range_count_rec(query, &bbox, store)
     }
 
     fn range_count_rec(
         &self,
         query: &QueryRange3d<P>,
-        bbox: &BBox<P>,
+        bbox: &BBoxRef<P>,
         store: &impl NodeStore<P>,
     ) -> Result<u64> {
-        const peek: bool = true;
-        if peek {
-            if self.is_empty() {
-                return Ok(0);
-            }
-            let data = store.peek_data(*self, |data| -> Result<u64> {
-                if bbox.contained_in(&query) {
-                    Ok(data.count())
-                } else {
-                    let key = data.key();
-                    let order = data.sort_order();
-                    let left = data.left().filter(|| query.overlaps_left(key, order));
-                    let right = data.right().filter(|| query.overlaps_right(key, order));
-                    let left = if !left.is_empty() {
-                        Some((left, bbox.split_left(key, order)))
-                    } else {
-                        None
-                    };
-                    let right = if !right.is_empty() {
-                        Some((right, bbox.split_right(key, order)))
-                    } else {
-                        None
-                    };
-                    let sc = if query.contains(key) { 1 } else { 0 };
-                    let lc = if let Some((left, bbox)) = left {
-                        left.range_count_rec(query, &bbox, store)?
-                    } else {
-                        0
-                    };
-                    let rc = if let Some((right, bbox)) = right {
-                        right.range_count_rec(query, &bbox, store)?
-                    } else {
-                        0
-                    };
-                    Ok(lc + sc + rc)
-                }
-            })?;
-            return data;
-            // return match data {
-            //     Ok(count) => Ok(count),
-            //     Err((sc, left, right)) => {
-            //         let lc = if let Some((left, bbox)) = left {
-            //             left.range_count_rec(query, &bbox, store)?
-            //         } else {
-            //             0
-            //         };
-            //         let rc = if let Some((right, bbox)) = right {
-            //             right.range_count_rec(query, &bbox, store)?
-            //         } else {
-            //             0
-            //         };
-            //         Ok(lc + sc + rc)
-            //     }
-            // }
+        if self.is_empty() {
+            return Ok(0);
         }
-
-        Ok(if let Some(data) = store.data_opt(*self)? {
-            // if the node is fully contained in the query, we can just return the count
+        store.peek_data(*self, |data| -> Result<u64> {
             if bbox.contained_in(&query) {
-                return Ok(data.count());
+                Ok(data.count())
+            } else {
+                let key = data.key();
+                let order = data.sort_order();
+                let left = data.left().filter(|| query.overlaps_left(key, order));
+                let right = data.right().filter(|| query.overlaps_right(key, order));
+                let lc = left.range_count_rec(query, &bbox.split_left(key, order), store)?;
+                let sc = if query.contains(key) { 1 } else { 0 };
+                let rc = right.range_count_rec(query, &bbox.split_right(key, order), store)?;
+                Ok(lc + sc + rc)
             }
-            let order = data.sort_order();
-            let sc = if query.contains(data.key()) { 1 } else { 0 };
-            let lc = if !data.left().is_empty() && query.overlaps_left(data.key(), order) {
-                data.left()
-                    .range_count_rec(query, &bbox.split_left(data.key(), order), store)?
-            } else {
-                0
-            };
-            let rc = if !data.right().is_empty() && query.overlaps_right(data.key(), order) {
-                data.right()
-                    .range_count_rec(query, &bbox.split_right(data.key(), order), store)?
-            } else {
-                0
-            };
-            lc + sc + rc
-        } else {
-            0
-        })
+        })?
     }
 
     pub fn split_range<'a>(
@@ -2060,15 +1998,15 @@ impl<P: TreeParams> NodeData<P> {
     fn range_summary_rec(
         &self,
         query: &QueryRange3d<P>,
-        bbox: &BBox<P>,
+        bbox: &BBoxRef<P>,
         store: &impl NodeStore<P>,
     ) -> Result<P::M> {
         if self.is_leaf() {
-            if query.contains(self.key()) {
-                return Ok(self.summary().clone());
+            return Ok(if query.contains(self.key()) {
+                self.summary().clone()
             } else {
-                return Ok(P::M::neutral());
-            }
+                P::M::neutral()
+            })
         }
         if bbox.contained_in(&query) {
             return Ok(self.summary().clone());
