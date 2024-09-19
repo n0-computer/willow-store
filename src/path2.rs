@@ -12,7 +12,10 @@ use rand::Rng;
 use ref_cast::RefCast;
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
-use crate::{FixedSize, KeyParams, LiftingCommutativeMonoid, LowerBound, NoQuotes, PointRef, RefFromSlice, TreeParams, VariableSize};
+use crate::{
+    FixedSize, KeyParams, LiftingCommutativeMonoid, LowerBound, NoQuotes, PointRef, RefFromSlice,
+    TreeParams, VariableSize,
+};
 
 /// Formats a single component.
 /// - If the component is valid UTF-8, it is enclosed in quotes, and any quotes within
@@ -387,7 +390,6 @@ impl TreeParams for WillowTreeParams {
     type V = WillowValue;
     type M = Fingerprint;
 }
-
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, FromBytes, AsBytes, FromZeroes)]
 #[repr(transparent)]
