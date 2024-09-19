@@ -1,9 +1,5 @@
-use std::{fmt::Write, path::Path};
-
 use redb::{Database, ReadableTable, TableDefinition, WriteTransaction};
 use zerocopy::{AsBytes, FromBytes};
-
-use crate::Node;
 
 use super::{BlobStore, NodeId, Result};
 
@@ -279,12 +275,12 @@ mod tests {
     };
 
     use crate::{
-        path::{Subspace, Timestamp, WillowTreeParams, WillowValue},
+        path2::{Subspace, Timestamp, WillowTreeParams, WillowValue},
         MemStore, Node, Point, QueryRange, QueryRange3d,
     };
 
     use super::*;
-    use crate::path::Path;
+    use crate::path2::Path;
     use testresult::TestResult;
     use walkdir::WalkDir;
 
@@ -347,7 +343,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn linux_kernel_test() -> TestResult<()> {
         let db = RedbBlobStore::memory()?;
         let mut batch = db.txn()?;
@@ -396,9 +391,15 @@ mod tests {
         // for split in node.split_range(QueryRange3d::all(), 2, &ss) {
         //     println!("{:?}", split?);
         // }
+        let count_range_time = {
+            let t0 = Instant::now();
+            let n = node.range_count(&q, &ss)?;
+            t0.elapsed()
+        };
         let (sum, count) = node.average_node_depth(&ss)?;
         println!("Node count: {}", count);
         println!("Average Node Depth: {}", (sum as f64) / (count as f64));
+        println!("Count range time: {}", count_range_time.as_secs_f64());
         Ok(())
     }
 

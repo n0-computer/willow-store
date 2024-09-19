@@ -114,7 +114,7 @@ pub use point::Point;
 mod store;
 use ref_cast::RefCast;
 mod layout;
-mod path;
+// mod path;
 mod path2;
 use layout::*;
 pub use store::BlobStore;
@@ -525,6 +525,7 @@ impl<T: Ord> RangeInclusive<T> {
 }
 
 /// A range with either inclusive or open start and end bounds.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct RangeInclusiveOpt<T> {
     min: Option<T>,
     max: Option<T>,
@@ -547,15 +548,6 @@ impl<T: Debug> Debug for RangeInclusiveOpt<T> {
             .field("min", &self.min)
             .field("max", &self.max)
             .finish()
-    }
-}
-
-impl<T: Clone> Clone for RangeInclusiveOpt<T> {
-    fn clone(&self) -> Self {
-        Self {
-            min: self.min.clone(),
-            max: self.max.clone(),
-        }
     }
 }
 
@@ -636,13 +628,13 @@ impl<T: Clone> RangeInclusiveOpt<T> {
 /// A bounding box in 3D space.
 ///
 /// Bounds are either omitted (None) or inclusive.
-pub struct BBox<P: KeyParams> {
-    x: RangeInclusiveOpt<P::X>,
-    y: RangeInclusiveOpt<P::Y>,
-    z: RangeInclusiveOpt<P::ZOwned>,
+pub struct BBox<'a, P: KeyParams> {
+    x: RangeInclusiveOpt<&'a P::X>,
+    y: RangeInclusiveOpt<&'a P::Y>,
+    z: RangeInclusiveOpt<&'a P::Z>,
 }
 
-impl<P: KeyParams> Clone for BBox<P> {
+impl<'a, P: KeyParams> Clone for BBox<'a, P> {
     fn clone(&self) -> Self {
         BBox {
             x: self.x.clone(),
@@ -652,13 +644,13 @@ impl<P: KeyParams> Clone for BBox<P> {
     }
 }
 
-impl<P: KeyParams> Display for BBox<P> {
+impl<'a, P: KeyParams> Display for BBox<'a, P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} {} {}", self.x, self.y, self.z)
     }
 }
 
-impl<P: KeyParams> Debug for BBox<P> {
+impl<'a, P: KeyParams> Debug for BBox<'a, P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BBox")
             .field("x", &self.x)
@@ -756,11 +748,11 @@ impl<T: TreeParams> AssertInvariantsRes<T> {
     }
 }
 
-impl<P: KeyParams> BBox<P> {
+impl<'a, P: KeyParams> BBox<'a, P> {
     pub fn new(
-        x: RangeInclusiveOpt<P::X>,
-        y: RangeInclusiveOpt<P::Y>,
-        z: RangeInclusiveOpt<P::ZOwned>,
+        x: RangeInclusiveOpt<&'a P::X>,
+        y: RangeInclusiveOpt<&'a P::Y>,
+        z: RangeInclusiveOpt<&'a P::Z>,
     ) -> Self {
         BBox { x, y, z }
     }
@@ -783,42 +775,42 @@ impl<P: KeyParams> BBox<P> {
             && query.z.contains_range_inclusive_opt(&self.z)
     }
 
-    pub fn split_left(&self, key: &PointRef<P>, rank: u8) -> BBox<P> {
-        match SortOrder::from(rank) {
+    pub fn split_left(&'a self, key: &'a PointRef<P>, order: SortOrder) -> BBox<'a, P> {
+        match order {
             SortOrder::XYZ => BBox {
-                x: RangeInclusiveOpt::new(self.x.min.clone(), Some(key.x().clone())),
+                x: RangeInclusiveOpt::new(self.x.min.clone(), Some(key.x())),
                 y: self.y.clone(),
                 z: self.z.clone(),
             },
             SortOrder::YZX => BBox {
                 x: self.x.clone(),
-                y: RangeInclusiveOpt::new(self.y.min.clone(), Some(key.y().clone())),
+                y: RangeInclusiveOpt::new(self.y.min.clone(), Some(key.y())),
                 z: self.z.clone(),
             },
             SortOrder::ZXY => BBox {
                 x: self.x.clone(),
                 y: self.y.clone(),
-                z: RangeInclusiveOpt::new(self.z.min.clone(), Some(key.z().to_owned())),
+                z: RangeInclusiveOpt::new(self.z.min.clone(), Some(key.z())),
             },
         }
     }
 
-    pub fn split_right(&self, key: &PointRef<P>, rank: u8) -> BBox<P> {
-        match SortOrder::from(rank) {
+    pub fn split_right(&'a self, key: &'a PointRef<P>, order: SortOrder) -> BBox<'a, P> {
+        match order {
             SortOrder::XYZ => BBox {
-                x: RangeInclusiveOpt::new(Some(key.x().clone()), self.x.max.clone()),
+                x: RangeInclusiveOpt::new(Some(key.x()), self.x.max.clone()),
                 y: self.y.clone(),
                 z: self.z.clone(),
             },
             SortOrder::YZX => BBox {
                 x: self.x.clone(),
-                y: RangeInclusiveOpt::new(Some(key.y().clone()), self.y.max.clone()),
+                y: RangeInclusiveOpt::new(Some(key.y()), self.y.max.clone()),
                 z: self.z.clone(),
             },
             SortOrder::ZXY => BBox {
                 x: self.x.clone(),
                 y: self.y.clone(),
-                z: RangeInclusiveOpt::new(Some(key.z().to_owned()), self.z.max.clone()),
+                z: RangeInclusiveOpt::new(Some(key.z()), self.z.max.clone()),
             },
         }
     }
@@ -1298,7 +1290,7 @@ impl<P: TreeParams> Node<P> {
         query: &QueryRange3d<P>,
         store: &impl NodeStore<P>,
     ) -> Result<P::M> {
-        if let Some(node) = store.get_node(*self)? {
+        if let Some(node) = store.data_opt(*self)? {
             let bbox = BBox::all();
             node.range_summary_rec(query, &bbox, store)
         } else {
@@ -1309,37 +1301,94 @@ impl<P: TreeParams> Node<P> {
     /// Count the number of elements in a 3d range.
     pub fn range_count(&self, query: &QueryRange3d<P>, store: &impl NodeStore<P>) -> Result<u64> {
         let bbox = BBox::all();
-        self.count_range_rec(query, &bbox, store)
+        self.range_count_rec(query, &bbox, store)
     }
 
-    fn count_range_rec(
+    fn range_count_rec(
         &self,
         query: &QueryRange3d<P>,
         bbox: &BBox<P>,
         store: &impl NodeStore<P>,
     ) -> Result<u64> {
+        const peek: bool = true;
+        if peek {
+            if self.is_empty() {
+                return Ok(0);
+            }
+            let data = store.peek_data(*self, |data| -> Result<u64> {
+                if bbox.contained_in(&query) {
+                    Ok(data.count())
+                } else {
+                    let key = data.key();
+                    let order = data.sort_order();
+                    let left = data.left().filter(|| query.overlaps_left(key, order));
+                    let right = data.right().filter(|| query.overlaps_right(key, order));
+                    let left = if !left.is_empty() {
+                        Some((left, bbox.split_left(key, order)))
+                    } else {
+                        None
+                    };
+                    let right = if !right.is_empty() {
+                        Some((right, bbox.split_right(key, order)))
+                    } else {
+                        None
+                    };
+                    let sc = if query.contains(key) { 1 } else { 0 };
+                    let lc = if let Some((left, bbox)) = left {
+                        left.range_count_rec(query, &bbox, store)?
+                    } else {
+                        0
+                    };
+                    let rc = if let Some((right, bbox)) = right {
+                        right.range_count_rec(query, &bbox, store)?
+                    } else {
+                        0
+                    };
+                    Ok(lc + sc + rc)
+                }
+            })?;
+            return data;
+            // return match data {
+            //     Ok(count) => Ok(count),
+            //     Err((sc, left, right)) => {
+            //         let lc = if let Some((left, bbox)) = left {
+            //             left.range_count_rec(query, &bbox, store)?
+            //         } else {
+            //             0
+            //         };
+            //         let rc = if let Some((right, bbox)) = right {
+            //             right.range_count_rec(query, &bbox, store)?
+            //         } else {
+            //             0
+            //         };
+            //         Ok(lc + sc + rc)
+            //     }
+            // }
+        }
+
         Ok(if let Some(data) = store.data_opt(*self)? {
             // if the node is fully contained in the query, we can just return the count
             if bbox.contained_in(&query) {
                 return Ok(data.count());
             }
+            let order = data.sort_order();
             let sc = if query.contains(data.key()) { 1 } else { 0 };
             let lc =
-                if !data.left().is_empty() && query.overlaps_left(data.key(), data.sort_order()) {
-                    data.left().count_range_rec(
+                if !data.left().is_empty() && query.overlaps_left(data.key(), order) {
+                    data.left().range_count_rec(
                         query,
-                        &bbox.split_left(data.key(), data.rank()),
+                        &bbox.split_left(data.key(), order),
                         store,
                     )?
                 } else {
                     0
                 };
             let rc = if !data.right().is_empty()
-                && query.overlaps_right(data.key(), data.sort_order())
+                && query.overlaps_right(data.key(), order)
             {
-                data.right().count_range_rec(
+                data.right().range_count_rec(
                     query,
-                    &bbox.split_right(data.key(), data.rank()),
+                    &bbox.split_right(data.key(), order),
                     store,
                 )?
             } else {
@@ -1936,7 +1985,7 @@ impl<P: TreeParams> NodeData<P> {
     ) -> Result<P::M> {
         if self.is_leaf() {
             if query.contains(self.key()) {
-                return Ok(self.summary().clone());
+                return Ok(self.summary().clone()); 
             } else {
                 return Ok(P::M::neutral());
             }
@@ -1945,18 +1994,20 @@ impl<P: TreeParams> NodeData<P> {
             return Ok(self.summary().clone());
         }
         let mut summary = P::M::neutral();
-        if query.overlaps_left(self.key(), self.sort_order()) {
+        let order = self.sort_order();
+        let key = self.key();
+        if query.overlaps_left(key, order) {
             if let Some(left) = store.data_opt(self.left())? {
-                let left_bbox = bbox.split_left(self.key(), self.rank());
+                let left_bbox = bbox.split_left(key, order);
                 summary = summary.combine(&left.range_summary_rec(query, &left_bbox, store)?);
             }
         }
-        if query.contains(self.key()) {
-            summary = summary.combine(&P::M::lift(self.key(), self.value()));
+        if query.contains(key) {
+            summary = summary.combine(&P::M::lift(key, self.value()));
         }
-        if query.overlaps_right(self.key(), self.sort_order()) {
+        if query.overlaps_right(key, order) {
             if let Some(right) = store.data_opt(self.right())? {
-                let right_bbox = bbox.split_right(self.key(), self.rank());
+                let right_bbox = bbox.split_right(key, order);
                 summary = summary.combine(&right.range_summary_rec(query, &right_bbox, store)?);
             }
         }
