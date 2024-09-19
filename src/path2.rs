@@ -99,40 +99,23 @@ fn unescape(path: &[u8]) -> Vec<Vec<u8>> {
 }
 
 pub struct Path2 {
-    // data, containing the escaped path concatenated with the unescaped components(*)
-    //
-    // data layout:
-    // 0..escaped_len: escaped path
-    // escaped_len..escaped_len+4*count: start and end offsets of each component, as u16 big-endian
-    // escaped_len+4*count..: unescaped components, if needed
+    /// data, containing the escaped path concatenated with the unescaped components(*)
+    ///
+    /// data layout:
+    ///   0..count * 4: start and end offsets of each component, as u16 big-endian
+    ///   count * 4..escaped_start: unescaped components, if needed
+    ///   escaped_start..: escaped path
     data: Arc<[u8]>,
-    // length of the escaped representation of the path
-    escaped_len: u16,
-    // number of components in the path
+    /// start of the escaped path in the data
+    escaped_start: u16,
+    /// number of components in the path
     count: u16,
 }
 
 impl From<Vec<Vec<u8>>> for Path2 {
     fn from(components: Vec<Vec<u8>>) -> Self {
-        let mut target = Vec::new();
-        let count = components.len() as u16;
-        escape_into(&components, &mut target);
-        let escaped_len = target.len() as u16;
-        let sizes_len = components.len() * 4;
-        target.extend((0..sizes_len).map(|_| 0u8));
-        for (i, component) in components.iter().enumerate() {
-            let start = u16::try_from(target.len()).unwrap();
-            target.extend(component);
-            let end = u16::try_from(target.len()).unwrap();
-            let base = escaped_len as usize + 4 * i;
-            target[base..base + 2].copy_from_slice(&start.to_be_bytes());
-            target[base + 2..base + 4].copy_from_slice(&end.to_be_bytes());
-        }
-        Self {
-            data: target.into(),
-            escaped_len,
-            count,
-        }
+        let escaped = escape(components.iter());
+        Self::from_escaped(&escaped)
     }
 }
 
@@ -178,15 +161,15 @@ impl Eq for Path2 {}
 
 impl Path2 {
     fn escaped(&self) -> &[u8] {
-        &self.data[..self.escaped_len as usize]
+        let start = self.escaped_start as usize;
+        &self.data[start..]
     }
 
     fn components(&self) -> impl Iterator<Item = &[u8]> {
         let data = &self.data;
-        let escaped_len = self.escaped_len as usize;
         let count = self.count as usize;
         (0..count).map(move |i| {
-            let base = escaped_len + 4 * i;
+            let base = i * 4;
             let start = u16::from_be_bytes(data[base..base + 2].try_into().unwrap()) as usize;
             let end = u16::from_be_bytes(data[base + 2..base + 4].try_into().unwrap()) as usize;
             &data[start..end]
@@ -196,10 +179,9 @@ impl Path2 {
     fn from_escaped(escaped: &[u8]) -> Self {
         let mut escape = false;
         let mut res = Vec::new();
-        res.extend_from_slice(escaped);
-        let mut sizes = Vec::new();
-        let mut unescaped_start = res.len();
-        let mut escaped_start = 0;
+        let mut sizes = smallvec::SmallVec::<[(u16, u16, bool); 8]>::new();
+        let mut unescaped_start = res.len() as u16;
+        let mut escaped_start = 0u16;
         for i in 0..escaped.len() {
             let byte = escaped[i];
             if escape {
@@ -209,45 +191,45 @@ impl Path2 {
                 match byte {
                     ESCAPE => escape = true,
                     SEPARATOR => {
-                        let escaped_end = i;
-                        let unescaped_end = res.len();
+                        let escaped_end = i as u16;
+                        let unescaped_end = res.len() as u16;
                         if unescaped_end - unescaped_start == escaped_end - escaped_start {
-                            sizes.push((escaped_start, escaped_end));
-                            res.truncate(unescaped_start);
+                            sizes.push((escaped_start, escaped_end, false));
+                            res.truncate(unescaped_start as usize);
                         } else {
-                            sizes.push((unescaped_start, unescaped_end));
+                            sizes.push((unescaped_start, unescaped_end, true));
                         }
-                        unescaped_start = res.len();
-                        escaped_start = i + 1;
+                        unescaped_start = res.len() as u16;
+                        escaped_start = (i + 1) as u16;
                     }
                     _ => res.push(byte),
                 }
             }
         }
         let count = sizes.len();
-        let sizes_len = count * 4;
+        let sizes_len = (count * 4) as u16;
         // make room for the sizes, we need 4 bytes per component
-        res.splice(escaped.len()..escaped.len(), (0..sizes_len).map(|_| 0u8));
+        res.splice(0..0, (0..sizes_len).map(|_| 0u8));
+        let escaped_start = res.len() as u16;
+        res.extend_from_slice(escaped);
         // adjust the offsets and store them in the allocated space
-        for (i, (mut start, mut end)) in sizes.into_iter().enumerate() {
-            if end > escaped.len() {
-                // this refers to the extra data after the escaped path, so we need to adjust
-                // the offsets to make room for the sizes.
+        for (i, (mut start, mut end, unescaped)) in sizes.into_iter().enumerate() {
+            if unescaped {
                 start += sizes_len;
                 end += sizes_len;
+            } else {
+                start += escaped_start;
+                end += escaped_start;
             }
-            let base = escaped.len() + 4 * i;
+            let base = 4 * i;
             res[base..base + 2].copy_from_slice(&(start as u16).to_be_bytes());
             res[base + 2..base + 4].copy_from_slice(&(end as u16).to_be_bytes());
         }
         let res = Self {
             data: res.into(),
-            escaped_len: escaped.len() as u16,
+            escaped_start,
             count: count as u16,
         };
-        let res2 = Self::from(unescape(escaped));
-        println!("{} {}", hex::encode(&res.data), hex::encode(&res2.data));
-        assert_eq!(res, res2);
         res
     }
 }
