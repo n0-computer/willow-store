@@ -277,7 +277,7 @@ fn tree_query_ordered_impl(
 fn tree_summary_impl(items: Vec<(TPoint, u64)>, query: TQuery) -> TestResult<()> {
     let mut store = MemStore::new();
     let tree = willow_store::Node::from_iter(items.clone(), &mut store)?;
-    let actual = tree.summary(&query, &store)?;
+    let actual = tree.range_summary(&query, &store)?;
     let mut expected = ValueSum::neutral();
     for (key, value) in &items {
         if query.contains(key) {
@@ -295,7 +295,7 @@ fn tree_summary_impl(items: Vec<(TPoint, u64)>, query: TQuery) -> TestResult<()>
 fn tree_count_range_impl(items: Vec<(TPoint, u64)>, query: TQuery) -> TestResult<()> {
     let mut store = MemStore::new();
     let tree = willow_store::Node::from_iter(items.clone(), &mut store)?;
-    let actual = tree.count_range(&query, &store)?;
+    let actual = tree.range_count(&query, &store)?;
     let mut expected = 0;
     for (key, _value) in &items {
         if query.contains(key) {
@@ -309,15 +309,15 @@ fn tree_count_range_impl(items: Vec<(TPoint, u64)>, query: TQuery) -> TestResult
 fn tree_find_split_plane_impl(items: Vec<(TPoint, u64)>, query: TQuery) -> TestResult<()> {
     let mut store = MemStore::new();
     let tree = willow_store::Node::from_iter(items.clone(), &mut store)?;
-    let total_count = tree.count_range(&query, &store)?;
+    let total_count = tree.range_count(&query, &store)?;
     let Some((left, left_count, right, right_count)) = tree.find_split_plane(&query, &store)?
     else {
         assert!(total_count <= 1);
         return Ok(());
     };
     assert_eq!(left_count + right_count, total_count);
-    assert_eq!(left_count, tree.count_range(&left, &store)?);
-    assert_eq!(right_count, tree.count_range(&right, &store)?);
+    assert_eq!(left_count, tree.range_count(&left, &store)?);
+    assert_eq!(right_count, tree.range_count(&right, &store)?);
     Ok(())
 }
 
@@ -325,7 +325,7 @@ fn tree_split_impl(items: Vec<(TPoint, u64)>, query: TQuery) -> TestResult<()> {
     // println!("Query: {}", query.pretty());
     let mut store = MemStore::new();
     let tree = willow_store::Node::from_iter(items.clone(), &mut store)?;
-    let total_count = tree.count_range(&query, &store)?;
+    let total_count = tree.range_count(&query, &store)?;
     // println!("total count: {}", total_count);
     let ranges = tree
         .split_range(query.clone(), 3, &store)

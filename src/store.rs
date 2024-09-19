@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use anyhow::Result;
 use std::fmt::{Debug, Display};
@@ -11,32 +11,16 @@ pub trait BlobStore {
     fn create(&mut self, node: &[u8]) -> Result<NodeId>;
     /// Read a node from the store.
     fn read(&self, id: NodeId) -> Result<Vec<u8>>;
+    /// Peek at a node in the store and project it into a value.
+    fn peek<T>(&self, id: NodeId, f: impl Fn(&[u8]) -> T) -> Result<T>;
     /// Update a node in the store.
     fn update(&mut self, id: NodeId, node: &[u8]) -> Result<()>;
     /// Delete a node from the store.
     fn delete(&mut self, id: NodeId) -> Result<()>;
 }
 
-impl BlobStore for Box<dyn BlobStore> {
-    fn create(&mut self, node: &[u8]) -> Result<NodeId> {
-        self.as_mut().create(node)
-    }
-
-    fn read(&self, id: NodeId) -> Result<Vec<u8>> {
-        self.as_ref().read(id)
-    }
-
-    fn update(&mut self, id: NodeId, node: &[u8]) -> Result<()> {
-        self.as_mut().update(id, node)
-    }
-
-    fn delete(&mut self, id: NodeId) -> Result<()> {
-        self.as_mut().delete(id)
-    }
-}
-
 pub struct MemStore {
-    nodes: BTreeMap<NodeId, Vec<u8>>,
+    nodes: BTreeMap<NodeId, Arc<[u8]>>,
 }
 
 impl MemStore {
@@ -55,20 +39,28 @@ impl BlobStore for MemStore {
     fn create(&mut self, node: &[u8]) -> Result<NodeId> {
         let id = NodeId::from((self.nodes.len() as u64) + 1);
         assert!(!id.is_empty());
-        self.nodes.insert(id, node.to_vec());
+        self.nodes.insert(id, node.to_vec().into());
         Ok(id)
     }
 
     fn update(&mut self, id: NodeId, node: &[u8]) -> Result<()> {
         assert!(!id.is_empty());
-        self.nodes.insert(id, node.to_vec());
+        self.nodes.insert(id, node.to_vec().into());
         Ok(())
     }
 
     fn read(&self, id: NodeId) -> Result<Vec<u8>> {
         assert!(!id.is_empty());
         match self.nodes.get(&id) {
-            Some(data) => Ok(data.clone()),
+            Some(data) => Ok(data.to_vec()),
+            None => Err(anyhow::anyhow!("Node not found")),
+        }
+    }
+
+    fn peek<T>(&self, id: NodeId, f: impl Fn(&[u8]) -> T) -> Result<T> {
+        assert!(!id.is_empty());
+        match self.nodes.get(&id) {
+            Some(data) => Ok(f(data)),
             None => Err(anyhow::anyhow!("Node not found")),
         }
     }

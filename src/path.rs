@@ -1,12 +1,16 @@
 use core::str;
 use std::{
     borrow::Borrow,
+    cmp::Ordering,
     fmt::{Debug, Display, Formatter},
+    ops::Index,
     str::FromStr,
     sync::Arc,
+    time::SystemTime,
 };
 
 use rand::Rng;
+use redb::Range;
 use ref_cast::RefCast;
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
@@ -315,6 +319,18 @@ impl Display for Blake3Hash {
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, FromBytes, AsBytes, FromZeroes)]
 #[repr(transparent)]
 pub struct Timestamp([u8; 8]);
+
+impl From<SystemTime> for Timestamp {
+    fn from(time: SystemTime) -> Self {
+        if let Ok(since_epoch) = time.duration_since(std::time::UNIX_EPOCH) {
+            let secs = since_epoch.as_secs();
+            let micros = since_epoch.subsec_micros();
+            Self::from(secs * 1000000 + micros as u64)
+        } else {
+            Self::ZERO
+        }
+    }
+}
 
 impl LowerBound for Timestamp {
     fn min_value() -> Self {

@@ -115,6 +115,7 @@ mod store;
 use ref_cast::RefCast;
 mod layout;
 mod path;
+mod path2;
 use layout::*;
 pub use store::BlobStore;
 pub use store::MemStore;
@@ -414,16 +415,16 @@ impl<P: KeyParams> QueryRange3d<P> {
         self.x.contains(point.x()) && self.y.contains(point.y()) && self.z.contains(point.z())
     }
 
-    pub fn overlaps_left(&self, key: &PointRef<P>, rank: u8) -> bool {
-        match SortOrder::from(rank) {
+    pub fn overlaps_left(&self, key: &PointRef<P>, order: SortOrder) -> bool {
+        match order {
             SortOrder::XYZ => &self.x.min <= key.x(),
             SortOrder::YZX => &self.y.min <= key.y(),
             SortOrder::ZXY => &self.z.min.borrow() <= &key.z(),
         }
     }
 
-    pub fn overlaps_right(&self, key: &PointRef<P>, rank: u8) -> bool {
-        match SortOrder::from(rank) {
+    pub fn overlaps_right(&self, key: &PointRef<P>, order: SortOrder) -> bool {
+        match order {
             SortOrder::XYZ => !self
                 .x
                 .max
@@ -876,6 +877,18 @@ pub trait NodeStore<P: TreeParams>: store::BlobStore {
         Ok(OwnedNodeData::new(data))
     }
 
+    fn peek_data<T>(&self, id: Node<P>, f: impl Fn(&NodeData<P>) -> T) -> Result<T> {
+        store::BlobStore::peek(self, id.0, |data| f(NodeData::ref_cast(data)))
+    }
+
+    fn peek_data_opt<T>(&self, id: Node<P>, f: impl Fn(&NodeData<P>) -> T) -> Result<Option<T>> {
+        Ok(if id.is_empty() {
+            None
+        } else {
+            Some(self.peek_data(id, f)?)
+        })
+    }
+
     /// Get a node by id, returning None if the id is None.
     ///
     /// This is just a convenience method for the common case where you have an
@@ -1214,32 +1227,64 @@ impl<P: TreeParams> Node<P> {
         Ok(())
     }
 
-    /// Iterate over the entire tree in its natural order.
-    ///
-    /// The order is implementation dependent and should not be relied on.
     pub fn iter<'a>(
         &'a self,
         store: &'a impl NodeStore<P>,
     ) -> impl Iterator<Item = Result<(Point<P>, P::V)>> + 'a {
+        self.iter_impl(
+            &|data, _| (data.key().to_owned(), data.value().clone()),
+            store,
+        )
+    }
+
+    pub fn values<'a>(
+        &'a self,
+        store: &'a impl NodeStore<P>,
+    ) -> impl Iterator<Item = Result<P::V>> + 'a {
+        self.iter_impl(&|data, _| data.value().clone(), store)
+    }
+
+    pub fn average_node_depth(&self, store: &impl NodeStore<P>) -> Result<(u64, u64)> {
+        let mut sum = 0;
+        for item in self.iter_impl(&|_, depth| depth, store) {
+            sum += item?;
+        }
+        Ok((sum, self.count(store)?))
+    }
+
+    /// Iterate over the entire tree in its natural order.
+    ///
+    /// The order is implementation dependent and should not be relied on.
+    fn iter_impl<'a, T: 'a>(
+        &'a self,
+        project: &'a impl Fn(&NodeData<P>, u64) -> T,
+        store: &'a impl NodeStore<P>,
+    ) -> impl Iterator<Item = Result<T>> + 'a {
         Gen::new(|co| async move {
-            if let Err(cause) = self.iter0(store, &co).await {
+            if let Err(cause) = self.iter_rec(0, &project, store, &co).await {
                 co.yield_(Err(cause)).await;
             }
         })
         .into_iter()
     }
 
-    async fn iter0(
+    async fn iter_rec<T>(
         &self,
+        depth: u64,
+        project: &impl Fn(&NodeData<P>, u64) -> T,
         store: &impl NodeStore<P>,
-        co: &Co<Result<(Point<P>, P::V)>>,
+        co: &Co<Result<T>>,
     ) -> Result<()> {
-        if let Some(data) = store.data_opt(*self)? {
-            Box::pin(data.left().iter0(store, co)).await?;
-            co.yield_(Ok((data.key().to_owned(), data.value().to_owned())))
-                .await;
-            Box::pin(data.right().iter0(store, co)).await?;
+        if self.is_empty() {
+            return Ok(());
         }
+        let (left, right, item) = store.peek_data(*self, |data| {
+            let res = project(data, depth);
+            (data.left(), data.right(), res)
+        })?;
+        Box::pin(left.iter_rec(depth + 1, project, store, co)).await?;
+        co.yield_(Ok(item)).await;
+        Box::pin(right.iter_rec(depth + 1, project, store, co)).await?;
         Ok(())
     }
 
@@ -1248,17 +1293,21 @@ impl<P: TreeParams> Node<P> {
     /// The result is identical to iterating over the elements in the 3d range
     /// and combining the summaries of each element, but will be much more
     /// efficient for large trees.
-    pub fn summary(&self, query: &QueryRange3d<P>, store: &impl NodeStore<P>) -> Result<P::M> {
+    pub fn range_summary(
+        &self,
+        query: &QueryRange3d<P>,
+        store: &impl NodeStore<P>,
+    ) -> Result<P::M> {
         if let Some(node) = store.get_node(*self)? {
             let bbox = BBox::all();
-            node.summary0(query, &bbox, store)
+            node.range_summary_rec(query, &bbox, store)
         } else {
             Ok(P::M::neutral())
         }
     }
 
     /// Count the number of elements in a 3d range.
-    pub fn count_range(&self, query: &QueryRange3d<P>, store: &impl NodeStore<P>) -> Result<u64> {
+    pub fn range_count(&self, query: &QueryRange3d<P>, store: &impl NodeStore<P>) -> Result<u64> {
         let bbox = BBox::all();
         self.count_range_rec(query, &bbox, store)
     }
@@ -1269,28 +1318,25 @@ impl<P: TreeParams> Node<P> {
         bbox: &BBox<P>,
         store: &impl NodeStore<P>,
     ) -> Result<u64> {
-        let (lc, sc, rc) = self.count_range_parts(query, bbox, store)?;
-        Ok(lc + sc + rc)
-    }
-
-    fn count_range_parts(
-        &self,
-        query: &QueryRange3d<P>,
-        bbox: &BBox<P>,
-        store: &impl NodeStore<P>,
-    ) -> Result<(u64, u64, u64)> {
         Ok(if let Some(data) = store.data_opt(*self)? {
+            // if the node is fully contained in the query, we can just return the count
+            if bbox.contained_in(&query) {
+                return Ok(data.count());
+            }
             let sc = if query.contains(data.key()) { 1 } else { 0 };
-            let lc = if !data.left().is_empty() && query.overlaps_left(data.key(), data.rank()) {
-                data.left().count_range_rec(
-                    query,
-                    &bbox.split_left(data.key(), data.rank()),
-                    store,
-                )?
-            } else {
-                0
-            };
-            let rc = if !data.right().is_empty() && query.overlaps_right(data.key(), data.rank()) {
+            let lc =
+                if !data.left().is_empty() && query.overlaps_left(data.key(), data.sort_order()) {
+                    data.left().count_range_rec(
+                        query,
+                        &bbox.split_left(data.key(), data.rank()),
+                        store,
+                    )?
+                } else {
+                    0
+                };
+            let rc = if !data.right().is_empty()
+                && query.overlaps_right(data.key(), data.sort_order())
+            {
                 data.right().count_range_rec(
                     query,
                     &bbox.split_right(data.key(), data.rank()),
@@ -1299,9 +1345,9 @@ impl<P: TreeParams> Node<P> {
             } else {
                 0
             };
-            (lc, sc, rc)
+            lc + sc + rc
         } else {
-            (0, 0, 0)
+            0
         })
     }
 
@@ -1317,7 +1363,7 @@ impl<P: TreeParams> Node<P> {
         P::ZOwned: Display,
     {
         Gen::new(|co| async move {
-            let Ok(total_count) = self.count_range(&query, store) else {
+            let Ok(total_count) = self.range_count(&query, store) else {
                 return;
             };
             if let Err(cause) = self
@@ -1335,7 +1381,7 @@ impl<P: TreeParams> Node<P> {
         query: &QueryRange3d<P>,
         store: &impl NodeStore<P>,
     ) -> Result<Option<(QueryRange3d<P>, u64, QueryRange3d<P>, u64)>> {
-        let total_count = self.count_range(query, store)?;
+        let total_count = self.range_count(query, store)?;
         self.find_split_plane0(*self, query, total_count, store)
     }
 
@@ -1353,7 +1399,7 @@ impl<P: TreeParams> Node<P> {
             let o = data.sort_order();
             for sort_order in [o, o.inc(), o.inc().inc()] {
                 let left = query.left(data.key(), sort_order);
-                let left_count = root.count_range(&left, store)?;
+                let left_count = root.range_count(&left, store)?;
                 if left_count < total_count && left_count > 0 {
                     let right_count = total_count - left_count;
                     let right = query.right(data.key(), sort_order);
@@ -1455,7 +1501,7 @@ impl<P: TreeParams> Node<P> {
             let left = query.left(data.key(), sort_order);
             let right = query.right(data.key(), sort_order);
             // println!("splitting\n{} into\n{}\nand\n{}\nin\n{:?}", query.pretty(), left.pretty(), right.pretty(), data.sort_order());
-            let left_count = root.count_range(&left, store)?;
+            let left_count = root.range_count(&left, store)?;
             let right_count = total_count - left_count;
             if split_factor == 1 {
                 co.yield_(Ok((query.clone(), total_count))).await;
@@ -1495,7 +1541,7 @@ impl<P: TreeParams> Node<P> {
         } else {
             // this is not necessarily 1, since we could have points from "above" that
             // are inside the query range
-            let total_count = root.count_range(&query, store)?;
+            let total_count = root.range_count(&query, store)?;
             if total_count > 0 {
                 co.yield_(Ok((query.clone(), total_count))).await;
             }
@@ -1512,29 +1558,67 @@ impl<P: TreeParams> Node<P> {
         store: &'a impl NodeStore<P>,
     ) -> impl Iterator<Item = Result<(Point<P>, P::V)>> + 'a {
         Gen::new(|co| async move {
-            if let Err(cause) = self.query0(query, store, &co).await {
+            if let Err(cause) = self.query_rec(query, store, &co).await {
                 co.yield_(Err(cause)).await;
             }
         })
         .into_iter()
     }
 
-    async fn query0(
+    fn filter(&self, f: impl Fn() -> bool) -> Self {
+        if !self.is_empty() && f() {
+            *self
+        } else {
+            Node::EMPTY
+        }
+    }
+
+    async fn query_rec(
         &self,
         query: &QueryRange3d<P>,
         store: &impl NodeStore<P>,
         co: &Co<Result<(Point<P>, P::V)>>,
     ) -> Result<()> {
-        if let Some(data) = store.data_opt(*self)? {
-            if query.overlaps_left(data.key(), data.rank()) {
-                Box::pin(data.left().query0(query, store, co)).await?;
+        const peek: bool = true;
+        if peek {
+            if self.is_empty() {
+                return Ok(());
             }
-            if query.contains(data.key()) {
-                co.yield_(Ok((data.key().to_owned(), data.value().to_owned())))
-                    .await;
+            // project out the data we need, left, right and kv
+            let (left, kv, right) = store.peek_data(*self, |data| {
+                let key = data.key();
+                let order = data.sort_order();
+                let left = data.left().filter(|| query.overlaps_left(key, order));
+                let right = data.right().filter(|| query.overlaps_right(key, order));
+                let kv = if query.contains(key) {
+                    Some((key.to_owned(), data.value().to_owned()))
+                } else {
+                    None
+                };
+                (left, kv, right)
+            })?;
+            // do the recursion after the projection
+            if !left.is_empty() {
+                Box::pin(left.query_rec(query, store, co)).await?;
             }
-            if query.overlaps_right(data.key(), data.rank()) {
-                Box::pin(data.right().query0(query, store, co)).await?;
+            if let Some(kv) = kv {
+                co.yield_(Ok(kv)).await;
+            }
+            if !right.is_empty() {
+                Box::pin(right.query_rec(query, store, co)).await?;
+            }
+        } else {
+            if let Some(data) = store.data_opt(*self)? {
+                if query.overlaps_left(data.key(), data.sort_order()) {
+                    Box::pin(data.left().query_rec(query, store, co)).await?;
+                }
+                if query.contains(data.key()) {
+                    co.yield_(Ok((data.key().to_owned(), data.value().to_owned())))
+                        .await;
+                }
+                if query.overlaps_right(data.key(), data.sort_order()) {
+                    Box::pin(data.right().query_rec(query, store, co)).await?;
+                }
             }
         }
         Ok(())
@@ -1551,69 +1635,132 @@ impl<P: TreeParams> Node<P> {
         store: &'a impl NodeStore<P>,
     ) -> impl Iterator<Item = Result<(Point<P>, P::V)>> + 'a {
         Gen::new(|co| async move {
-            if let Err(cause) = self.query_ordered0(query, ordering, store, &co).await {
+            if let Err(cause) = self.query_ordered_rec(query, ordering, store, &co).await {
                 co.yield_(Err(cause)).await;
             }
         })
         .into_iter()
     }
 
-    async fn query_ordered0(
+    async fn query_ordered_rec(
         &self,
         query: &QueryRange3d<P>,
         ordering: SortOrder,
         store: &impl NodeStore<P>,
         co: &Co<Result<(Point<P>, P::V)>>,
     ) -> Result<()> {
-        let Some(data) = store.data_opt(*self)? else {
-            return Ok(());
-        };
-        // we know that the node partitions the space in the correct way, so
-        // we can just concatenate the results from the left, self and right
-        if data.sort_order() == ordering {
-            if query.overlaps_left(data.key(), data.rank()) {
-                Box::pin(data.left().query_ordered0(query, ordering, store, co)).await?;
+        const peek: bool = true;
+        if peek {
+            if self.is_empty() {
+                return Ok(());
             }
-            if query.contains(data.key()) {
-                co.yield_(Ok((data.key().to_owned(), data.value().to_owned())))
-                    .await;
+            let (left, right, kv, node_order) = store.peek_data(*self, |data| {
+                let order = data.sort_order();
+                let key = data.key();
+                let left = data.left().filter(|| query.overlaps_left(key, order));
+                let right = data.right().filter(|| query.overlaps_right(key, order));
+                let kv = if query.contains(key) {
+                    Some((key.to_owned(), data.value().to_owned()))
+                } else {
+                    None
+                };
+                (left, right, kv, order)
+            })?;
+            if node_order == ordering {
+                if !left.is_empty() {
+                    Box::pin(left.query_ordered_rec(query, ordering, store, co)).await?;
+                }
+                if let Some(kv) = kv {
+                    co.yield_(Ok(kv)).await;
+                }
+                if !right.is_empty() {
+                    Box::pin(right.query_ordered_rec(query, ordering, store, co)).await?;
+                }
+            } else {
+                // the node does not partition the space in the correct way, so we
+                // need to merge the results from the left, self and right
+                // still better than a full sort!
+                let iter1 = if !left.is_empty() {
+                    Some(left.query_ordered(query, ordering, store).into_iter())
+                } else {
+                    None
+                }
+                .into_iter()
+                .flatten();
+                let iter2 = if let Some(kv) = kv {
+                    Some(std::iter::once(Ok(kv)))
+                } else {
+                    None
+                }
+                .into_iter()
+                .flatten();
+                let iter3 = if !right.is_empty() {
+                    Some(right.query_ordered(query, ordering, store).into_iter())
+                } else {
+                    None
+                }
+                .into_iter()
+                .flatten();
+                merge3(iter1, iter2, iter3, ordering, co).await?;
             }
-            if query.overlaps_right(data.key(), data.rank()) {
-                Box::pin(data.right().query_ordered0(query, ordering, store, co)).await?;
-            }
+            Ok(())
         } else {
-            // the node does not partition the space in the correct way, so we
-            // need to merge the results from the left, self and right
-            // still better than a full sort!
-            let iter1 = if query.overlaps_left(data.key(), data.rank()) {
-                itertools::Either::Left(
-                    data.left()
-                        .query_ordered(query, ordering, store)
-                        .into_iter(),
-                )
-            } else {
-                itertools::Either::Right(std::iter::empty())
+            let Some(data) = store.data_opt(*self)? else {
+                return Ok(());
             };
-            let iter2 = if query.contains(data.key()) {
-                itertools::Either::Left(std::iter::once(Ok((
-                    data.key().to_owned(),
-                    data.value().to_owned(),
-                ))))
+            // we know that the node partitions the space in the correct way, so
+            // we can just concatenate the results from the left, self and right
+            if data.sort_order() == ordering {
+                if query.overlaps_left(data.key(), data.sort_order()) {
+                    Box::pin(data.left().query_ordered_rec(query, ordering, store, co)).await?;
+                }
+                if query.contains(data.key()) {
+                    co.yield_(Ok((data.key().to_owned(), data.value().to_owned())))
+                        .await;
+                }
+                if query.overlaps_right(data.key(), data.sort_order()) {
+                    Box::pin(data.right().query_ordered_rec(query, ordering, store, co)).await?;
+                }
             } else {
-                itertools::Either::Right(std::iter::empty())
-            };
-            let iter3 = if query.overlaps_right(data.key(), data.rank()) {
-                itertools::Either::Left(
-                    data.right()
-                        .query_ordered(query, ordering, store)
-                        .into_iter(),
-                )
-            } else {
-                itertools::Either::Right(std::iter::empty())
-            };
-            merge3(iter1, iter2, iter3, ordering, co).await?;
+                // the node does not partition the space in the correct way, so we
+                // need to merge the results from the left, self and right
+                // still better than a full sort!
+                let iter1 = if query.overlaps_left(data.key(), data.sort_order()) {
+                    Some(
+                        data.left()
+                            .query_ordered(query, ordering, store)
+                            .into_iter(),
+                    )
+                } else {
+                    None
+                }
+                .into_iter()
+                .flatten();
+                let iter2 = if query.contains(data.key()) {
+                    Some(std::iter::once(Ok((
+                        data.key().to_owned(),
+                        data.value().to_owned(),
+                    ))))
+                } else {
+                    None
+                }
+                .into_iter()
+                .flatten();
+                let iter3 = if query.overlaps_right(data.key(), data.sort_order()) {
+                    Some(
+                        data.right()
+                            .query_ordered(query, ordering, store)
+                            .into_iter(),
+                    )
+                } else {
+                    None
+                }
+                .into_iter()
+                .flatten();
+                merge3(iter1, iter2, iter3, ordering, co).await?;
+            }
+            Ok(())
         }
-        Ok(())
     }
 
     /// Split an entire tree into leafs. The nodes are modified in place.
@@ -1781,7 +1928,7 @@ impl<P: TreeParams> NodeData<P> {
         *self.count_mut() = 1.into();
     }
 
-    fn summary0(
+    fn range_summary_rec(
         &self,
         query: &QueryRange3d<P>,
         bbox: &BBox<P>,
@@ -1798,19 +1945,19 @@ impl<P: TreeParams> NodeData<P> {
             return Ok(self.summary().clone());
         }
         let mut summary = P::M::neutral();
-        if query.overlaps_left(self.key(), self.rank()) {
+        if query.overlaps_left(self.key(), self.sort_order()) {
             if let Some(left) = store.data_opt(self.left())? {
                 let left_bbox = bbox.split_left(self.key(), self.rank());
-                summary = summary.combine(&left.summary0(query, &left_bbox, store)?);
+                summary = summary.combine(&left.range_summary_rec(query, &left_bbox, store)?);
             }
         }
         if query.contains(self.key()) {
             summary = summary.combine(&P::M::lift(self.key(), self.value()));
         }
-        if query.overlaps_right(self.key(), self.rank()) {
+        if query.overlaps_right(self.key(), self.sort_order()) {
             if let Some(right) = store.data_opt(self.right())? {
                 let right_bbox = bbox.split_right(self.key(), self.rank());
-                summary = summary.combine(&right.summary0(query, &right_bbox, store)?);
+                summary = summary.combine(&right.range_summary_rec(query, &right_bbox, store)?);
             }
         }
         Ok(summary)
