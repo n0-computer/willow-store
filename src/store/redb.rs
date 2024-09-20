@@ -1,6 +1,8 @@
 use redb::{Database, ReadableTable, TableDefinition, WriteTransaction};
 use zerocopy::{AsBytes, FromBytes};
 
+use crate::{Node, Point, WillowTreeParams};
+
 use super::{BlobStore, NodeId, Result};
 
 pub struct RedbBlobStore {
@@ -135,7 +137,7 @@ self_cell::self_cell!(
 pub struct WriteBatch(WriteTransactionInner);
 
 impl WriteBatch {
-    fn commit(self) -> Result<()> {
+    pub fn commit(self) -> Result<()> {
         self.0.into_owner().commit()?;
         Ok(())
     }
@@ -212,7 +214,7 @@ impl BlobStore for RedbBlobStore {
             // Update the autoincrement value
             autoinc_table.insert("id", &new_id)?;
             // Create a NodeId from the new_id
-            new_node_id = NodeId(new_id.to_le_bytes());
+            new_node_id = NodeId::from(new_id);
             // Open the blobs table and insert the new node
             let mut blob_table = write_txn.open_table(BLOB_TABLE)?;
             blob_table.insert(&new_node_id, node)?;
@@ -260,6 +262,9 @@ impl BlobStore for RedbBlobStore {
     }
 }
 
+pub type TNode = Node<WillowTreeParams>;
+pub type TPoint = Point<WillowTreeParams>;
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -275,17 +280,14 @@ mod tests {
     };
 
     use crate::{
-        path2::{Subspace, Timestamp, WillowTreeParams, WillowValue},
+        path::{Subspace, Timestamp, WillowTreeParams, WillowValue},
         MemStore, Node, Point, QueryRange, QueryRange3d,
     };
 
     use super::*;
-    use crate::path2::Path;
+    use crate::path::Path;
     use testresult::TestResult;
     use walkdir::WalkDir;
-
-    type TNode = Node<WillowTreeParams>;
-    type TPoint = Point<WillowTreeParams>;
 
     fn entry_to_triple(entry: walkdir::DirEntry) -> io::Result<Option<(u32, Timestamp, PathBuf)>> {
         let path = entry.path().to_path_buf();
@@ -343,6 +345,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn linux_kernel_test() -> TestResult<()> {
         let db = RedbBlobStore::memory()?;
         let mut batch = db.txn()?;

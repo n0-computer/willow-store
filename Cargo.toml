@@ -28,3 +28,6 @@ zerocopy = { version = "0.7.32", features = ["derive"] }
 [dev-dependencies]
 testresult = "0.4.1"
 walkdir = "2.5.0"
+
+[profile.release]
+debug = true

@@ -3,14 +3,12 @@ use std::{
     borrow::Borrow,
     cmp::Ordering,
     fmt::{Debug, Display, Formatter},
-    ops::Index,
     str::FromStr,
     sync::Arc,
     time::SystemTime,
 };
 
 use rand::Rng;
-use redb::Range;
 use ref_cast::RefCast;
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
@@ -18,77 +16,6 @@ use crate::{
     FixedSize, KeyParams, LiftingCommutativeMonoid, LowerBound, NoQuotes, PointRef, RefFromSlice,
     TreeParams, VariableSize,
 };
-
-const ESCAPE: u8 = 1;
-const SEPARATOR: u8 = 0;
-
-fn escape_into<P, C>(path: P, result: &mut Vec<u8>)
-where
-    P: AsRef<[C]>,
-    C: AsRef<[u8]>,
-{
-    result.push(0);
-    for segment in path.as_ref() {
-        for &byte in segment.as_ref() {
-            match byte {
-                ESCAPE => result.extend([ESCAPE, ESCAPE]),
-                SEPARATOR => result.extend([ESCAPE, SEPARATOR]),
-                _ => result.push(byte),
-            }
-        }
-        result.push(SEPARATOR);
-    }
-}
-
-fn escape<P, C>(path: P) -> Vec<u8>
-where
-    P: AsRef<[C]>,
-    C: AsRef<[u8]>,
-{
-    let mut result = Vec::new();
-    escape_into(path, &mut result);
-    result
-}
-
-fn unescape(path: &[u8]) -> Vec<Vec<u8>> {
-    let mut components = Vec::new();
-    let mut segment = Vec::new();
-    let mut escape = false;
-    assert!(path.len() > 0 && path[0] == 0);
-    let path = &path[1..];
-    for &byte in path {
-        if escape {
-            segment.push(byte);
-            escape = false;
-        } else {
-            match byte {
-                ESCAPE => escape = true,
-                SEPARATOR => {
-                    components.push(segment);
-                    segment = Vec::new();
-                }
-                _ => segment.push(byte),
-            }
-        }
-    }
-    components
-}
-
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
-pub struct Path {
-    escaped: Arc<[u8]>,
-    components: Vec<Vec<u8>>,
-}
-
-impl LowerBound for Path {
-    fn min_value() -> Self {
-        Self::from(vec![])
-    }
-
-    fn is_min_value(&self) -> bool {
-        self.components.is_empty()
-    }
-}
 
 /// Formats a single component.
 /// - If the component is valid UTF-8, it is enclosed in quotes, and any quotes within
@@ -120,39 +47,80 @@ fn parse_component(s: &str) -> anyhow::Result<Vec<u8>> {
     Ok(hex::decode(s)?)
 }
 
-impl Display for Path {
-    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            self.components
-                .iter()
-                .map(|x| format_component(&x))
-                .collect::<Vec<_>>()
-                .join("/")
-        )
+// these values are needed to keep the order preserved
+const ESCAPE: u8 = 1;
+const SEPARATOR: u8 = 0;
+
+fn escape_into<I, C>(components: I, result: &mut Vec<u8>)
+where
+    I: IntoIterator<Item = C>,
+    C: AsRef<[u8]>,
+{
+    for segment in components.into_iter() {
+        for &byte in segment.as_ref() {
+            match byte {
+                ESCAPE => result.extend([ESCAPE, ESCAPE]),
+                SEPARATOR => result.extend([ESCAPE, SEPARATOR]),
+                _ => result.push(byte),
+            }
+        }
+        result.push(SEPARATOR);
     }
+    // you might think that the trailing separator is unnecessary, but it is needed
+    // to distinguish between the empty path and the path with one empty component
 }
 
-impl FromStr for Path {
-    type Err = anyhow::Error;
+fn escape<I, C>(components: I) -> Vec<u8>
+where
+    I: IntoIterator<Item = C>,
+    C: AsRef<[u8]>,
+{
+    let mut result = Vec::new();
+    escape_into(components, &mut result);
+    result
+}
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let components: Vec<Vec<u8>> = s
-            .split('/')
-            .map(parse_component)
-            .collect::<anyhow::Result<Vec<Vec<_>>>>()?;
-        Ok(components.into())
+fn unescape(path: &[u8]) -> Vec<Vec<u8>> {
+    let mut components = Vec::new();
+    let mut segment = Vec::new();
+    let mut escape = false;
+    for &byte in path {
+        if escape {
+            segment.push(byte);
+            escape = false;
+        } else {
+            match byte {
+                ESCAPE => escape = true,
+                SEPARATOR => {
+                    components.push(segment);
+                    segment = Vec::new();
+                }
+                _ => segment.push(byte),
+            }
+        }
     }
+    components
+}
+
+#[derive(Clone)]
+pub struct Path {
+    /// data, containing the escaped path concatenated with the unescaped components(*)
+    ///
+    /// data layout:
+    ///   0..count * 4: start and end offsets of each component, as u16 big-endian
+    ///   count * 4..escaped_start: unescaped components, if needed
+    ///   escaped_start..: escaped path
+    data: Arc<[u8]>,
+    /// start of the escaped path in the data
+    escaped_start: u16,
+    /// number of components in the path
+    count: u16,
 }
 
 impl From<Vec<Vec<u8>>> for Path {
     fn from(components: Vec<Vec<u8>>) -> Self {
-        let escaped = escape(&components).into();
-        Path {
-            components,
-            escaped,
-        }
+        let escaped = escape(components.iter());
+        Self::from_escaped(&escaped)
     }
 }
 
@@ -170,15 +138,138 @@ impl From<&[&str]> for Path {
     }
 }
 
-impl AsRef<[Vec<u8>]> for Path {
-    fn as_ref(&self) -> &[Vec<u8>] {
-        &self.components
+impl Borrow<PathRef> for Path {
+    fn borrow(&self) -> &PathRef {
+        PathRef::ref_cast(self.escaped())
     }
 }
 
-impl Borrow<PathRef> for Path {
-    fn borrow(&self) -> &PathRef {
-        PathRef::ref_cast(&self.escaped)
+impl PartialOrd for Path {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.escaped().partial_cmp(other.escaped())
+    }
+}
+
+impl Ord for Path {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.escaped().cmp(other.escaped())
+    }
+}
+
+impl PartialEq for Path {
+    fn eq(&self, other: &Self) -> bool {
+        self.escaped() == other.escaped()
+    }
+}
+
+impl Eq for Path {}
+
+impl Path {
+    fn escaped(&self) -> &[u8] {
+        let start = self.escaped_start as usize;
+        &self.data[start..]
+    }
+
+    fn components(&self) -> impl Iterator<Item = &[u8]> {
+        let data = &self.data;
+        let count = self.count as usize;
+        (0..count).map(move |i| {
+            let base = i * 4;
+            let start = u16::from_be_bytes(data[base..base + 2].try_into().unwrap()) as usize;
+            let end = u16::from_be_bytes(data[base + 2..base + 4].try_into().unwrap()) as usize;
+            &data[start..end]
+        })
+    }
+
+    fn from_escaped(escaped: &[u8]) -> Self {
+        assert!(escaped.len() < 1 << 15);
+        let mut escape = false;
+        let mut res = Vec::with_capacity(escaped.len() + 32);
+        let mut sizes = smallvec::SmallVec::<[(u16, u16, bool); 8]>::new();
+        let mut unescaped_start = res.len() as u16;
+        let mut escaped_start = 0u16;
+        for i in 0..escaped.len() {
+            let byte = escaped[i];
+            if escape {
+                res.push(byte);
+                escape = false;
+            } else {
+                match byte {
+                    ESCAPE => escape = true,
+                    SEPARATOR => {
+                        let escaped_end = i as u16;
+                        let unescaped_end = res.len() as u16;
+                        let escaped_len = escaped_end - escaped_start;
+                        let unescaped_len = unescaped_end - unescaped_start;
+                        if escaped_len == unescaped_len {
+                            sizes.push((escaped_start, escaped_end, false));
+                            res.truncate(unescaped_start as usize);
+                        } else {
+                            sizes.push((unescaped_start, unescaped_end, true));
+                        }
+                        unescaped_start = res.len() as u16;
+                        escaped_start = (i + 1) as u16;
+                    }
+                    _ => res.push(byte),
+                }
+            }
+        }
+        let count = sizes.len();
+        let sizes_len = (count * 4) as u16;
+        // make room for the sizes, we need 4 bytes per component
+        res.splice(0..0, (0..sizes_len).map(|_| 0u8));
+        let escaped_start = res.len() as u16;
+        res.extend_from_slice(escaped);
+        // adjust the offsets and store them in the allocated space
+        for (i, (mut start, mut end, unescaped)) in sizes.into_iter().enumerate() {
+            if unescaped {
+                start += sizes_len;
+                end += sizes_len;
+            } else {
+                start += escaped_start;
+                end += escaped_start;
+            }
+            let base = 4 * i;
+            res[base..base + 2].copy_from_slice(&(start as u16).to_be_bytes());
+            res[base + 2..base + 4].copy_from_slice(&(end as u16).to_be_bytes());
+        }
+        let res = Self {
+            data: res.into(),
+            escaped_start,
+            count: count as u16,
+        };
+        res
+    }
+}
+
+impl Debug for Path {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        write!(f, "Path2({})", self)
+    }
+}
+
+impl Display for Path {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            self.components()
+                .map(|x| format_component(&x))
+                .collect::<Vec<_>>()
+                .join("/")
+        )
+    }
+}
+
+impl FromStr for Path {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let components: Vec<Vec<u8>> = s
+            .split('/')
+            .map(parse_component)
+            .collect::<anyhow::Result<Vec<Vec<_>>>>()?;
+        Ok(components.into())
     }
 }
 
@@ -215,11 +306,7 @@ impl ToOwned for PathRef {
     type Owned = Path;
 
     fn to_owned(&self) -> Self::Owned {
-        let escaped = self.0.to_vec().into();
-        Path {
-            escaped,
-            components: unescape(&self.0),
-        }
+        Path::from_escaped(&self.0)
     }
 }
 
@@ -283,6 +370,25 @@ impl Display for Subspace {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         write!(f, "{}", hex::encode(self.0))
     }
+}
+
+#[derive(Debug)]
+pub struct WillowTreeParams;
+
+impl KeyParams for WillowTreeParams {
+    // timestamp
+    type X = Subspace;
+    // subspace
+    type Y = Timestamp;
+    // path
+    type Z = PathRef;
+    // owned path
+    type ZOwned = Path;
+}
+
+impl TreeParams for WillowTreeParams {
+    type V = WillowValue;
+    type M = Fingerprint;
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, FromBytes, AsBytes, FromZeroes)]
@@ -442,91 +548,81 @@ impl LiftingCommutativeMonoid<PointRef<WillowTreeParams>, WillowValue> for Finge
     }
 }
 
-#[derive(Debug)]
-pub struct WillowTreeParams;
-
-impl KeyParams for WillowTreeParams {
-    // timestamp
-    type X = Subspace;
-    // subspace
-    type Y = Timestamp;
-    // path
-    type Z = PathRef;
-    // owned path
-    type ZOwned = Path;
-}
-
-impl TreeParams for WillowTreeParams {
-    type V = WillowValue;
-    type M = Fingerprint;
-}
-
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, FromBytes, AsBytes, FromZeroes)]
-#[repr(transparent)]
-pub struct ValueSum(u64);
-
-impl FixedSize for ValueSum {
-    const SIZE: usize = 8;
-}
-
-impl LiftingCommutativeMonoid<PointRef<WillowTreeParams>, u64> for ValueSum {
-    fn neutral() -> Self {
-        Self(0)
-    }
-
-    fn lift(_key: &PointRef<WillowTreeParams>, value: &u64) -> Self {
-        Self(*value)
-    }
-
-    fn combine(&self, other: &Self) -> Self {
-        Self(self.0 + other.0)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use proptest::prelude::*;
     use test_strategy::proptest;
-    use testresult::TestResult;
 
-    fn path_value_range() -> std::ops::Range<u8> {
+    fn component_value_range() -> std::ops::Range<u8> {
         // having more than 3 or 4 values does not add much value to the test
         // 0 and 1 are special values (escape and separator)
         // 3 and 4 are normal values
         0..4
     }
 
-    fn arb_path(max_components: usize, max_component_size: usize) -> impl Strategy<Value = Path> {
+    fn arb_components(
+        max_components: usize,
+        max_component_size: usize,
+    ) -> impl Strategy<Value = Components> {
         prop::collection::vec(
-            prop::collection::vec(path_value_range(), 0..max_component_size),
+            prop::collection::vec(component_value_range(), 0..max_component_size),
             0..max_components,
         )
-        .prop_map(|components| Path::from(components))
+        .prop_map(|components| Components(components))
     }
 
-    impl Arbitrary for Path {
+    #[derive(Debug, Clone)]
+    struct Components(Vec<Vec<u8>>);
+
+    impl Arbitrary for Components {
         type Parameters = ();
         type Strategy = BoxedStrategy<Self>;
 
         fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
-            arb_path(4, 12).boxed()
+            arb_components(4, 12).boxed()
         }
     }
 
     #[proptest]
-    fn test_escape_roundtrip(path: Path) {
-        let path = path;
-        let escaped = escape(&path);
-        let unescaped = unescape(&escaped).into();
-        assert_eq!(path, unescaped);
+    fn test_escape_roundtrip(comp: Components) {
+        let comp = comp.0;
+        let escaped = escape(&comp);
+        let unescaped = unescape(&escaped);
+        assert_eq!(comp, unescaped);
     }
 
     #[proptest]
-    fn test_escape_preserves_order(a: Path, b: Path) {
-        let ae = escape(&a);
-        let be = escape(&b);
-        assert_eq!(ae.cmp(&be), a.components.cmp(&b.components));
+    fn test_escape_preserves_order(a: Components, b: Components) {
+        let ac = a.0;
+        let bc = b.0;
+        let ae = escape(&ac);
+        let be = escape(&bc);
+        assert_eq!(ae.cmp(&be), ac.cmp(&bc));
+    }
+
+    fn path_escape_roundtrip_impl(c: Components) {
+        let c = c.0;
+        let escaped = escape(&c);
+        let path = Path::from_escaped(&escaped);
+        let c2 = path.components().map(|x| x.to_vec()).collect::<Vec<_>>();
+        assert_eq!(c, c2);
+    }
+
+    #[proptest]
+    fn prop_path_escape_roundtrip(c: Components) {
+        path_escape_roundtrip_impl(c);
+    }
+
+    #[test]
+    fn test_path_escape_roundtrip() {
+        let cases = vec![
+            // vec![vec![0,0]],
+            vec![vec![2]],
+        ];
+        for case in cases {
+            path_escape_roundtrip_impl(Components(case));
+        }
     }
 
     #[test]

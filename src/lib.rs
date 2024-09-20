@@ -115,11 +115,14 @@ mod store;
 use ref_cast::RefCast;
 mod layout;
 // mod path;
-mod path2;
+mod path;
 use layout::*;
 pub use store::BlobStore;
 pub use store::MemStore;
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
+
+pub use path::{Fingerprint, Path, PathRef, Subspace, Timestamp, WillowTreeParams, WillowValue};
+pub use store::redb::{RedbBlobStore, TNode, TPoint};
 
 pub trait FixedSize {
     const SIZE: usize;
@@ -346,9 +349,9 @@ impl<T: Ord> QueryRange<T> {
 }
 
 pub struct QueryRange3d<P: KeyParams> {
-    x: QueryRange<P::X>,
-    y: QueryRange<P::Y>,
-    z: QueryRange<P::ZOwned>,
+    pub x: QueryRange<P::X>,
+    pub y: QueryRange<P::Y>,
+    pub z: QueryRange<P::ZOwned>,
 }
 
 impl<P: KeyParams> Display for QueryRange3d<P> {
@@ -1379,12 +1382,48 @@ impl<P: TreeParams> Node<P> {
         query: &QueryRange3d<P>,
         store: &impl NodeStore<P>,
     ) -> Result<P::M> {
-        if let Some(node) = store.data_opt(*self)? {
-            let bbox = BBoxRef::all();
-            node.range_summary_rec(query, &bbox, store)
-        } else {
-            Ok(P::M::neutral())
+        let bbox = BBoxRef::all();
+        self.range_summary_rec(query, &bbox, store)
+    }
+
+    fn range_summary_rec(
+        &self,
+        query: &QueryRange3d<P>,
+        bbox: &BBoxRef<P>,
+        store: &impl NodeStore<P>,
+    ) -> Result<P::M> {
+        if self.is_empty() {
+            return Ok(P::M::neutral());
         }
+        store.peek_data(*self, |data| -> Result<P::M> {
+            let key = data.key();
+            let order = data.sort_order();
+            if data.is_leaf() {
+                return Ok(if query.contains(key) {
+                    data.summary().clone()
+                } else {
+                    P::M::neutral()
+                });
+            }
+            if bbox.contained_in(&query) {
+                return Ok(data.summary().clone());
+            }
+            let mut summary = P::M::neutral();
+            let left = data.left().filter(|| query.overlaps_left(key, order));
+            let right = data.right().filter(|| query.overlaps_right(key, order));
+            if !left.is_empty() {
+                let left_bbox = bbox.split_left(key, order);
+                summary = summary.combine(&left.range_summary_rec(query, &left_bbox, store)?);
+            }
+            if query.contains(key) {
+                summary = summary.combine(&P::M::lift(key, data.value()));
+            }
+            if !right.is_empty() {
+                let right_bbox = bbox.split_right(key, order);
+                summary = summary.combine(&right.range_summary_rec(query, &right_bbox, store)?);
+            }
+            Ok(summary)
+        })?
     }
 
     /// Count the number of elements in a 3d range.
@@ -1402,20 +1441,7 @@ impl<P: TreeParams> Node<P> {
         if self.is_empty() {
             return Ok(0);
         }
-        store.peek_data(*self, |data| -> Result<u64> {
-            if bbox.contained_in(&query) {
-                Ok(data.count())
-            } else {
-                let key = data.key();
-                let order = data.sort_order();
-                let left = data.left().filter(|| query.overlaps_left(key, order));
-                let right = data.right().filter(|| query.overlaps_right(key, order));
-                let lc = left.range_count_rec(query, &bbox.split_left(key, order), store)?;
-                let sc = if query.contains(key) { 1 } else { 0 };
-                let rc = right.range_count_rec(query, &bbox.split_right(key, order), store)?;
-                Ok(lc + sc + rc)
-            }
-        })?
+        store.peek_data(*self, |data| foobar(data, bbox, query, store))?
     }
 
     pub fn split_range<'a>(
@@ -1485,9 +1511,9 @@ impl<P: TreeParams> Node<P> {
             {
                 return Ok(Some(res));
             }
-            return Ok(None);
+            Ok(None)
         } else {
-            return Ok(None);
+            Ok(None)
         }
     }
 
@@ -1848,6 +1874,36 @@ impl<P: TreeParams> Node<P> {
     }
 }
 
+#[inline(never)]
+pub fn foobar<P: TreeParams>(
+    data: &NodeData<P>,
+    bbox: &BBoxRef<P>,
+    query: &QueryRange3d<P>,
+    store: &impl NodeStore<P>,
+) -> Result<u64> {
+    if bbox.contained_in(&query) {
+        Ok(data.count())
+    } else {
+        let key = data.key();
+        let order = data.sort_order();
+        let left = data.left().filter(|| query.overlaps_left(key, order));
+        let right = data.right().filter(|| query.overlaps_right(key, order));
+        let mut count = 0;
+        if !left.is_empty() {
+            let left_bbox = bbox.split_left(key, order);
+            count += left.range_count_rec(query, &left_bbox, store)?;
+        }
+        if query.contains(key) {
+            count += 1;
+        }
+        if !right.is_empty() {
+            let right_bbox = bbox.split_right(key, order);
+            count += right.range_count_rec(query, &right_bbox, store)?;
+        }
+        Ok(count)
+    }
+}
+
 #[repr(transparent)]
 #[derive(RefCast)]
 pub struct NodeData<P: TreeParams>(PhantomData<P>, [u8]);
@@ -1993,43 +2049,6 @@ impl<P: TreeParams> NodeData<P> {
         *self.right_mut() = Node::EMPTY;
         *self.summary_mut() = P::M::lift(self.key(), self.value());
         *self.count_mut() = 1.into();
-    }
-
-    fn range_summary_rec(
-        &self,
-        query: &QueryRange3d<P>,
-        bbox: &BBoxRef<P>,
-        store: &impl NodeStore<P>,
-    ) -> Result<P::M> {
-        if self.is_leaf() {
-            return Ok(if query.contains(self.key()) {
-                self.summary().clone()
-            } else {
-                P::M::neutral()
-            })
-        }
-        if bbox.contained_in(&query) {
-            return Ok(self.summary().clone());
-        }
-        let mut summary = P::M::neutral();
-        let order = self.sort_order();
-        let key = self.key();
-        if query.overlaps_left(key, order) {
-            if let Some(left) = store.data_opt(self.left())? {
-                let left_bbox = bbox.split_left(key, order);
-                summary = summary.combine(&left.range_summary_rec(query, &left_bbox, store)?);
-            }
-        }
-        if query.contains(key) {
-            summary = summary.combine(&P::M::lift(key, self.value()));
-        }
-        if query.overlaps_right(key, order) {
-            if let Some(right) = store.data_opt(self.right())? {
-                let right_bbox = bbox.split_right(key, order);
-                summary = summary.combine(&right.range_summary_rec(query, &right_bbox, store)?);
-            }
-        }
-        Ok(summary)
     }
 
     fn recalculate_summary(&mut self, store: &impl NodeStore<P>) -> Result<()> {

@@ -387,7 +387,7 @@ fn delete(root: &mut Node, x: Node) {
 
 fn add_rank(keys: impl IntoIterator<Item = u64>) -> impl Iterator<Item = (u64, u8)> {
     keys.into_iter().map(|i| {
-        let hash: [u8; 32] = blake3::hash(&i.to_le_bytes()).into();
+        let hash: [u8; 32] = blake3::hash(&i.to_be_bytes()).into();
         let rank = count_trailing_zeros(&hash);
         (i, rank)
     })

@@ -1,9 +1,9 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::{BTreeMap, HashMap}, sync::Arc};
 
 use anyhow::Result;
 use std::fmt::{Debug, Display};
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
-mod redb;
+pub mod redb;
 
 /// A simple store trait for storing blobs.
 pub trait BlobStore {
@@ -20,18 +20,22 @@ pub trait BlobStore {
 }
 
 pub struct MemStore {
-    nodes: BTreeMap<NodeId, Arc<[u8]>>,
+    nodes: HashMap<NodeId, Arc<[u8]>>,
 }
 
 impl MemStore {
     pub fn new() -> Self {
         MemStore {
-            nodes: BTreeMap::new(),
+            nodes: Default::default(),
         }
     }
 
     pub fn size(&self) -> usize {
         self.nodes.len()
+    }
+
+    pub fn total_bytes(&self) -> usize {
+        self.nodes.values().map(|v| v.len()).sum()
     }
 }
 
@@ -72,7 +76,7 @@ impl BlobStore for MemStore {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, AsBytes, FromZeroes, FromBytes)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, AsBytes, FromZeroes, FromBytes, Hash)]
 #[repr(transparent)]
 pub struct NodeId([u8; 8]);
 

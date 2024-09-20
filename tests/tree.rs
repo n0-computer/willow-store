@@ -809,3 +809,10 @@ fn test_tree_delete() -> TestResult<()> {
     }
     Ok(())
 }
+
+#[test]
+fn align_test() {
+    println!("{}", std::mem::align_of::<zerocopy::big_endian::U64>());
+    println!("{}", std::mem::align_of::<zerocopy::native_endian::U64>());
+    println!("{}", std::mem::align_of::<u64>());
+}
