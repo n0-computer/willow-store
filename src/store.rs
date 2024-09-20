@@ -1,4 +1,7 @@
-use std::{collections::{BTreeMap, HashMap}, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 
 use anyhow::Result;
 use std::fmt::{Debug, Display};
@@ -76,32 +79,35 @@ impl BlobStore for MemStore {
     }
 }
 
+/// We implement the zero copy traits with native u64. This means that the storage
+/// will use the native endianess of the platform, and the DBs will not be compatible
+/// between platforms with different endianess.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, AsBytes, FromZeroes, FromBytes, Hash)]
 #[repr(transparent)]
-pub struct NodeId([u8; 8]);
+pub struct NodeId(u64);
 
 impl Debug for NodeId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let id = u64::from_be_bytes(self.0);
+        let id = self.0;
         write!(f, "NodeId({})", id)
     }
 }
 
 impl Display for NodeId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let id = u64::from_be_bytes(self.0);
+        let id = self.0;
         write!(f, "{}", id)
     }
 }
 
 impl From<u64> for NodeId {
     fn from(id: u64) -> Self {
-        NodeId(id.to_be_bytes())
+        NodeId(id)
     }
 }
 
 impl NodeId {
-    pub const EMPTY: Self = NodeId([0; 8]);
+    pub const EMPTY: Self = NodeId(0);
 
     pub fn is_empty(&self) -> bool {
         self == &Self::EMPTY

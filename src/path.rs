@@ -3,6 +3,7 @@ use std::{
     borrow::Borrow,
     cmp::Ordering,
     fmt::{Debug, Display, Formatter},
+    ops::Deref,
     str::FromStr,
     sync::Arc,
     time::SystemTime,
@@ -144,21 +145,29 @@ impl Borrow<PathRef> for Path {
     }
 }
 
+impl Deref for Path {
+    type Target = PathRef;
+
+    fn deref(&self) -> &Self::Target {
+        self.borrow()
+    }
+}
+
 impl PartialOrd for Path {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.escaped().partial_cmp(other.escaped())
+        self.deref().partial_cmp(other.deref())
     }
 }
 
 impl Ord for Path {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.escaped().cmp(other.escaped())
+        self.deref().cmp(other.deref())
     }
 }
 
 impl PartialEq for Path {
     fn eq(&self, other: &Self) -> bool {
-        self.escaped() == other.escaped()
+        self.deref() == other.deref()
     }
 }
 
@@ -273,7 +282,7 @@ impl FromStr for Path {
     }
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, FromBytes, FromZeroes, AsBytes, RefCast)]
+#[derive(PartialEq, Eq, FromBytes, FromZeroes, AsBytes, RefCast)]
 #[repr(transparent)]
 pub struct PathRef([u8]);
 
@@ -284,6 +293,77 @@ impl Debug for PathRef {
         } else {
             write!(f, "{}", self)
         }
+    }
+}
+
+/// A trivial comparison function that compares two paths byte by byte.
+///
+/// This might seem weird, but the default Ord impl calls into the platform-specific memcmp,
+/// which has some overhead for small slices.
+///
+/// I actually measured this. Using this compared to the default Ord impl has a noticeable
+/// benefit, using a chunked comparison has no additional benefit at least for my test case,
+/// the linux kernel source tree.
+#[inline(always)]
+fn trivial_compare(a: &[u8], b: &[u8]) -> Ordering {
+    let min_len = a.len().min(b.len());
+
+    for i in 0..min_len {
+        match a[i].cmp(&b[i]) {
+            Ordering::Equal => continue, // If the bytes are equal, continue to the next byte
+            non_eq => return non_eq,     // Return as soon as a difference is found
+        }
+    }
+
+    // If all compared bytes are equal, compare based on length
+    a.len().cmp(&b.len())
+}
+
+// #[inline(always)]
+// fn chunked_compare(a: &[u8], b: &[u8]) -> Ordering {
+//     let len = a.len().min(b.len());
+
+//     // Compare chunks of 8 bytes at a time (u64)
+//     let chunk_size = std::mem::size_of::<u64>();
+//     let mut i = 0;
+
+//     while i + chunk_size <= len {
+//         // Use big-endian to ensure consistent comparison across platforms
+//         let a_chunk = u64::from_be_bytes(a[i..i + chunk_size].try_into().unwrap());
+//         let b_chunk = u64::from_be_bytes(b[i..i + chunk_size].try_into().unwrap());
+
+//         match a_chunk.cmp(&b_chunk) {
+//             Ordering::Equal => (),
+//             non_eq => return non_eq,
+//         }
+
+//         i += chunk_size;
+//     }
+
+//     // Compare the remaining bytes individually
+//     for j in i..len {
+//         match a[j].cmp(&b[j]) {
+//             Ordering::Equal => continue,
+//             non_eq => return non_eq,
+//         }
+//     }
+
+//     // If all compared bytes are equal, compare based on length
+//     a.len().cmp(&b.len())
+// }
+
+impl Ord for PathRef {
+    #[inline(always)]
+    fn cmp(&self, other: &Self) -> Ordering {
+        trivial_compare(&self.0, &other.0)
+        // self.0.cmp(&other.0)
+    }
+}
+
+impl PartialOrd for PathRef {
+    #[inline(always)]
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 

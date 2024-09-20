@@ -269,6 +269,7 @@ impl<T: Ord> QueryRange<T> {
         }
     }
 
+    #[inline(always)]
     pub fn contains<U: Ord + ?Sized>(&self, value: &U) -> bool
     where
         T: Borrow<U>,
@@ -426,10 +427,12 @@ impl<P: KeyParams> QueryRange3d<P> {
         }
     }
 
+    #[inline(always)]
     pub fn contains(&self, point: &PointRef<P>) -> bool {
         self.x.contains(point.x()) && self.y.contains(point.y()) && self.z.contains(point.z())
     }
 
+    #[inline(always)]
     pub fn overlaps_left(&self, key: &PointRef<P>, order: SortOrder) -> bool {
         match order {
             SortOrder::XYZ => &self.x.min <= key.x(),
@@ -438,6 +441,7 @@ impl<P: KeyParams> QueryRange3d<P> {
         }
     }
 
+    #[inline(always)]
     pub fn overlaps_right(&self, key: &PointRef<P>, order: SortOrder) -> bool {
         match order {
             SortOrder::XYZ => !self
@@ -1889,12 +1893,12 @@ pub fn foobar<P: TreeParams>(
         let left = data.left().filter(|| query.overlaps_left(key, order));
         let right = data.right().filter(|| query.overlaps_right(key, order));
         let mut count = 0;
+        if query.contains(key) {
+            count += 1;
+        }
         if !left.is_empty() {
             let left_bbox = bbox.split_left(key, order);
             count += left.range_count_rec(query, &left_bbox, store)?;
-        }
-        if query.contains(key) {
-            count += 1;
         }
         if !right.is_empty() {
             let right_bbox = bbox.split_right(key, order);
@@ -1936,7 +1940,7 @@ impl<P: TreeParams> OwnedNodeData<P> {
         *res.left_mut() = Node::EMPTY; // not strictly necessary, since it's already 0
         *res.right_mut() = Node::EMPTY; // not strictly necessary, since it's already 0
         *res.rank_mut() = key.rank();
-        *res.count_mut() = 1.into();
+        *res.count_mut() = 1;
         *res.value_mut() = value.clone();
         *res.summary_mut() = P::M::lift(key, value);
         res.1[key_offset::<P>()..].copy_from_slice(key.as_slice());
@@ -2030,9 +2034,13 @@ impl<P: TreeParams> NodeData<P> {
     }
 
     pub fn count(&self) -> u64 {
-        zerocopy::big_endian::U64::read_from_prefix(&self.1[COUNT_OFFSET..])
-            .unwrap()
-            .into()
+        // Use native byte order for count
+        u64::read_from_prefix(&self.1[COUNT_OFFSET..]).unwrap()
+    }
+
+    pub fn count_mut(&mut self) -> &mut u64 {
+        // Use native byte order for count
+        u64::mut_from_prefix(&mut self.1[COUNT_OFFSET..]).unwrap()
     }
 
     pub fn sort_order(&self) -> SortOrder {
@@ -2048,7 +2056,7 @@ impl<P: TreeParams> NodeData<P> {
         *self.left_mut() = Node::EMPTY;
         *self.right_mut() = Node::EMPTY;
         *self.summary_mut() = P::M::lift(self.key(), self.value());
-        *self.count_mut() = 1.into();
+        *self.count_mut() = 1;
     }
 
     fn recalculate_summary(&mut self, store: &impl NodeStore<P>) -> Result<()> {
@@ -2205,9 +2213,7 @@ impl<P: TreeParams> NodeData<P> {
     //     }
     //     Ok(summary)
     // }
-}
 
-impl<P: TreeParams> NodeData<P> {
     pub fn left_mut(&mut self) -> &mut Node<P> {
         Node::mut_from_prefix(&mut self.1[LEFT_OFFSET..]).unwrap()
     }
@@ -2218,10 +2224,6 @@ impl<P: TreeParams> NodeData<P> {
 
     pub fn summary_mut(&mut self) -> &mut P::M {
         P::M::mut_from_prefix(&mut self.1[summary_offset::<P>()..]).unwrap()
-    }
-
-    pub fn count_mut(&mut self) -> &mut zerocopy::big_endian::U64 {
-        zerocopy::big_endian::U64::mut_from_prefix(&mut self.1[COUNT_OFFSET..]).unwrap()
     }
 
     pub fn value_mut(&mut self) -> &mut P::V {

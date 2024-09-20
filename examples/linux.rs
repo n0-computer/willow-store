@@ -1,5 +1,10 @@
 use std::{
-    borrow::Borrow, io, os::unix::fs::MetadataExt, path::PathBuf, str::FromStr, time::Instant,
+    borrow::Borrow,
+    io,
+    os::unix::fs::MetadataExt,
+    path::PathBuf,
+    str::FromStr,
+    time::{Duration, Instant},
 };
 
 use testresult::TestResult;
@@ -101,11 +106,15 @@ fn main() -> TestResult<()> {
     println!("Average Node Depth: {}", (sum as f64) / (count as f64));
     println!("Count range time: {}", count_range_time.as_secs_f64());
     println!("nodes={} total size={}", ss.size(), ss.total_bytes());
-    for i in 0..100000 {
+    let mut total = Duration::ZERO;
+    let n = 100000;
+    for i in 0..n {
         let t0 = Instant::now();
         let n = node.range_count(&q, &ss)?;
         let dt = t0.elapsed();
+        total += dt;
         println!("{} {}", i, dt.as_secs_f64());
     }
+    println!("Average time: {}", (total.as_secs_f64()) / (n as f64));
     Ok(())
 }
