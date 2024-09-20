@@ -14,8 +14,8 @@ use ref_cast::RefCast;
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
 use crate::{
-    FixedSize, KeyParams, LiftingCommutativeMonoid, LowerBound, NoQuotes, PointRef, RefFromSlice,
-    TreeParams, VariableSize,
+    FixedSize, IsLowerBound, KeyParams, LiftingCommutativeMonoid, LowerBound, NoQuotes, PointRef,
+    RefFromSlice, TreeParams, VariableSize,
 };
 
 /// Formats a single component.
@@ -103,7 +103,7 @@ fn unescape(path: &[u8]) -> Vec<Vec<u8>> {
     components
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Path {
     /// data, containing the escaped path concatenated with the unescaped components(*)
     ///
@@ -111,11 +111,23 @@ pub struct Path {
     ///   0..count * 4: start and end offsets of each component, as u16 big-endian
     ///   count * 4..escaped_start: unescaped components, if needed
     ///   escaped_start..: escaped path
-    data: Arc<[u8]>,
+    data: Option<Arc<[u8]>>,
     /// start of the escaped path in the data
     escaped_start: u16,
     /// number of components in the path
     count: u16,
+}
+
+impl IsLowerBound for Path {
+    fn is_min_value(&self) -> bool {
+        self.data.is_none()
+    }
+}
+
+impl LowerBound for Path {
+    fn min_value() -> Self {
+        Self::default()
+    }
 }
 
 impl From<Vec<Vec<u8>>> for Path {
@@ -174,13 +186,17 @@ impl PartialEq for Path {
 impl Eq for Path {}
 
 impl Path {
+    fn data(&self) -> &[u8] {
+        self.data.as_deref().unwrap_or_default()
+    }
+
     fn escaped(&self) -> &[u8] {
         let start = self.escaped_start as usize;
-        &self.data[start..]
+        &self.data()[start..]
     }
 
     fn components(&self) -> impl Iterator<Item = &[u8]> {
-        let data = &self.data;
+        let data = self.data();
         let count = self.count as usize;
         (0..count).map(move |i| {
             let base = i * 4;
@@ -192,6 +208,9 @@ impl Path {
 
     fn from_escaped(escaped: &[u8]) -> Self {
         assert!(escaped.len() < 1 << 15);
+        if escaped.is_empty() {
+            return Self::default();
+        }
         let mut escape = false;
         let mut res = Vec::with_capacity(escaped.len() + 32);
         let mut sizes = smallvec::SmallVec::<[(u16, u16, bool); 8]>::new();
@@ -242,18 +261,28 @@ impl Path {
             res[base..base + 2].copy_from_slice(&(start as u16).to_be_bytes());
             res[base + 2..base + 4].copy_from_slice(&(end as u16).to_be_bytes());
         }
-        let res = Self {
-            data: res.into(),
+        Self {
+            data: Some(res.into()),
             escaped_start,
             count: count as u16,
-        };
-        res
+        }
     }
 }
 
 impl Debug for Path {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        write!(f, "Path2({})", self)
+        if f.alternate() {
+            f.debug_struct("Path")
+                .field(
+                    "data",
+                    &NoQuotes(&format!("[{}]", hex::encode(&self.data()))),
+                )
+                .field("escaped_start", &self.escaped_start)
+                .field("count", &self.count)
+                .finish()
+        } else {
+            write!(f, "Path({})", self)
+        }
     }
 }
 
@@ -285,6 +314,12 @@ impl FromStr for Path {
 #[derive(PartialEq, Eq, FromBytes, FromZeroes, AsBytes, RefCast)]
 #[repr(transparent)]
 pub struct PathRef([u8]);
+
+impl IsLowerBound for PathRef {
+    fn is_min_value(&self) -> bool {
+        self.0.is_empty()
+    }
+}
 
 impl Debug for PathRef {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
@@ -406,13 +441,15 @@ impl VariableSize for PathRef {
 #[repr(transparent)]
 pub struct Subspace([u8; 32]);
 
+impl IsLowerBound for Subspace {
+    fn is_min_value(&self) -> bool {
+        self.0 == [0; 32]
+    }
+}
+
 impl LowerBound for Subspace {
     fn min_value() -> Self {
         Self::ZERO
-    }
-
-    fn is_min_value(&self) -> bool {
-        self.0 == [0; 32]
     }
 }
 
@@ -518,13 +555,15 @@ impl From<SystemTime> for Timestamp {
     }
 }
 
+impl IsLowerBound for Timestamp {
+    fn is_min_value(&self) -> bool {
+        self.0 == [0; 8]
+    }
+}
+
 impl LowerBound for Timestamp {
     fn min_value() -> Self {
         Self::ZERO
-    }
-
-    fn is_min_value(&self) -> bool {
-        self.0 == [0; 8]
     }
 }
 
@@ -703,6 +742,14 @@ mod tests {
         for case in cases {
             path_escape_roundtrip_impl(Components(case));
         }
+    }
+
+    #[test]
+    fn min_value_test() {
+        let a = Path::min_value();
+        let b = Path::from(vec![]);
+        assert_eq!(a, b);
+        println!("{:#?}", a);
     }
 
     #[test]

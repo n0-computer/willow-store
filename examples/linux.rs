@@ -10,8 +10,8 @@ use std::{
 use testresult::TestResult;
 use walkdir::WalkDir;
 use willow_store::{
-    MemStore, Path, QueryRange, QueryRange3d, RedbBlobStore, Subspace, TNode, TPoint, Timestamp,
-    WillowValue,
+    MemStore, NodeId, Path, QueryRange, QueryRange3d, RedbBlobStore, Subspace, TNode, TPoint,
+    Timestamp, WillowValue,
 };
 
 fn entry_to_triple(entry: walkdir::DirEntry) -> io::Result<Option<(u32, Timestamp, PathBuf)>> {
@@ -47,10 +47,25 @@ fn traverse(
 }
 
 fn main() -> TestResult<()> {
-    // let db = RedbBlobStore::memory()?;
-    // let mut batch = db.txn()?;
-    let db = MemStore::new();
-    let mut batch = db;
+    tracing_subscriber::fmt::init();
+    let node = TNode::from(NodeId::from(297442));
+    let db = RedbBlobStore::new("test.db")?;
+    let ss = db.snapshot()?;
+    // for item in node.iter(&ss) {
+    //     println!("{:?}", item?);
+    // }
+    for split in node.split_range(QueryRange3d::all(), 10, &ss) {
+        let split = split?;
+        println!("{} {}", split.0.pretty(), split.1);
+    }
+    Ok(())
+}
+
+fn main_old() -> TestResult<()> {
+    let db = RedbBlobStore::new("test.db")?;
+    let mut batch = db.txn()?;
+    // let db = MemStore::new();
+    // let mut batch = db;
     let mut node = TNode::EMPTY;
     let root: PathBuf = "/Users/rklaehn/projects_git/linux".into();
     for item in traverse(&root) {
@@ -70,13 +85,14 @@ fn main() -> TestResult<()> {
         // let input = std::fs::read(&path)?;
         node.insert(&key, &WillowValue::hash(&input), &mut batch)?;
     }
-    let db = batch;
-    // batch.commit()?;
-    let ss = db;
-    // let ss = db.snapshot()?;
-    for item in node.iter(&ss) {
-        println!("{:?}", item?);
-    }
+    // let db = batch;
+    batch.commit()?;
+    println!("{}", node.id());
+    // let ss = db;
+    let ss = db.snapshot()?;
+    // for item in node.iter(&ss) {
+    //     println!("{:?}", item?);
+    // }
     let q = QueryRange3d {
         x: QueryRange::all(),
         y: QueryRange::all(),
@@ -87,34 +103,28 @@ fn main() -> TestResult<()> {
     let items = node.query(&q, &ss).collect::<Vec<_>>();
     let dt = t0.elapsed();
     let c = items.len();
-    for item in items {
-        println!("{:?}", item?);
-    }
-    node.dump(&ss)?;
+    // for item in items {
+    //     println!("{:?}", item?);
+    // }
+    // node.dump(&ss)?;
     println!("Elapsed: {} {}", c, dt.as_secs_f64());
     // node.dump(&ss)?;
-    // for split in node.split_range(QueryRange3d::all(), 2, &ss) {
-    //     println!("{:?}", split?);
-    // }
-    let count_range_time = {
-        let t0 = Instant::now();
-        let n = node.range_count(&q, &ss)?;
-        t0.elapsed()
-    };
-    let (sum, count) = node.average_node_depth(&ss)?;
-    println!("Node count: {}", count);
-    println!("Average Node Depth: {}", (sum as f64) / (count as f64));
-    println!("Count range time: {}", count_range_time.as_secs_f64());
-    println!("nodes={} total size={}", ss.size(), ss.total_bytes());
-    let mut total = Duration::ZERO;
-    let n = 100000;
-    for i in 0..n {
-        let t0 = Instant::now();
-        let n = node.range_count(&q, &ss)?;
-        let dt = t0.elapsed();
-        total += dt;
-        println!("{} {}", i, dt.as_secs_f64());
+    for split in node.split_range(QueryRange3d::all(), 3, &ss) {
+        println!("{:?}", split?);
     }
-    println!("Average time: {}", (total.as_secs_f64()) / (n as f64));
+    // let (sum, count) = node.average_node_depth(&ss)?;
+    // println!("Node count: {}", count);
+    // println!("Average Node Depth: {}", (sum as f64) / (count as f64));
+    // println!("nodes={} total size={}", ss.size(), ss.total_bytes());
+    // let mut total = Duration::ZERO;
+    // let n = 100000;
+    // for i in 0..n {
+    //     let t0 = Instant::now();
+    //     let n = node.range_count(&q, &ss)?;
+    //     let dt = t0.elapsed();
+    //     total += dt;
+    //     println!("{} {}", i, dt.as_secs_f64());
+    // }
+    // println!("Average range count time: {}", (total.as_secs_f64()) / (n as f64));
     Ok(())
 }
