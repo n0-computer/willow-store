@@ -112,6 +112,7 @@ use std::{
 };
 
 use anyhow::Result;
+use format::DD;
 use genawaiter::sync::{Co, Gen};
 pub use point::PointRef;
 
@@ -121,13 +122,17 @@ mod store;
 use ref_cast::RefCast;
 mod layout;
 // mod path;
+mod format;
 mod path;
 use layout::*;
 pub use store::{BlobStore, MemStore, NodeId};
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
-pub use path::{Fingerprint, Path, PathRef, Subspace, Timestamp, WillowTreeParams, WillowValue};
-pub use store::redb::{RedbBlobStore, TNode, TPoint};
+pub use path::{Path, PathRef};
+pub use store::redb::RedbBlobStore;
+
+#[cfg(any(test, feature = "mock-willow"))]
+pub mod mock_willow;
 
 pub trait FixedSize {
     const SIZE: usize;
@@ -403,22 +408,6 @@ impl<P: KeyParams> Debug for QueryRange3d<P> {
             .field("y", &DD(&self.y))
             .field("z", &DD(&self.z))
             .finish()
-    }
-}
-
-struct NoQuotes<'a>(&'a str);
-
-impl<'a> Debug for NoQuotes<'a> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-struct DD<T>(T);
-
-impl<T: Display> Debug for DD<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
     }
 }
 
@@ -1134,6 +1123,14 @@ impl<P: TreeParams> Node<P> {
         self.0.is_empty()
     }
 
+    pub fn non_empty(&self) -> Option<Self> {
+        if self.is_empty() {
+            None
+        } else {
+            Some(*self)
+        }
+    }
+
     pub fn count(&self, store: &impl NodeStore<P>) -> Result<u64> {
         Ok(if let Some(data) = store.data_opt(*self)? {
             1 + data.left().count(store)? + data.right().count(store)?
@@ -1381,6 +1378,7 @@ impl<P: TreeParams> Node<P> {
         self.iter_impl(&|data, _| data.value().clone(), store)
     }
 
+    /// Computes the average depth of the nodes in the tree, as a measure of the tree's balance.
     pub fn average_node_depth(&self, store: &impl NodeStore<P>) -> Result<(u64, u64)> {
         let mut sum = 0;
         for item in self.iter_impl(&|_, depth| depth, store) {
@@ -1392,6 +1390,8 @@ impl<P: TreeParams> Node<P> {
     /// Iterate over the entire tree in its natural order.
     ///
     /// The order is implementation dependent and should not be relied on.
+    ///
+    /// Provides a projection function to project out the desired data
     fn iter_impl<'a, T: 'a>(
         &'a self,
         project: &'a impl Fn(&NodeData<P>, u64) -> T,
@@ -1553,72 +1553,46 @@ impl<P: TreeParams> Node<P> {
     pub fn find_split_plane_2(
         &self,
         query: &QueryRange3d<P>,
-        count: u64,
         store: &impl NodeStore<P>,
-    ) -> Result<Option<(QueryRange3d<P>, u64, QueryRange3d<P>, u64)>> {
-        for dir in [SortOrder::XYZ, SortOrder::YZX, SortOrder::ZXY] {
-            if let Some(res) = self.find_split_plane_2_rec(*self, query, dir, count, store)? {
-                return Ok(Some(res));
-            }
-        }
-        Ok(None)
-    }
-
-    pub fn find_split_plane_2_rec(
-        &self,
-        root: Node<P>,
-        query: &QueryRange3d<P>,
-        order: SortOrder,
-        count: u64,
-        store: &impl NodeStore<P>,
-    ) -> Result<Option<(QueryRange3d<P>, u64, QueryRange3d<P>, u64)>> {
-        if self.is_empty() {
-            // empty
+    ) -> Result<Option<(Point<P>, SortOrder)>> {
+        let mut points = self.iter_interleaved(query, &|data| data.key().to_owned(), store);
+        let Some(a) = points.next() else {
             return Ok(None);
-        }
-        if count <= 1 {
-            // can't split
+        };
+        let a = a?;
+        let Some(b) = points.next() else {
             return Ok(None);
+        };
+        let b = b?;
+        match a.x().cmp(b.x()) {
+            Ordering::Less => {
+                return Ok(Some((b, SortOrder::XYZ)));
+            }
+            Ordering::Greater => {
+                return Ok(Some((a, SortOrder::XYZ)));
+            }
+            Ordering::Equal => {}
         }
-        store.peek_data(*self, |data| {
-            let key = data.key();
-            let node_order = data.sort_order();
-            let left = query.left(key, order);
-            let left_count = root.range_count(&left, store)?;
-            let right_count = count - left_count;
-            if right_count > 0 && left_count > 0 {
-                let right = query.right(key, order);
-                return Ok(Some((left, left_count, right, right_count)));
+        match a.y().cmp(b.y()) {
+            Ordering::Less => {
+                return Ok(Some((b, SortOrder::YZX)));
             }
-            if node_order == order {
-                if let Some(res) = data
-                    .left()
-                    .find_split_plane_2_rec(root, query, order, count, store)?
-                {
-                    return Ok(Some(res));
-                }
-                if let Some(res) = data
-                    .right()
-                    .find_split_plane_2_rec(root, query, order, count, store)?
-                {
-                    return Ok(Some(res));
-                }
-            } else {
-                if let Some(res) = data
-                    .left()
-                    .find_split_plane_2_rec(root, query, order, count, store)?
-                {
-                    return Ok(Some(res));
-                }
-                if let Some(res) = data
-                    .right()
-                    .find_split_plane_2_rec(root, query, order, count, store)?
-                {
-                    return Ok(Some(res));
-                }
+            Ordering::Greater => {
+                return Ok(Some((a, SortOrder::YZX)));
             }
-            Ok(None)
-        })?
+            Ordering::Equal => {}
+        }
+        match a.z().cmp(b.z()) {
+            Ordering::Less => {
+                return Ok(Some((b, SortOrder::ZXY)));
+            }
+            Ordering::Greater => {
+                return Ok(Some((a, SortOrder::ZXY)));
+            }
+            Ordering::Equal => {
+                unreachable!("two points are equal");
+            }
+        }
     }
 
     fn find_split_plane_rec(
@@ -1710,14 +1684,16 @@ impl<P: TreeParams> Node<P> {
         query: &'a QueryRange3d<P>,
         store: &'a impl NodeStore<P>,
     ) -> impl Iterator<Item = Result<(Point<P>, P::V)>> + 'a {
+        let project = |data: &NodeData<P>| (data.key().to_owned(), data.value().clone());
         Gen::new(|co| async move {
-            if let Err(cause) = self.query_rec(query, store, &co).await {
+            if let Err(cause) = self.query_rec(query, &project, store, &co).await {
                 co.yield_(Err(cause)).await;
             }
         })
         .into_iter()
     }
 
+    /// internal convenience function to filter nodes by some
     fn filter(&self, f: impl Fn() -> bool) -> Self {
         if !self.is_empty() && f() {
             *self
@@ -1726,11 +1702,12 @@ impl<P: TreeParams> Node<P> {
         }
     }
 
-    async fn query_rec(
+    async fn query_rec<T>(
         &self,
         query: &QueryRange3d<P>,
+        project: &impl Fn(&NodeData<P>) -> T,
         store: &impl NodeStore<P>,
-        co: &Co<Result<(Point<P>, P::V)>>,
+        co: &Co<Result<T>>,
     ) -> Result<()> {
         if self.is_empty() {
             return Ok(());
@@ -1742,7 +1719,7 @@ impl<P: TreeParams> Node<P> {
             let left = data.left().filter(|| query.overlaps_left(key, order));
             let right = data.right().filter(|| query.overlaps_right(key, order));
             let kv = if query.contains(key) {
-                Some((key.to_owned(), data.value().to_owned()))
+                Some(project(data))
             } else {
                 None
             };
@@ -1750,13 +1727,13 @@ impl<P: TreeParams> Node<P> {
         })?;
         // do the recursion after the projection
         if !left.is_empty() {
-            Box::pin(left.query_rec(query, store, co)).await?;
+            Box::pin(left.query_rec(query, project, store, co)).await?;
         }
         if let Some(kv) = kv {
             co.yield_(Ok(kv)).await;
         }
         if !right.is_empty() {
-            Box::pin(right.query_rec(query, store, co)).await?;
+            Box::pin(right.query_rec(query, project, store, co)).await?;
         }
         Ok(())
     }
@@ -1839,6 +1816,59 @@ impl<P: TreeParams> Node<P> {
             merge3(iter1, iter2, iter3, ordering, co).await?;
         }
         Ok(())
+    }
+
+    /// iterate over all elements in the query range,
+    /// yielding first the node itself then the left and right subtrees
+    /// interleaved. This is roughly like a breadth-first traversal.
+    /// allow projecting out a value from each node
+    pub fn iter_interleaved<'a, T: 'a>(
+        self,
+        query: &'a QueryRange3d<P>,
+        project: &'a impl Fn(&NodeData<P>) -> T,
+        store: &'a impl NodeStore<P>,
+    ) -> Box<dyn Iterator<Item = Result<T>> + 'a> {
+        match self.iter_interleaved_rec(query, project, store) {
+            Ok(iter) => Box::new(iter),
+            Err(cause) => Box::new(std::iter::once(Err(cause))),
+        }
+    }
+
+    fn iter_interleaved_rec<'a, T: 'a>(
+        self,
+        query: &'a QueryRange3d<P>,
+        project: &'a impl Fn(&NodeData<P>) -> T,
+        store: &'a impl NodeStore<P>,
+    ) -> Result<impl Iterator<Item = Result<T>> + 'a> {
+        let res = if self.is_empty() {
+            None
+        } else {
+            let (left, right, kv) = store.peek_data(self, |data| {
+                let order = data.sort_order();
+                let key = data.key();
+                let left = data.left().filter(|| query.overlaps_left(key, order));
+                let right = data.right().filter(|| query.overlaps_right(key, order));
+                let kv = if query.contains(key) {
+                    Some(project(data))
+                } else {
+                    None
+                };
+                (left, right, kv)
+            })?;
+            let left = left
+                .non_empty()
+                .map(|left| left.iter_interleaved(query, project, store).into_iter())
+                .into_iter()
+                .flatten();
+            let right = right
+                .non_empty()
+                .map(|right| right.iter_interleaved(query, project, store).into_iter())
+                .into_iter()
+                .flatten();
+            let me = kv.map(anyhow::Ok).into_iter();
+            Some(me.chain(itertools::interleave(left, right)))
+        };
+        Ok(res.into_iter().flatten())
     }
 
     /// Split an entire tree into leafs. The nodes are modified in place.

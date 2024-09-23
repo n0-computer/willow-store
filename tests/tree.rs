@@ -311,7 +311,7 @@ fn tree_find_split_plane_impl(items: Vec<(TPoint, u64)>, query: TQuery) -> TestR
     let tree = willow_store::Node::from_iter(items.clone(), &mut store)?;
     let count = tree.range_count(&query, &store)?;
     let Some((left, left_count, right, right_count)) =
-        tree.find_split_plane_2(&query, count, &store)?
+        tree.find_split_plane(&query, count, &store)?
     else {
         assert!(count <= 1);
         return Ok(());
@@ -319,6 +319,10 @@ fn tree_find_split_plane_impl(items: Vec<(TPoint, u64)>, query: TQuery) -> TestR
     assert_eq!(left_count + right_count, count);
     assert_eq!(left_count, tree.range_count(&left, &store)?);
     assert_eq!(right_count, tree.range_count(&right, &store)?);
+    let Some((p, order)) = tree.find_split_plane_2(&query, &store)? else {
+        assert!(count <= 1);
+        return Ok(());
+    };
     Ok(())
 }
 

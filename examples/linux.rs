@@ -9,9 +9,10 @@ use std::{
 
 use testresult::TestResult;
 use walkdir::WalkDir;
+use willow_store::mock_willow::{TNode, TPoint, WillowValue};
 use willow_store::{
-    MemStore, NodeId, Path, QueryRange, QueryRange3d, RedbBlobStore, Subspace, TNode, TPoint,
-    Timestamp, WillowValue,
+    mock_willow::{Subspace, Timestamp},
+    MemStore, NodeId, Path, QueryRange, QueryRange3d, RedbBlobStore,
 };
 
 fn entry_to_triple(entry: walkdir::DirEntry) -> io::Result<Option<(u32, Timestamp, PathBuf)>> {
@@ -46,7 +47,7 @@ fn traverse(
         })
 }
 
-fn main() -> TestResult<()> {
+fn main_new() -> TestResult<()> {
     tracing_subscriber::fmt::init();
     let node = TNode::from(NodeId::from(297442));
     let db = RedbBlobStore::new("test.db")?;
@@ -61,7 +62,7 @@ fn main() -> TestResult<()> {
     Ok(())
 }
 
-fn main_old() -> TestResult<()> {
+fn main() -> TestResult<()> {
     let db = RedbBlobStore::new("test.db")?;
     let mut batch = db.txn()?;
     // let db = MemStore::new();
