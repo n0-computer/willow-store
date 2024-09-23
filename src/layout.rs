@@ -11,17 +11,7 @@
 //! key:        X::SIZE+Y::SIZE+z.size() bytes (variable size)
 //!
 //! Count is stored separately so we can do ops such as splits efficiently.
-use crate::{FixedSize, KeyParams, TreeParams};
-
-#[inline(always)]
-pub fn min_key_size<P: KeyParams>() -> usize {
-    P::X::SIZE + P::Y::SIZE
-}
-
-#[inline(always)]
-pub fn min_data_size<P: TreeParams>() -> usize {
-    key_offset::<P>() + min_key_size::<P>()
-}
+use crate::{FixedSize, TreeParams};
 
 pub const LEFT_OFFSET: usize = 0;
 pub const RIGHT_OFFSET: usize = 8;
@@ -29,11 +19,13 @@ pub const RANK_OFFSET: usize = 16;
 pub const COUNT_OFFSET: usize = 24;
 pub const VALUE_OFFSET: usize = 32;
 
+/// This is not a const because rustc limitations. Conceptually, it is a const.
 #[inline(always)]
 pub fn summary_offset<P: TreeParams>() -> usize {
     VALUE_OFFSET + P::V::SIZE
 }
 
+/// This is not a const because rustc limitations. Conceptually, it is a const.
 #[inline(always)]
 pub fn key_offset<P: TreeParams>() -> usize {
     VALUE_OFFSET + P::V::SIZE + P::M::SIZE

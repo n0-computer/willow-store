@@ -3,26 +3,27 @@ use std::{
     borrow::Borrow,
     cmp::Ordering,
     fmt::{Debug, Display, Formatter},
+    hash::Hash,
     ops::Deref,
     str::FromStr,
     sync::Arc,
-    time::SystemTime,
 };
 
 use ref_cast::RefCast;
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
-use crate::{
-    format::NoQuotes, FixedSize, IsLowerBound, KeyParams, LiftingCommutativeMonoid, LowerBound,
-    PointRef, RefFromSlice, TreeParams, VariableSize,
-};
+use crate::{fmt::NoQuotes, IsLowerBound, LowerBound, RefFromSlice, VariableSize};
 
+/// The maximum size of all components of a path in bytes, before the 16 bit
+/// offsets cause trouble. This is a very conservative limit, but I don't want
+/// to spend too much time figuring out the exact limit.
 pub const MAX_TOTAL_SIZE: usize = 1 << 12;
 
 /// Formats a single component.
-/// - If the component is valid UTF-8, it is enclosed in quotes, and any quotes within
-///   the string are escaped.
-/// - If the component is not valid UTF-8, it is formatted as hexadecimal.
+/// - If the component is valid UTF-8, visible characters, aand does not contain
+/// quotes or slashes, it is formatted as a quoted string.
+/// - If the component is not valid UTF-8, or contains forbidden characters, it
+/// is just shown as hex so it can be round-tripped.
 fn format_component(component: &[u8]) -> String {
     if let Ok(s) = str::from_utf8(component) {
         if s.chars()
@@ -38,6 +39,8 @@ fn format_component(component: &[u8]) -> String {
     hex::encode(component)
 }
 
+/// Parses a single component. Since we have excluded quotes and slashes from
+/// the valid characters, we just need to strip quotes.
 fn parse_component(s: &str) -> anyhow::Result<Vec<u8>> {
     let s = s.trim();
     if s.starts_with('"') && s.ends_with('"') {
@@ -53,6 +56,7 @@ fn parse_component(s: &str) -> anyhow::Result<Vec<u8>> {
 const ESCAPE: u8 = 1;
 const SEPARATOR: u8 = 0;
 
+/// Escape into an existing vec.
 fn escape_into<I, C>(components: I, result: &mut Vec<u8>)
 where
     I: IntoIterator<Item = C>,
@@ -72,6 +76,7 @@ where
     // to distinguish between the empty path and the path with one empty component
 }
 
+/// Escape into a new vec.
 fn escape<I, C>(components: I) -> Vec<u8>
 where
     I: IntoIterator<Item = C>,
@@ -82,6 +87,8 @@ where
     result
 }
 
+/// A simple version of unescape.
+#[allow(dead_code)]
 fn unescape(path: &[u8]) -> Vec<Vec<u8>> {
     let mut components = Vec::new();
     let mut segment = Vec::new();
@@ -104,6 +111,13 @@ fn unescape(path: &[u8]) -> Vec<Vec<u8>> {
     components
 }
 
+/// An owned path.
+///
+/// A path is a sequence of components, where each component is a sequence of
+/// bytes. It uses a memory-efficient internal representation that prevents lots
+/// of small allocations.
+///
+/// The ordering of paths is like the ordering of a sequence of blobs.
 #[derive(Clone, Default)]
 pub struct Path {
     /// data, containing the escaped path concatenated with the unescaped components(*)
@@ -185,6 +199,12 @@ impl PartialEq for Path {
 }
 
 impl Eq for Path {}
+
+impl Hash for Path {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.deref().hash(state)
+    }
+}
 
 impl Path {
     fn data(&self) -> &[u8] {
@@ -312,7 +332,8 @@ impl FromStr for Path {
     }
 }
 
-#[derive(PartialEq, Eq, FromBytes, FromZeroes, AsBytes, RefCast)]
+/// A sequence of bytes that represents an escaped sequence of components.
+#[derive(PartialEq, Eq, Hash, FromBytes, FromZeroes, AsBytes, RefCast)]
 #[repr(transparent)]
 pub struct PathRef([u8]);
 
@@ -341,7 +362,7 @@ impl Debug for PathRef {
 /// benefit, using a chunked comparison has no additional benefit at least for my test case,
 /// the linux kernel source tree.
 #[inline(always)]
-fn trivial_compare(a: &[u8], b: &[u8]) -> Ordering {
+fn compare(a: &[u8], b: &[u8]) -> Ordering {
     let min_len = a.len().min(b.len());
 
     for i in 0..min_len {
@@ -391,7 +412,7 @@ fn trivial_compare(a: &[u8], b: &[u8]) -> Ordering {
 impl Ord for PathRef {
     #[inline(always)]
     fn cmp(&self, other: &Self) -> Ordering {
-        trivial_compare(&self.0, &other.0)
+        compare(&self.0, &other.0)
         // self.0.cmp(&other.0)
     }
 }

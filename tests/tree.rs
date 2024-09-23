@@ -17,7 +17,7 @@ use zerocopy::{AsBytes, FromBytes, FromZeroes};
 type TPoint = Point<TestParams>;
 type TQuery = QueryRange3d<TestParams>;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct TestParams;
 
 impl KeyParams for TestParams {

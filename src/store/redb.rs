@@ -263,7 +263,7 @@ impl BlobStore for RedbBlobStore {
 #[cfg(test)]
 mod tests {
     use crate::mock_willow::{Subspace, TNode, TPoint, Timestamp, WillowTreeParams, WillowValue};
-    use std::{borrow::Borrow, io, os::unix::fs::MetadataExt, path::PathBuf, str::FromStr};
+    use std::{borrow::Borrow, str::FromStr};
 
     use crate::{Node, Point, QueryRange, QueryRange3d};
 
@@ -284,8 +284,7 @@ mod tests {
             let subspace = subspace.into();
             for (timestamp, path, value) in data {
                 let path = Path::from_str(&path.into()).unwrap();
-                let key =
-                    Point::<WillowTreeParams>::new(&subspace, &timestamp.into(), path.borrow());
+                let key = TPoint::new(&subspace, &timestamp.into(), path.borrow());
                 let value = WillowValue::hash(value.into().as_bytes());
                 node.insert(&key, &value, &mut txn).unwrap();
             }

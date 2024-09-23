@@ -1,7 +1,7 @@
 //! A minimal self-contained implementation of the types of the [willow data model]
 //!
 //! This is used in tests and examples.
-//! 
+//!
 //! [willow data model]: https://willowprotocol.org/specs/data-model/index.html
 use std::{
     fmt::{Debug, Display, Formatter},
@@ -11,8 +11,8 @@ use std::{
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
 use crate::{
-    format::NoQuotes, FixedSize, IsLowerBound, KeyParams, LiftingCommutativeMonoid, LowerBound,
-    Node, Path, PathRef, Point, PointRef, TreeParams,
+    fmt::NoQuotes, FixedSize, IsLowerBound, KeyParams, LiftingCommutativeMonoid, LowerBound, Node,
+    Path, PathRef, Point, PointRef, TreeParams,
 };
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, FromBytes, AsBytes, FromZeroes)]
@@ -61,7 +61,7 @@ impl Display for Subspace {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct WillowTreeParams;
 
 pub type TNode = Node<WillowTreeParams>;

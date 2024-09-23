@@ -1,10 +1,5 @@
 use std::{
-    borrow::Borrow,
-    io,
-    os::unix::fs::MetadataExt,
-    path::PathBuf,
-    str::FromStr,
-    time::{Duration, Instant},
+    borrow::Borrow, io, os::unix::fs::MetadataExt, path::PathBuf, str::FromStr, time::Instant,
 };
 
 use testresult::TestResult;
@@ -12,7 +7,7 @@ use walkdir::WalkDir;
 use willow_store::mock_willow::{TNode, TPoint, WillowValue};
 use willow_store::{
     mock_willow::{Subspace, Timestamp},
-    MemStore, NodeId, Path, QueryRange, QueryRange3d, RedbBlobStore,
+    NodeId, Path, QueryRange, QueryRange3d, RedbBlobStore,
 };
 
 fn entry_to_triple(entry: walkdir::DirEntry) -> io::Result<Option<(u32, Timestamp, PathBuf)>> {
@@ -34,6 +29,7 @@ fn entry_to_triple(entry: walkdir::DirEntry) -> io::Result<Option<(u32, Timestam
     }
 }
 
+/// Utility to traverse a directory and yield (user_id, creation_time, path) triples
 fn traverse(
     root: impl AsRef<std::path::Path>,
 ) -> impl Iterator<Item = io::Result<(u32, Timestamp, PathBuf)>> {
