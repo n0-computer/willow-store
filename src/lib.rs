@@ -918,12 +918,28 @@ impl<P: TreeParams> Node<P> {
         self.find_split_plane_rec(*self, query, count, &bbox, store)
     }
 
+    pub fn find_split_plane_new(
+        &self,
+        query: &QueryRange3d<P>,
+        count: u64,
+        store: &impl NodeStore<P>,
+    ) -> Result<Option<(QueryRange3d<P>, u64, QueryRange3d<P>, u64)>> {
+        let Some((point, order)) = self.find_split_plane_2(query, store)? else {
+            return Ok(None);
+        };
+        let left = query.left(&point, order);
+        let left_count = self.range_count(&left, store)?;
+        let right_count = count - left_count;
+        let right = query.right(&point, order);
+        Ok(Some((left, left_count, right, right_count)))
+    }
+
     pub fn find_split_plane_2(
         &self,
         query: &QueryRange3d<P>,
         store: &impl NodeStore<P>,
     ) -> Result<Option<(Point<P>, SortOrder)>> {
-        let mut points = self.iter_interleaved(query, &|data| data.key().to_owned(), store);
+        let mut points = self.query_interleaved(query, &|data| data.key().to_owned(), store);
         let Some(a) = points.next() else {
             return Ok(None);
         };
@@ -1190,19 +1206,19 @@ impl<P: TreeParams> Node<P> {
     /// yielding first the node itself then the left and right subtrees
     /// interleaved. This is roughly like a breadth-first traversal.
     /// allow projecting out a value from each node
-    pub fn iter_interleaved<'a, T: 'a>(
+    pub fn query_interleaved<'a, T: 'a>(
         self,
         query: &'a QueryRange3d<P>,
         project: &'a impl Fn(&NodeData<P>) -> T,
         store: &'a impl NodeStore<P>,
     ) -> Box<dyn Iterator<Item = Result<T>> + 'a> {
-        match self.iter_interleaved_rec(query, project, store) {
+        match self.query_interleaved_rec(query, project, store) {
             Ok(iter) => Box::new(iter),
             Err(cause) => Box::new(std::iter::once(Err(cause))),
         }
     }
 
-    fn iter_interleaved_rec<'a, T: 'a>(
+    fn query_interleaved_rec<'a, T: 'a>(
         self,
         query: &'a QueryRange3d<P>,
         project: &'a impl Fn(&NodeData<P>) -> T,
@@ -1225,12 +1241,12 @@ impl<P: TreeParams> Node<P> {
             })?;
             let left = left
                 .non_empty()
-                .map(|left| left.iter_interleaved(query, project, store).into_iter())
+                .map(|left| left.query_interleaved(query, project, store).into_iter())
                 .into_iter()
                 .flatten();
             let right = right
                 .non_empty()
-                .map(|right| right.iter_interleaved(query, project, store).into_iter())
+                .map(|right| right.query_interleaved(query, project, store).into_iter())
                 .into_iter()
                 .flatten();
             let me = kv.map(anyhow::Ok).into_iter();

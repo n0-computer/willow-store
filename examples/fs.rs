@@ -4,7 +4,6 @@ use std::{
 };
 
 use clap::Parser;
-use testresult::TestResult;
 use walkdir::WalkDir;
 use willow_store::mock_willow::{TNode, TPoint, WillowValue};
 use willow_store::{
@@ -21,6 +20,7 @@ struct Args {
 #[derive(Debug, Clone, clap::Parser)]
 enum Subcommand {
     Import(ImportArgs),
+    Split(SplitArgs),
 }
 
 #[derive(Debug, Clone, clap::Parser)]
@@ -28,6 +28,16 @@ struct ImportArgs {
     root: PathBuf,
     #[clap(long)]
     target: PathBuf,
+}
+
+#[derive(Debug, Clone, clap::Parser)]
+struct SplitArgs {
+    #[clap(long, default_value = "3")]
+    n: u64,
+    #[clap(long)]
+    path: PathBuf,
+    #[clap(long)]
+    root: u64,
 }
 
 fn entry_to_triple(entry: walkdir::DirEntry) -> io::Result<Option<(u32, Timestamp, PathBuf)>> {
@@ -64,21 +74,22 @@ fn traverse(
 }
 
 fn main() -> Result<()> {
+    tracing_subscriber::fmt::init();
     let args = Args::parse();
     match args.subcommand {
         Subcommand::Import(args) => import(args),
+        Subcommand::Split(args) => split(args),
     }
 }
 
-fn main_new() -> TestResult<()> {
-    tracing_subscriber::fmt::init();
-    let node = TNode::from(NodeId::from(297442));
-    let db = RedbBlobStore::new("test.db")?;
+fn split(args: SplitArgs) -> Result<()> {
+    let node = TNode::from(NodeId::from(args.root));
+    let db = RedbBlobStore::new(args.path)?;
     let ss = db.snapshot()?;
     // for item in node.iter(&ss) {
     //     println!("{:?}", item?);
     // }
-    for split in node.split_range(QueryRange3d::all(), 10, &ss) {
+    for split in node.split_range(QueryRange3d::all(), args.n, &ss) {
         let split = split?;
         println!("{} {}", split.0.pretty(), split.1);
     }
@@ -113,8 +124,8 @@ fn import(args: ImportArgs) -> Result<()> {
     }
     // let db = batch;
     batch.commit()?;
-    println!("{}", node.id());
-    println!("{}", db.blob_count()?);
+    println!("root id: {}", node.id());
+    println!("total count: {}", db.blob_count()?);
     // let ss = db;
     let ss = db.snapshot()?;
     // for item in node.iter(&ss) {
