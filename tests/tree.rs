@@ -1,7 +1,5 @@
 use std::{
-    collections::BTreeSet,
-    fmt::{Debug, Display},
-    ops::Deref,
+    collections::BTreeSet, fmt::{Debug, Display}, marker::PhantomData, ops::Deref
 };
 
 use prop::sample::SizeRange;
@@ -187,57 +185,63 @@ fn tpoint(x: u64, y: u64, z: u64) -> TPoint {
     TPoint::new(&x, &y, &z)
 }
 
-/// Tests that creating a tree from unique points works.
-///
-/// The tree should conform to the invariants of the tree structure,
-/// and contain all the points that were inserted.
-fn tree_creation_impl(items: Vec<(TPoint, u64)>) -> TestResult<()> {
-    let mut store = MemStore::new();
-    let node = willow_store::Node::from_iter(items.clone(), &mut store)?;
-    // tree.dump(&store)?;
-    node.assert_invariants(&store, true)?;
-    let mut actual = node.iter(&store).map(|x| x.unwrap()).collect::<Vec<_>>();
-    let mut expected = items;
-    actual.sort_by_key(|(p, _)| p.clone());
-    expected.sort_by_key(|(p, _)| p.clone());
-    assert_eq!(actual, expected);
-    Ok(())
+struct TreeTests<P: TreeParams>(PhantomData<P>);
+
+impl<P: TreeParams> TreeTests<P> {
+
+    /// Tests that creating a tree from unique points works.
+    ///
+    /// The tree should conform to the invariants of the tree structure,
+    /// and contain all the points that were inserted.
+    fn creation(items: Vec<(Point<P>, P::V)>) -> TestResult<()> {
+        let mut store = MemStore::new();
+        let node = willow_store::Node::from_iter(items.clone(), &mut store)?;
+        // tree.dump(&store)?;
+        node.assert_invariants(&store, true)?;
+        let mut actual = node.iter(&store).map(|x| x.unwrap()).collect::<Vec<_>>();
+        let mut expected = items.clone();
+        actual.sort_by_key(|(p, _)| p.clone());
+        expected.sort_by_key(|(p, _)| p.clone());
+        assert_eq!(store.size(), items.len());
+        assert_eq!(store.max_id(), items.len() as u64);
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    /// Test the `query_unordered` method of the tree.
+    ///
+    /// The method should return all the points that are contained in the query.
+    /// This is tested by comparing with a brute-force implementation.
+    fn tree_query_unordered(items: Vec<(TPoint, u64)>, query: TQuery) -> TestResult<()> {
+        let mut store = MemStore::new();
+        let tree = willow_store::Node::from_iter(items.clone(), &mut store)?;
+        let mut actual = tree
+            .query(&query, &store)
+            .map(|x| x.unwrap())
+            .collect::<Vec<_>>();
+        let mut expected = items
+            .iter()
+            .filter(|(p, _)| query.contains(p))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        actual.sort_by_key(|(p, _)| p.clone());
+        expected.sort_by_key(|(p, _)| p.clone());
+        println!("{} {} {}", items.len(), actual.len(), expected.len());
+        assert_eq!(actual, expected);
+        Ok(())
+    }
 }
 
 #[proptest]
 fn prop_tree_creation(#[strategy(treecontents())] items: Vec<(TPoint, u64)>) {
-    tree_creation_impl(items).unwrap();
+    TreeTests::<TestParams>::creation(items).unwrap();
 }
 
 #[test]
 fn test_tree_creation() -> TestResult<()> {
     let items = vec![(tpoint(83, 0, 0), 0), (tpoint(0, 0, 1), 2)];
-    tree_creation_impl(items)?;
-
-    Ok(())
-}
-
-/// Test the `query_unordered` method of the tree.
-///
-/// The method should return all the points that are contained in the query.
-/// This is tested by comparing with a brute-force implementation.
-fn tree_query_unordered_impl(items: Vec<(TPoint, u64)>, query: TQuery) -> TestResult<()> {
-    let mut store = MemStore::new();
-    let tree = willow_store::Node::from_iter(items.clone(), &mut store)?;
-    let mut actual = tree
-        .query(&query, &store)
-        .map(|x| x.unwrap())
-        .collect::<Vec<_>>();
-    let mut expected = items
-        .iter()
-        .filter(|(p, _)| query.contains(p))
-        .cloned()
-        .collect::<Vec<_>>();
-
-    actual.sort_by_key(|(p, _)| p.clone());
-    expected.sort_by_key(|(p, _)| p.clone());
-    println!("{} {} {}", items.len(), actual.len(), expected.len());
-    assert_eq!(actual, expected);
+    TreeTests::<TestParams>::creation(items)?;
     Ok(())
 }
 
@@ -323,7 +327,7 @@ fn tree_find_split_plane_impl(items: Vec<(TPoint, u64)>, query: TQuery) -> TestR
         assert!(count <= 1);
         return Ok(());
     };
-    Ok(())
+    Ok(())  
 }
 
 fn tree_split_impl(items: Vec<(TPoint, u64)>, query: TQuery) -> TestResult<()> {
@@ -462,7 +466,7 @@ fn prop_tree_query_unordered(
     #[strategy(treecontents())] items: Vec<(TPoint, u64)>,
     #[strategy(query())] query: TQuery,
 ) {
-    tree_query_unordered_impl(items, query).unwrap();
+    TreeTests::<TestParams>::tree_query_unordered(items, query).unwrap();
 }
 
 #[proptest]
@@ -735,19 +739,6 @@ fn test_tree_insert() -> TestResult<()> {
         vec![((32, 0, 0), 0), ((54, 0, 0), 1), ((0, 0, 0), 0)],
         // vec![((0, 0, 0), 0), ((54, 0, 0), 1)],
     ];
-    for items in cases {
-        let items = parse_case(items);
-        tree_insert_impl(items)?;
-    }
-
-    Ok(())
-}
-
-#[test]
-#[ignore]
-fn test_tree_ins2() -> TestResult<()> {
-    tracing_subscriber::fmt::try_init().ok();
-    let cases = vec![vec![((0, 0, 0), 0), ((19, 0, 0), 0), ((21, 0, 0), 0)]];
     for items in cases {
         let items = parse_case(items);
         tree_insert_impl(items)?;
