@@ -1,0 +1,17 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 4d19b4f5145f8bfa3a3040cd54b8ee0d1fff4e23196f575bfc567f941e417d48 # shrinks to input = _PropTreeInsertArgs { items: [((0, 0, 0), 0)] }
+cc a5e7f5a3f90fa847745906eb39faf0cfb170bc6c061228364796ebac2752cb50 # shrinks to input = _PropTreeInsertArgs { items: [((0, 0, 0), 0), ((19, 0, 0), 0), ((21, 0, 0), 0)] }
+cc 2bdea5b8eaf342b081ede6cba658a2f5f4633edafccaad20c9cf86180f34d770 # shrinks to input = _PropTreeInsertArgs { items: [((0, 0, 0), 0)] }
+cc d1a274d42c1209a9fe41f76f208446b8764e9412fb041d982d3615913dc5a26e # shrinks to input = _PropTreeDeleteArgs { items: [((98, 0, 0), 0), ((64, 0, 0), 0), ((15, 0, 0), 0), ((88, 0, 0), 0)] }
+cc 58c9d97f5ae24b8ab319d0440d20733b2225f5be27556c988e68f32dfad322b7 # shrinks to input = _PropTreeQueryUnorderedArgs { items: [((4, 13, 30), 1)], query: QueryRange3d { x: QueryRange { min: 0, max: Some(5) }, y: QueryRange { min: 0, max: Some(14) }, z: QueryRange { min: 0, max: Some(31) } } }
+cc 6d232a9485e18cf35f279ea1e1eb8405675a3d2460c1cdeca0dfff2524a8e251 # shrinks to input = _PropTreeQueryOrderedArgs { items: [((8, 7, 56), 1), ((1, 3, 0), 0), ((1, 14, 40), 0), ((0, 2, 0), 0), ((0, 13, 0), 0)], query: QueryRange3d { x: QueryRange { min: 0, max: Some(9) }, y: QueryRange { min: 0, max: Some(8) }, z: QueryRange { min: 45, max: Some(57) } }, ordering: XYZ }
+cc 14586872fb71cf5fcaba0b1014540a16da5a933fb8989415faab46a45f3199d5 # shrinks to input = _PropTreeSummaryArgs { items: [((0, 0, 19), 0), ((40, 56, 18), 0), ((0, 0, 20), 0), ((17, 53, 19), 0), ((0, 68, 19), 0), ((1, 53, 20), 0), ((50, 83, 47), 1), ((0, 0, 0), 0), ((0, 53, 22), 0), ((4, 53, 20), 0), ((0, 53, 20), 0), ((2, 59, 19), 0), ((0, 53, 23), 0), ((14, 58, 19), 0)], query: QueryRange3d { x: QueryRange { min: 0, max: Some(51) }, y: QueryRange { min: 43, max: Some(84) }, z: QueryRange { min: 9, max: Some(48) } } }
+cc 81e196b60f5558fcb33a2fcd247e50a7c6626160eb60c5a54a39df9ed1523c60 # shrinks to input = _PropTreeSplitRangeArgs { items: [((7, 6, 0), 0), ((2, 2, 0), 0), ((2, 1, 0), 0)], query: QueryRange3d { x: QueryRange { min: 0, max: Some(8) }, y: QueryRange { min: 0, max: Some(7) }, z: QueryRange { min: 0, max: Some(1) } } }
+cc df8b18b00cc69a54920b060a6de170cdbbbb029705002541b06d18981e2b251c # shrinks to input = _PropTreeSplitRangeArgs { items: [((2, 2, 0), 0), ((6, 0, 0), 0), ((5, 4, 0), 0)], query: QueryRange3d { x: QueryRange { min: 0, max: Some(6) }, y: QueryRange { min: 0, max: Some(5) }, z: QueryRange { min: 0, max: Some(1) } } }
+cc bc5aa6913ddd079e22cb13759a0900c77f9c128fbc92425a65707d38b07e8118 # shrinks to input = _PropTreeSplitRangeArgs { items: [((3, 0, 0), 0), ((0, 6, 0), 0), ((0, 7, 0), 0), ((5, 0, 0), 0)], query: QueryRange3d { x: QueryRange { min: 0, max: Some(1) }, y: QueryRange { min: 5, max: Some(8) }, z: QueryRange { min: 0, max: Some(1) } } }
+cc 62400c5bfb9123bab6e9982f0d21a58ce2e9cd22c49fe6e91c5a3f2eea971a06 # shrinks to input = _PropTreeFindSplitPlaneArgs { items: [((0, 0, 0), 0), ((0, 1, 0), 0)], query: QueryRange3d { x: QueryRange { min: 0, max: Some(1) }, y: QueryRange { min: 1, max: Some(2) }, z: QueryRange { min: 0, max: Some(1) } } }

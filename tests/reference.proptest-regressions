@@ -4,4 +4,4 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
-cc 1ac0b886eb2f2ae9ebd041365f660f1c0fba2c33c8c095bbaecb3c97365e59c1 # shrinks to input = _TestInsertGetArgs { paths: [(Path([]), Value { timestamp: 0, fingerprint: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], size: 0 })] }
+cc 499c3c00e1abec46c491ac2707cb2fff0cc620613cca8ccd04374755b9be9a68 # shrinks to input = _PropDeleteArgs { values: {0}, seed: 0 }
