@@ -4,17 +4,23 @@ use super::{BlobStore, NodeId, Result};
 
 pub struct MemStore {
     nodes: HashMap<NodeId, Arc<[u8]>>,
+    max_id: u64,
 }
 
 impl MemStore {
     pub fn new() -> Self {
         MemStore {
             nodes: Default::default(),
+            max_id: 0,
         }
     }
 
     pub fn size(&self) -> usize {
         self.nodes.len()
+    }
+
+    pub fn max_id(&self) -> u64 {
+        self.max_id
     }
 
     pub fn total_bytes(&self) -> usize {
@@ -24,7 +30,8 @@ impl MemStore {
 
 impl BlobStore for MemStore {
     fn create(&mut self, node: &[u8]) -> Result<NodeId> {
-        let id = NodeId::from((self.nodes.len() as u64) + 1);
+        self.max_id += 1;
+        let id = NodeId(self.max_id);
         assert!(!id.is_empty());
         self.nodes.insert(id, node.to_vec().into());
         Ok(id)

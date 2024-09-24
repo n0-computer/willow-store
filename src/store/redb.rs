@@ -1,4 +1,4 @@
-use redb::{Database, ReadableTable, TableDefinition, WriteTransaction};
+use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition, WriteTransaction};
 use zerocopy::{AsBytes, FromBytes};
 
 use super::{BlobStore, NodeId, Result};
@@ -86,6 +86,12 @@ impl RedbBlobStore {
             })
         })?;
         Ok(WriteBatch(inner))
+    }
+
+    pub fn blob_count(&self) -> Result<u64> {
+        let txn = self.db.begin_read().unwrap();
+        let table = txn.open_table(BLOB_TABLE).unwrap();
+        Ok(table.len()?)
     }
 }
 

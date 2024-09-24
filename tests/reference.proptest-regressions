@@ -1,7 +1,0 @@
-# Seeds for failure cases proptest has generated in the past. It is
-# automatically read and these particular cases re-run before any
-# novel cases are generated.
-#
-# It is recommended to check this file in to source control so that
-# everyone who runs the test benefits from these saved cases.
-cc 499c3c00e1abec46c491ac2707cb2fff0cc620613cca8ccd04374755b9be9a68 # shrinks to input = _PropDeleteArgs { values: {0}, seed: 0 }

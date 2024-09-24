@@ -59,6 +59,7 @@ fn main_new() -> TestResult<()> {
 }
 
 fn main() -> TestResult<()> {
+    std::fs::remove_file("test.db").ok();
     let db = RedbBlobStore::new("test.db")?;
     let mut batch = db.txn()?;
     // let db = MemStore::new();
@@ -85,6 +86,7 @@ fn main() -> TestResult<()> {
     // let db = batch;
     batch.commit()?;
     println!("{}", node.id());
+    println!("{}", db.blob_count()?);
     // let ss = db;
     let ss = db.snapshot()?;
     // for item in node.iter(&ss) {
