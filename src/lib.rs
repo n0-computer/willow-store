@@ -127,7 +127,7 @@ use layout::*;
 pub use store::{mem::MemStore, BlobStore, NodeId};
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
-pub use path::{Path, PathRef};
+pub use path::{BlobSeq, BlobSeqRef};
 pub use store::redb::RedbBlobStore;
 
 #[cfg(any(test, feature = "mock-willow"))]
@@ -322,6 +322,8 @@ impl<T: TreeParams> AssertInvariantsRes<T> {
     }
 }
 
+/// This is a separate trait because we can implement [IsLowerBound] for an
+/// unsized type, but not [LowerBound].
 pub trait IsLowerBound {
     fn is_min_value(&self) -> bool;
 }

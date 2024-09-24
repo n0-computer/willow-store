@@ -1,3 +1,25 @@
+//! A compact, order-preserving encoding of paths consisting of a sequence of
+//! blobs.
+//!
+//! Use case: you have a kv store and want to store paths consisting of multiple
+//! components in the keys while still retaining the ordering of a sequence
+//! of blobs.
+//!
+//! [Path] is the owned version, storing any number of components in a single
+//! allocation. [PathRef] is the borrowed version, which is just a newtype for
+//! a slice of bytes.
+//!
+//! The relationship between [Path] and [PathRef] is similar to the relationship
+//! between [String] and [str].
+//!
+//! # Example
+//!
+//! ```rust
+//! use willow_store::BlobSeq;
+//!
+//! let bs = BlobSeq::from(["a", "b", "c"].as_ref());
+//! assert_eq!(bs.to_string(), r#""a"/"b"/"c""#);
+//! ```
 use core::str;
 use std::{
     borrow::Borrow,
@@ -9,7 +31,7 @@ use std::{
     sync::Arc,
 };
 
-use ref_cast::RefCast;
+use ref_cast::{ref_cast_custom, RefCastCustom};
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
 use crate::{fmt::NoQuotes, IsLowerBound, LowerBound, RefFromSlice, VariableSize};
@@ -119,7 +141,7 @@ fn unescape(path: &[u8]) -> Vec<Vec<u8>> {
 ///
 /// The ordering of paths is like the ordering of a sequence of blobs.
 #[derive(Clone, Default)]
-pub struct Path {
+pub struct BlobSeq {
     /// data, containing the escaped path concatenated with the unescaped components(*)
     ///
     /// data layout:
@@ -133,80 +155,92 @@ pub struct Path {
     count: u16,
 }
 
-impl IsLowerBound for Path {
+impl IsLowerBound for BlobSeq {
     fn is_min_value(&self) -> bool {
         self.data.is_none()
     }
 }
 
-impl LowerBound for Path {
+impl LowerBound for BlobSeq {
     fn min_value() -> Self {
         Self::default()
     }
 }
 
-impl From<Vec<Vec<u8>>> for Path {
+impl<'a> IsLowerBound for &'a BlobSeqRef {
+    fn is_min_value(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl<'a> LowerBound for &'a BlobSeqRef {
+    fn min_value() -> Self {
+        BlobSeqRef::ZERO
+    }
+}
+
+impl From<Vec<Vec<u8>>> for BlobSeq {
     fn from(components: Vec<Vec<u8>>) -> Self {
         let escaped = escape(components.iter());
         Self::from_escaped(&escaped)
     }
 }
 
-impl From<&[&[u8]]> for Path {
+impl From<&[&[u8]]> for BlobSeq {
     fn from(components: &[&[u8]]) -> Self {
         let components: Vec<Vec<u8>> = components.iter().map(|&c| c.to_vec()).collect();
         components.into()
     }
 }
 
-impl From<&[&str]> for Path {
+impl From<&[&str]> for BlobSeq {
     fn from(components: &[&str]) -> Self {
         let components: Vec<Vec<u8>> = components.iter().map(|&c| c.as_bytes().to_vec()).collect();
         components.into()
     }
 }
 
-impl Borrow<PathRef> for Path {
-    fn borrow(&self) -> &PathRef {
-        PathRef::ref_cast(self.escaped())
+impl Borrow<BlobSeqRef> for BlobSeq {
+    fn borrow(&self) -> &BlobSeqRef {
+        BlobSeqRef::new(self.escaped())
     }
 }
 
-impl Deref for Path {
-    type Target = PathRef;
+impl Deref for BlobSeq {
+    type Target = BlobSeqRef;
 
     fn deref(&self) -> &Self::Target {
         self.borrow()
     }
 }
 
-impl PartialOrd for Path {
+impl PartialOrd for BlobSeq {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         self.deref().partial_cmp(other.deref())
     }
 }
 
-impl Ord for Path {
+impl Ord for BlobSeq {
     fn cmp(&self, other: &Self) -> Ordering {
         self.deref().cmp(other.deref())
     }
 }
 
-impl PartialEq for Path {
+impl PartialEq for BlobSeq {
     fn eq(&self, other: &Self) -> bool {
         self.deref() == other.deref()
     }
 }
 
-impl Eq for Path {}
+impl Eq for BlobSeq {}
 
-impl Hash for Path {
+impl Hash for BlobSeq {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.deref().hash(state)
     }
 }
 
-impl Path {
+impl BlobSeq {
     fn data(&self) -> &[u8] {
         self.data.as_deref().unwrap_or_default()
     }
@@ -290,7 +324,7 @@ impl Path {
     }
 }
 
-impl Debug for Path {
+impl Debug for BlobSeq {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         if f.alternate() {
             f.debug_struct("Path")
@@ -307,7 +341,7 @@ impl Debug for Path {
     }
 }
 
-impl Display for Path {
+impl Display for BlobSeq {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         write!(
             f,
@@ -320,7 +354,7 @@ impl Display for Path {
     }
 }
 
-impl FromStr for Path {
+impl FromStr for BlobSeq {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -333,20 +367,28 @@ impl FromStr for Path {
 }
 
 /// A sequence of bytes that represents an escaped sequence of components.
-#[derive(PartialEq, Eq, Hash, FromBytes, FromZeroes, AsBytes, RefCast)]
+#[derive(PartialEq, Eq, Hash, FromBytes, FromZeroes, AsBytes, RefCastCustom)]
 #[repr(transparent)]
-pub struct PathRef([u8]);
+pub struct BlobSeqRef([u8]);
 
-impl IsLowerBound for PathRef {
+impl BlobSeqRef {
+    /// Converts a slice of bytes into a PathRef without checking proper escaping.
+    #[ref_cast_custom]
+    pub(crate) const fn new(data: &[u8]) -> &Self;
+
+    pub const ZERO: &'static Self = Self::new(&[]);
+}
+
+impl IsLowerBound for BlobSeqRef {
     fn is_min_value(&self) -> bool {
         self.0.is_empty()
     }
 }
 
-impl Debug for PathRef {
+impl Debug for BlobSeqRef {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         if f.alternate() {
-            write!(f, "PathRef({})", hex::encode(&self.0))
+            write!(f, "BlobSeqRef({})", hex::encode(&self.0))
         } else {
             write!(f, "{}", self)
         }
@@ -409,7 +451,7 @@ fn compare(a: &[u8], b: &[u8]) -> Ordering {
 //     a.len().cmp(&b.len())
 // }
 
-impl Ord for PathRef {
+impl Ord for BlobSeqRef {
     #[inline(always)]
     fn cmp(&self, other: &Self) -> Ordering {
         compare(&self.0, &other.0)
@@ -417,35 +459,35 @@ impl Ord for PathRef {
     }
 }
 
-impl PartialOrd for PathRef {
+impl PartialOrd for BlobSeqRef {
     #[inline(always)]
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Display for PathRef {
+impl Display for BlobSeqRef {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         let path = self.to_owned();
         write!(f, "{}", path)
     }
 }
 
-impl ToOwned for PathRef {
-    type Owned = Path;
+impl ToOwned for BlobSeqRef {
+    type Owned = BlobSeq;
 
     fn to_owned(&self) -> Self::Owned {
-        Path::from_escaped(&self.0)
+        BlobSeq::from_escaped(&self.0)
     }
 }
 
-impl RefFromSlice for PathRef {
+impl RefFromSlice for BlobSeqRef {
     fn ref_from_slice(slice: &[u8]) -> &Self {
-        Self::ref_cast(slice)
+        Self::new(slice)
     }
 }
 
-impl VariableSize for PathRef {
+impl VariableSize for BlobSeqRef {
     fn size(&self) -> usize {
         self.0.len()
     }
@@ -507,7 +549,7 @@ mod tests {
     fn path_escape_roundtrip_impl(c: Components) {
         let c = c.0;
         let escaped = escape(&c);
-        let path = Path::from_escaped(&escaped);
+        let path = BlobSeq::from_escaped(&escaped);
         let c2 = path.components().map(|x| x.to_vec()).collect::<Vec<_>>();
         assert_eq!(c, c2);
     }
@@ -530,17 +572,17 @@ mod tests {
 
     #[test]
     fn min_value_test() {
-        let a = Path::min_value();
-        let b = Path::from(vec![]);
+        let a = BlobSeq::min_value();
+        let b = BlobSeq::from(vec![]);
         assert_eq!(a, b);
         println!("{:#?}", a);
     }
 
     #[test]
     fn format_test() {
-        let a = Path::from(["a", "b", "c"].as_ref());
-        let b = Path::from([[01u8].as_ref(), &[02, 03], &[04, 05, 06]].as_ref());
-        let c = Path::from_str(r#""a"/"b"/01020304"#).unwrap();
+        let a = BlobSeq::from(["a", "b", "c"].as_ref());
+        let b = BlobSeq::from([[01u8].as_ref(), &[02, 03], &[04, 05, 06]].as_ref());
+        let c = BlobSeq::from_str(r#""a"/"b"/01020304"#).unwrap();
         println!("{}", a);
         println!("{}", b);
         println!("{}", c);

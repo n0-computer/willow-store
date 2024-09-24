@@ -1,7 +1,6 @@
 //! Geometric types and operations.
 use crate::{
-    count_trailing_zeros, FixedSize, IsLowerBound, KeyParams, LowerBound, RefFromSlice, SortOrder,
-    VariableSize,
+    count_trailing_zeros, FixedSize, KeyParams, LowerBound, RefFromSlice, SortOrder, VariableSize,
 };
 use ref_cast::RefCast;
 use std::{
@@ -40,7 +39,7 @@ impl<T> From<std::ops::RangeFrom<T>> for QueryRange<T> {
     }
 }
 
-impl<T: Display + IsLowerBound> Display for QueryRange<T> {
+impl<T: Display + LowerBound> Display for QueryRange<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.min.is_min_value() {
             match &self.max {

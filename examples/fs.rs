@@ -1,14 +1,34 @@
+use anyhow::Result;
 use std::{
     borrow::Borrow, io, os::unix::fs::MetadataExt, path::PathBuf, str::FromStr, time::Instant,
 };
 
+use clap::Parser;
 use testresult::TestResult;
 use walkdir::WalkDir;
 use willow_store::mock_willow::{TNode, TPoint, WillowValue};
 use willow_store::{
     mock_willow::{Subspace, Timestamp},
-    NodeId, Path, QueryRange, QueryRange3d, RedbBlobStore,
+    BlobSeq, NodeId, QueryRange, QueryRange3d, RedbBlobStore,
 };
+
+#[derive(Debug, clap::Parser)]
+struct Args {
+    #[command(subcommand)]
+    subcommand: Subcommand,
+}
+
+#[derive(Debug, Clone, clap::Parser)]
+enum Subcommand {
+    Import(ImportArgs),
+}
+
+#[derive(Debug, Clone, clap::Parser)]
+struct ImportArgs {
+    root: PathBuf,
+    #[clap(long)]
+    target: PathBuf,
+}
 
 fn entry_to_triple(entry: walkdir::DirEntry) -> io::Result<Option<(u32, Timestamp, PathBuf)>> {
     let path = entry.path().to_path_buf();
@@ -43,6 +63,13 @@ fn traverse(
         })
 }
 
+fn main() -> Result<()> {
+    let args = Args::parse();
+    match args.subcommand {
+        Subcommand::Import(args) => import(args),
+    }
+}
+
 fn main_new() -> TestResult<()> {
     tracing_subscriber::fmt::init();
     let node = TNode::from(NodeId::from(297442));
@@ -58,14 +85,15 @@ fn main_new() -> TestResult<()> {
     Ok(())
 }
 
-fn main() -> TestResult<()> {
-    std::fs::remove_file("test.db").ok();
-    let db = RedbBlobStore::new("test.db")?;
+fn import(args: ImportArgs) -> Result<()> {
+    let target = args.target;
+    std::fs::remove_file(&target).ok();
+    let db = RedbBlobStore::new(target)?;
     let mut batch = db.txn()?;
     // let db = MemStore::new();
     // let mut batch = db;
     let mut node = TNode::EMPTY;
-    let root: PathBuf = "/Users/rklaehn/projects_git/linux".into();
+    let root = args.root;
     for item in traverse(&root) {
         let (user_id, creation_time, path) = item?;
         let user_id = Subspace::from(user_id as u64);
@@ -76,7 +104,7 @@ fn main() -> TestResult<()> {
             .map(|x| x.to_string())
             .collect::<Vec<_>>();
         let comp_ref = components.iter().map(|x| x.as_bytes()).collect::<Vec<_>>();
-        let wpath = Path::from(comp_ref.as_slice());
+        let wpath = BlobSeq::from(comp_ref.as_slice());
         println!("{} {} {}", user_id, creation_time, wpath);
         let key = TPoint::new(&user_id, &creation_time, wpath.borrow());
         let input = path.to_string_lossy().as_bytes().to_vec();
@@ -95,7 +123,7 @@ fn main() -> TestResult<()> {
     let q = QueryRange3d {
         x: QueryRange::all(),
         y: QueryRange::all(),
-        z: QueryRange::from(Path::from_str(r#""arch""#)?..Path::from_str(r#""arch ""#)?),
+        z: QueryRange::from(BlobSeq::from_str(r#""arch""#)?..BlobSeq::from_str(r#""arch ""#)?),
     };
     println!("{}", q);
     let t0 = Instant::now();

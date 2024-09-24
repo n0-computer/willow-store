@@ -11,8 +11,8 @@ use std::{
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
 use crate::{
-    fmt::NoQuotes, FixedSize, IsLowerBound, KeyParams, LiftingCommutativeMonoid, LowerBound, Node,
-    Path, PathRef, Point, PointRef, TreeParams,
+    fmt::NoQuotes, BlobSeq, BlobSeqRef, FixedSize, IsLowerBound, KeyParams,
+    LiftingCommutativeMonoid, LowerBound, Node, Point, PointRef, TreeParams,
 };
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, FromBytes, AsBytes, FromZeroes)]
@@ -74,9 +74,9 @@ impl KeyParams for WillowTreeParams {
     // subspace
     type Y = Timestamp;
     // path
-    type Z = PathRef;
+    type Z = BlobSeqRef;
     // owned path
-    type ZOwned = Path;
+    type ZOwned = BlobSeq;
 }
 
 impl TreeParams for WillowTreeParams {

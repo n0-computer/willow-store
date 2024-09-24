@@ -274,7 +274,7 @@ mod tests {
     use crate::{Node, Point, QueryRange, QueryRange3d};
 
     use super::*;
-    use crate::path::Path;
+    use crate::path::BlobSeq;
     use testresult::TestResult;
 
     fn init(
@@ -289,7 +289,7 @@ mod tests {
         for (subspace, data) in x {
             let subspace = subspace.into();
             for (timestamp, path, value) in data {
-                let path = Path::from_str(&path.into()).unwrap();
+                let path = BlobSeq::from_str(&path.into()).unwrap();
                 let key = TPoint::new(&subspace, &timestamp.into(), path.borrow());
                 let value = WillowValue::hash(value.into().as_bytes());
                 node.insert(&key, &value, &mut txn).unwrap();
@@ -319,7 +319,7 @@ mod tests {
         let query = QueryRange3d {
             x: QueryRange::all(),
             y: QueryRange::all(),
-            z: QueryRange::from(Path::from_str(r#""a"/"b"/"e""#)?..),
+            z: QueryRange::from(BlobSeq::from_str(r#""a"/"b"/"e""#)?..),
         };
         println!("query by path range");
         for item in node.query(&query, &store) {
@@ -355,10 +355,10 @@ mod tests {
         let v2 = WillowValue::hash(b"data2");
         let t = Timestamp::now();
         let s = Subspace::ZERO;
-        let path = Path::from_str(r#""a"/"b"/"c""#)?;
+        let path = BlobSeq::from_str(r#""a"/"b"/"c""#)?;
         let key = Point::new(&s, &t, path.borrow());
         node.insert(&key, &v1, &mut txn)?;
-        let path = Path::from_str(r#""a"/"b"/"d""#)?;
+        let path = BlobSeq::from_str(r#""a"/"b"/"d""#)?;
         let key = Point::new(&s, &t, path.borrow());
         node.insert(&key, &v2, &mut txn)?;
         txn.commit()?;

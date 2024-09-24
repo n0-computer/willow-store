@@ -19,8 +19,8 @@ tracing = "0.1.40"
 zerocopy = { version = "0.7.32", features = ["derive"] }
 
 [dev-dependencies]
-clap = "4.5.18"
-postcard = { version = "1.0.8", features = ["use-std"] }
+clap = { version = "4", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
 proptest = "1.5.0"
 rand = { version = "0.8.5", features = ["small_rng"] }
 test-strategy = "0.4.0"
@@ -36,6 +36,6 @@ default = ["mock-willow"]
 debug = true
 
 [[example]]
-name = "linux"
-path = "examples/linux.rs"
+name = "fs"
+path = "examples/fs.rs"
 required-features = ["mock-willow"]
