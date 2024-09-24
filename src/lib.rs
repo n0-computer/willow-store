@@ -121,13 +121,13 @@ mod store;
 use ref_cast::RefCast;
 mod layout;
 // mod path;
+mod blob_seq;
 mod fmt;
-mod path;
 use layout::*;
 pub use store::{mem::MemStore, BlobStore, NodeId};
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
-pub use path::{BlobSeq, BlobSeqRef};
+pub use blob_seq::{BlobSeq, BlobSeqRef};
 pub use store::redb::RedbBlobStore;
 
 #[cfg(any(test, feature = "mock-willow"))]
@@ -928,9 +928,9 @@ impl<P: TreeParams> Node<P> {
             return Ok(None);
         };
         let left = query.left(&point, order);
+        let right = query.right(&point, order);
         let left_count = self.range_count(&left, store)?;
         let right_count = count - left_count;
-        let right = query.right(&point, order);
         Ok(Some((left, left_count, right, right_count)))
     }
 
@@ -939,7 +939,7 @@ impl<P: TreeParams> Node<P> {
         query: &QueryRange3d<P>,
         store: &impl NodeStore<P>,
     ) -> Result<Option<(Point<P>, SortOrder)>> {
-        let mut points = self.query_interleaved(query, &|data| data.key().to_owned(), store);
+        let mut points = self.query_interleaved(query, &|_, data| data.key().to_owned(), store);
         let Some(a) = points.next() else {
             return Ok(None);
         };
@@ -1068,7 +1068,7 @@ impl<P: TreeParams> Node<P> {
         query: &'a QueryRange3d<P>,
         store: &'a impl NodeStore<P>,
     ) -> impl Iterator<Item = Result<(Point<P>, P::V)>> + 'a {
-        let project = |data: &NodeData<P>| (data.key().to_owned(), data.value().clone());
+        let project = |_, data: &NodeData<P>| (data.key().to_owned(), data.value().clone());
         Gen::new(|co| async move {
             if let Err(cause) = self.query_rec(query, &project, store, &co).await {
                 co.yield_(Err(cause)).await;
@@ -1089,7 +1089,7 @@ impl<P: TreeParams> Node<P> {
     async fn query_rec<T>(
         &self,
         query: &QueryRange3d<P>,
-        project: &impl Fn(&NodeData<P>) -> T,
+        project: &impl Fn(Node<P>, &NodeData<P>) -> T,
         store: &impl NodeStore<P>,
         co: &Co<Result<T>>,
     ) -> Result<()> {
@@ -1103,7 +1103,7 @@ impl<P: TreeParams> Node<P> {
             let left = data.left().filter(|| query.overlaps_left(key, order));
             let right = data.right().filter(|| query.overlaps_right(key, order));
             let kv = if query.contains(key) {
-                Some(project(data))
+                Some(project(*self, data))
             } else {
                 None
             };
@@ -1209,7 +1209,7 @@ impl<P: TreeParams> Node<P> {
     pub fn query_interleaved<'a, T: 'a>(
         self,
         query: &'a QueryRange3d<P>,
-        project: &'a impl Fn(&NodeData<P>) -> T,
+        project: &'a impl Fn(Node<P>, &NodeData<P>) -> T,
         store: &'a impl NodeStore<P>,
     ) -> Box<dyn Iterator<Item = Result<T>> + 'a> {
         match self.query_interleaved_rec(query, project, store) {
@@ -1221,7 +1221,7 @@ impl<P: TreeParams> Node<P> {
     fn query_interleaved_rec<'a, T: 'a>(
         self,
         query: &'a QueryRange3d<P>,
-        project: &'a impl Fn(&NodeData<P>) -> T,
+        project: &'a impl Fn(Node<P>, &NodeData<P>) -> T,
         store: &'a impl NodeStore<P>,
     ) -> Result<impl Iterator<Item = Result<T>> + 'a> {
         let res = if self.is_empty() {
@@ -1233,7 +1233,7 @@ impl<P: TreeParams> Node<P> {
                 let left = data.left().filter(|| query.overlaps_left(key, order));
                 let right = data.right().filter(|| query.overlaps_right(key, order));
                 let kv = if query.contains(key) {
-                    Some(project(data))
+                    Some(project(self, data))
                 } else {
                     None
                 };

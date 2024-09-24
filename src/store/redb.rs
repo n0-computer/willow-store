@@ -274,7 +274,7 @@ mod tests {
     use crate::{Node, Point, QueryRange, QueryRange3d};
 
     use super::*;
-    use crate::path::BlobSeq;
+    use crate::blob_seq::BlobSeq;
     use testresult::TestResult;
 
     fn init(
