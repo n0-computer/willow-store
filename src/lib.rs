@@ -133,10 +133,12 @@ pub use store::redb::RedbBlobStore;
 #[cfg(any(test, feature = "mock-willow"))]
 pub mod mock_willow;
 
+/// Provide the size of a fixed size type as a constant.
 pub trait FixedSize {
     const SIZE: usize;
 }
 
+/// Provide the size of a variable size type.
 pub trait VariableSize {
     fn size(&self) -> usize;
 }
@@ -908,7 +910,41 @@ impl<P: TreeParams> Node<P> {
         .into_iter()
     }
 
-    pub fn find_split_plane(
+    pub fn find_split_plane_supernew(
+        &self,
+        query: &QueryRange3d<P>,
+        store: &impl NodeStore<P>,
+    ) -> Result<Option<(QueryRange3d<P>, Node<P>, QueryRange3d<P>, Node<P>)>> {
+        if self.is_empty() {
+            return Ok(None);
+        }
+        store.peek_data(*self, |data| {
+            let key = data.key();
+            let order = data.sort_order();
+            let left = data.left();
+            let right = data.right();
+            if !left.is_empty() {
+                // this is just wrong. left and right only work if the two keys are different in the first dimension of the order.
+                let lq = query.left(key, order);
+                let rq = query.right(key, order);
+                // todo: if the split is in the same direction as order, we can
+                // return left and right instead of self and self.
+                Ok(Some((lq, *self, rq, *self)))
+            } else if !data.right().is_empty() {
+                let (lq, rq) = store.peek_data(right, |right| {
+                    let right_key = right.key();
+                    (query.left(key, order), query.right(right_key, order))
+                })?;
+                // todo: if the split is in the same direction as order, we can
+                // return left and right instead of self and self.
+                Ok(Some((lq, *self, rq, right)))
+            } else {
+                Ok(None)
+            }
+        })?
+    }
+
+    pub fn find_split_plane_old(
         &self,
         query: &QueryRange3d<P>,
         count: u64,
@@ -918,7 +954,7 @@ impl<P: TreeParams> Node<P> {
         self.find_split_plane_rec(*self, query, count, &bbox, store)
     }
 
-    pub fn find_split_plane_new(
+    pub fn find_split_plane(
         &self,
         query: &QueryRange3d<P>,
         count: u64,

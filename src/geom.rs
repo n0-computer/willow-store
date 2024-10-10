@@ -667,6 +667,7 @@ impl<K: KeyParams> Ord for PointRef<K> {
     }
 }
 
+/// A point in 3D space.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Point<P: KeyParams>(PhantomData<P>, Arc<[u8]>);
 

@@ -250,7 +250,7 @@ impl BlobSeq {
         &self.data()[start..]
     }
 
-    fn components(&self) -> impl Iterator<Item = &[u8]> {
+    pub fn components(&self) -> impl Iterator<Item = &[u8]> {
         let data = self.data();
         let count = self.count as usize;
         (0..count).map(move |i| {
