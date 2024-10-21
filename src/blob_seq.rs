@@ -5,12 +5,12 @@
 //! components in the keys while still retaining the ordering of a sequence
 //! of blobs.
 //!
-//! [Path] is the owned version, storing any number of components in a single
-//! allocation. [PathRef] is the borrowed version, which is just a newtype for
+//! [BlobSeq] is the owned version, storing any number of components in a single
+//! allocation. [BlobSeqRef] is the borrowed version, which is just a newtype for
 //! a slice of bytes.
 //!
-//! The relationship between [Path] and [PathRef] is similar to the relationship
-//! between [String] and [str].
+//! The relationship between [BlobSeq] and [BlobSeqRef] is similar to the
+//! relationship between [String] and [str].
 //!
 //! # Example
 //!
