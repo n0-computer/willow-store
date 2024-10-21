@@ -261,6 +261,51 @@ impl BlobSeq {
         })
     }
 
+    /// For a value `x`, returns the immedate next [`BlobSeq`] `y > x`, such that
+    /// there is **no** `intermediate` for which `x < intermediate < y` holds.
+    pub fn immediate_successor(&self) -> BlobSeq {
+        // TODO: Avoid these intermediate allocations
+        Self::from(
+            self.components()
+                .map(|slice| slice.to_vec())
+                .chain(Some(Vec::new())) // Add an empty path element
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// For a value `x`, returns a [`BlobSeq`] `y > x`, such that all
+    /// `intermediate` values `x < intermediate < y` have `x` as their prefix.
+    /// (I.e. all `intermediate`s are subpaths of `x`.)
+    ///
+    /// Returns [`None`] for the empty [`BlobSeq`].
+    ///
+    /// This is useful to construct range queries that query for all
+    /// suffixes of this [`BlobSeq`].
+    pub fn subseq_successor(&self) -> Option<BlobSeq> {
+        // TODO: Avoid these intermediate allocations
+        let mut path = self
+            .components()
+            .map(|slice| slice.to_vec())
+            .collect::<Vec<_>>();
+
+        if path
+            .last_mut()
+            .map(|last_path| match last_path.last_mut() {
+                Some(255) | None => {
+                    last_path.push(0);
+                }
+                Some(i) => {
+                    *i += 1;
+                }
+            })
+            .is_some()
+        {
+            Some(Self::from(path))
+        } else {
+            None
+        }
+    }
+
     fn from_escaped(escaped: &[u8]) -> Self {
         assert!(escaped.len() < MAX_TOTAL_SIZE);
         if escaped.is_empty() {
@@ -529,6 +574,17 @@ mod tests {
         }
     }
 
+    impl Arbitrary for BlobSeq {
+        type Parameters = ();
+        type Strategy = BoxedStrategy<Self>;
+
+        fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
+            arb_components(4, 12)
+                .prop_map(|Components(comp)| BlobSeq::from(comp))
+                .boxed()
+        }
+    }
+
     #[proptest]
     fn test_escape_roundtrip(comp: Components) {
         let comp = comp.0;
@@ -557,6 +613,66 @@ mod tests {
     #[proptest]
     fn prop_path_escape_roundtrip(c: Components) {
         path_escape_roundtrip_impl(c);
+    }
+
+    #[proptest]
+    fn prop_immediate_successor_is_larger(seq: BlobSeq) {
+        prop_assert!(seq < seq.immediate_successor());
+    }
+
+    #[proptest]
+    fn prop_subseq_successor_is_larger(seq: BlobSeq) {
+        let Some(succ) = seq.subseq_successor() else {
+            // rejection doesn't count towards test run total
+            return Err(TestCaseError::reject("subseq_successor is None"));
+        };
+        prop_assert!(seq < succ);
+    }
+
+    #[proptest]
+    fn prop_subseq_successor_has_subpath_intermediate(a: Components, b: Components) {
+        impl_subseq_successor_has_subpath_intermediate(a, b)?;
+    }
+
+    fn impl_subseq_successor_has_subpath_intermediate(
+        mut a: Components,
+        b: Components,
+    ) -> Result<(), TestCaseError> {
+        let seq = BlobSeq::from(a.0.clone());
+        let Some(subseq_succ) = seq.subseq_successor() else {
+            // rejection doesn't count towards test run total
+            return Err(TestCaseError::reject("subseq_successor is None"));
+        };
+        a.0.extend(b.0);
+        let subseq = BlobSeq::from(a.0);
+        prop_assert!(seq <= subseq);
+        prop_assert!(subseq < subseq_succ);
+        Ok(())
+    }
+
+    #[proptest]
+    fn prop_immediate_smaller_than_subseq_successor(seq: BlobSeq) {
+        let Some(subseq_succ) = seq.subseq_successor() else {
+            // rejection doesn't count towards test run total
+            return Err(TestCaseError::reject("subseq_successor is None"));
+        };
+        let imm_succ = seq.immediate_successor();
+        assert!(imm_succ < subseq_succ);
+    }
+
+    #[test]
+    fn test_subseq_successor_has_subpath_intermediate_cases() -> Result<(), TestCaseError> {
+        let cases = vec![
+            (vec![vec![0]], vec![vec![]]),
+            (vec![vec![255]], vec![vec![42]]),
+            (vec![vec![0, 255]], vec![vec![0]]),
+            (vec![vec![0, 255]], vec![]),
+            (vec![vec![255, 0]], vec![]),
+        ];
+        for (a, b) in cases {
+            impl_subseq_successor_has_subpath_intermediate(Components(a), Components(b))?;
+        }
+        Ok(())
     }
 
     #[test]

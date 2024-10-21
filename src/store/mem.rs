@@ -2,6 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use super::{BlobStore, NodeId, Result};
 
+#[derive(Debug, Clone)]
 pub struct MemStore {
     nodes: HashMap<NodeId, Arc<[u8]>>,
     max_id: u64,
