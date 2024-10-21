@@ -264,6 +264,7 @@ impl BlobSeq {
     /// For a value `x`, returns the immedate next [`BlobSeq`] `y > x`, such that
     /// there is **no** `intermediate` for which `x < intermediate < y` holds.
     pub fn immediate_successor(&self) -> BlobSeq {
+        // TODO: Avoid these intermediate allocations
         Self::from(
             self.components()
                 .map(|slice| slice.to_vec())
@@ -281,6 +282,7 @@ impl BlobSeq {
     /// This is useful to construct range queries that query for all
     /// suffixes of this [`BlobSeq`].
     pub fn subseq_successor(&self) -> Option<BlobSeq> {
+        // TODO: Avoid these intermediate allocations
         let mut path = self
             .components()
             .map(|slice| slice.to_vec())
