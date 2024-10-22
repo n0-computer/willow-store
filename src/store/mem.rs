@@ -4,7 +4,7 @@ use super::{BlobStore, NodeId, Result};
 
 #[derive(Debug, Clone)]
 pub struct MemStore {
-    nodes: HashMap<NodeId, Arc<[u8]>>,
+    nodes: rpds::HashTrieMapSync<NodeId, Arc<[u8]>>,
     max_id: u64,
 }
 
@@ -17,7 +17,7 @@ impl MemStore {
     }
 
     pub fn size(&self) -> usize {
-        self.nodes.len()
+        self.nodes.size()
     }
 
     pub fn max_id(&self) -> u64 {
@@ -34,13 +34,13 @@ impl BlobStore for MemStore {
         self.max_id += 1;
         let id = NodeId(self.max_id);
         assert!(!id.is_empty());
-        self.nodes.insert(id, node.to_vec().into());
+        self.nodes.insert_mut(id, node.to_vec().into());
         Ok(id)
     }
 
     fn update(&mut self, id: NodeId, node: &[u8]) -> Result<()> {
         assert!(!id.is_empty());
-        self.nodes.insert(id, node.to_vec().into());
+        self.nodes.insert_mut(id, node.to_vec().into());
         Ok(())
     }
 
@@ -62,7 +62,7 @@ impl BlobStore for MemStore {
 
     fn delete(&mut self, id: NodeId) -> Result<()> {
         assert!(!id.is_empty());
-        self.nodes.remove(&id);
+        self.nodes.remove_mut(&id);
         Ok(())
     }
 }
