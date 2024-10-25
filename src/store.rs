@@ -4,18 +4,22 @@ use zerocopy::{AsBytes, FromBytes, FromZeroes};
 pub mod mem;
 pub mod redb;
 
-/// A simple store trait for storing blobs.
-pub trait BlobStore {
+/// A simple store trait for reading & storing blobs.
+pub trait BlobStore: BlobStoreRead {
     /// Create a new node in the store. The generated ids should not be reused.
     fn create(&mut self, node: &[u8]) -> Result<NodeId>;
-    /// Read a node from the store.
-    fn read(&self, id: NodeId) -> Result<Vec<u8>>;
-    /// Peek at a node in the store and project it into a value.
-    fn peek<T>(&self, id: NodeId, f: impl Fn(&[u8]) -> T) -> Result<T>;
     /// Update a node in the store.
     fn update(&mut self, id: NodeId, node: &[u8]) -> Result<()>;
     /// Delete a node from the store.
     fn delete(&mut self, id: NodeId) -> Result<()>;
+}
+
+/// A simple store trait for reading blobs.
+pub trait BlobStoreRead {
+    /// Read a node from the store.
+    fn read(&self, id: NodeId) -> Result<Vec<u8>>;
+    /// Peek at a node in the store and project it into a value.
+    fn peek<T>(&self, id: NodeId, f: impl Fn(&[u8]) -> T) -> Result<T>;
 }
 
 /// We implement the zero copy traits with native u64. This means that the storage
