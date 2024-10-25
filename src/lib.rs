@@ -128,7 +128,7 @@ pub use store::{mem::MemStore, BlobStore, NodeId};
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
 pub use blob_seq::{BlobSeq, BlobSeqRef};
-pub use store::redb::RedbBlobStore;
+pub use store::redb::{RedbBlobStore, Snapshot, Tables};
 
 #[cfg(any(test, feature = "mock-willow"))]
 pub mod mock_willow;
