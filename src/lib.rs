@@ -468,6 +468,12 @@ impl<P: TreeParams> From<store::NodeId> for Node<P> {
     }
 }
 
+impl<P: TreeParams> From<Node<P>> for store::NodeId {
+    fn from(id: Node<P>) -> Self {
+        store::NodeId::from(id.0)
+    }
+}
+
 impl<P: TreeParams> Clone for Node<P> {
     fn clone(&self) -> Self {
         Self(self.0, PhantomData)
