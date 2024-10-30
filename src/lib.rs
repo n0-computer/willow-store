@@ -895,6 +895,33 @@ impl<P: TreeParams> Node<P> {
         store.peek_data(*self, |data| range_count(data, bbox, query, store))?
     }
 
+    /// Same as [`Self::split_range`], but takes ownership of `self` and
+    /// `store` to avoid gnarly lifetime/borrowing issues, both of which
+    /// may be cheap to clone/Copy anyways.
+    pub fn split_range_owned(
+        self,
+        query: QueryRange3d<P>,
+        split_factor: u64,
+        store: impl NodeStoreRead<P>,
+    ) -> impl Iterator<Item = Result<(QueryRange3d<P>, u64)>> {
+        Gen::new(|co| async move {
+            let count = match self.range_count(&query, &store) {
+                Ok(count) => count,
+                Err(cause) => {
+                    co.yield_(Err(cause)).await;
+                    return;
+                }
+            };
+            if let Err(cause) = self
+                .split_range_rec(query, count, split_factor, &co, &store)
+                .await
+            {
+                co.yield_(Err(cause)).await;
+            }
+        })
+        .into_iter()
+    }
+
     pub fn split_range<'a>(
         &'a self,
         query: QueryRange3d<P>,
