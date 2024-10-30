@@ -17,7 +17,9 @@ pub trait BlobStore: BlobStoreRead {
 /// A simple store trait for reading blobs.
 pub trait BlobStoreRead {
     /// Read a node from the store.
-    fn read(&self, id: NodeId) -> Result<Vec<u8>>;
+    fn read(&self, id: NodeId) -> Result<Vec<u8>> {
+        self.peek(id, |x| x.to_vec())
+    }
     /// Peek at a node in the store and project it into a value.
     fn peek<T>(&self, id: NodeId, f: impl Fn(&[u8]) -> T) -> Result<T>;
 }

@@ -52,14 +52,6 @@ impl BlobStore for MemStore {
 }
 
 impl BlobStoreRead for MemStore {
-    fn read(&self, id: NodeId) -> Result<Vec<u8>> {
-        assert!(!id.is_empty());
-        match self.nodes.get(&id) {
-            Some(data) => Ok(data.to_vec()),
-            None => Err(anyhow::anyhow!("Node not found")),
-        }
-    }
-
     fn peek<T>(&self, id: NodeId, f: impl Fn(&[u8]) -> T) -> Result<T> {
         assert!(!id.is_empty());
         match self.nodes.get(&id) {

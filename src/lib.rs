@@ -124,7 +124,7 @@ mod layout;
 mod blob_seq;
 mod fmt;
 use layout::*;
-pub use store::{mem::MemStore, BlobStore, NodeId};
+pub use store::{mem::MemStore, BlobStore, BlobStoreRead, NodeId};
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
 pub use blob_seq::{BlobSeq, BlobSeqRef};

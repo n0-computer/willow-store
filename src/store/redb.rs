@@ -110,10 +110,6 @@ impl Snapshot {
 }
 
 impl BlobStoreRead for Snapshot {
-    fn read(&self, id: NodeId) -> Result<Vec<u8>> {
-        self.peek(id, |x| x.to_vec())
-    }
-
     fn peek<T>(&self, id: NodeId, f: impl Fn(&[u8]) -> T) -> Result<T> {
         match self.blob_table.get(&id)? {
             Some(value) => Ok(f(value.value())),
@@ -136,14 +132,6 @@ impl<'a> Tables<'a> {
 }
 
 impl<'a> BlobStoreRead for Tables<'a> {
-    fn read(&self, id: NodeId) -> Result<Vec<u8>> {
-        let value = self
-            .blobs
-            .get(&id)?
-            .ok_or_else(|| anyhow::anyhow!("Node not found"))?;
-        Ok(value.value().to_vec())
-    }
-
     fn peek<T>(&self, id: NodeId, f: impl Fn(&[u8]) -> T) -> Result<T> {
         let value = self
             .blobs
@@ -199,10 +187,6 @@ impl BlobStoreRead for WriteBatch {
     fn peek<T>(&self, id: NodeId, f: impl Fn(&[u8]) -> T) -> Result<T> {
         self.0.with_dependent(|_db, tables| tables.peek(id, f))
     }
-
-    fn read(&self, id: NodeId) -> Result<Vec<u8>> {
-        self.0.with_dependent(|_db, tables| tables.read(id))
-    }
 }
 
 impl BlobStore for WriteBatch {
@@ -224,11 +208,6 @@ impl BlobStore for WriteBatch {
 }
 
 impl BlobStoreRead for RedbBlobStore {
-    fn read(&self, id: NodeId) -> Result<Vec<u8>> {
-        let read_txn = self.db.begin_read()?;
-        Snapshot::open(&read_txn)?.read(id)
-    }
-
     fn peek<T>(&self, id: NodeId, f: impl Fn(&[u8]) -> T) -> Result<T> {
         let read_txn = self.db.begin_read()?;
         Snapshot::open(&read_txn)?.peek(id, f)
