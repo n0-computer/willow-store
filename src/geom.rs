@@ -15,10 +15,10 @@ use zerocopy::{AsBytes, FromBytes};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryRange<T> {
-    // min is inclusive
-    min: T,
-    // max is exclusive, None means unbounded
-    max: Option<T>,
+    /// min is inclusive
+    pub min: T,
+    /// max is exclusive, None means unbounded
+    pub max: Option<T>,
 }
 
 impl<T> From<std::ops::Range<T>> for QueryRange<T> {
