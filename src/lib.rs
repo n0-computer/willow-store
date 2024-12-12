@@ -124,11 +124,11 @@ mod layout;
 mod blob_seq;
 mod fmt;
 use layout::*;
-pub use store::{mem::MemStore, BlobStore, NodeId};
+pub use store::{mem::MemStore, BlobStore, BlobStoreRead, NodeId};
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
 pub use blob_seq::{BlobSeq, BlobSeqRef};
-pub use store::redb::RedbBlobStore;
+pub use store::redb::{RedbBlobStore, Snapshot, Tables};
 
 #[cfg(any(test, feature = "mock-willow"))]
 pub mod mock_willow;
@@ -377,14 +377,18 @@ pub trait NodeStore<P: TreeParams>: store::BlobStore {
         let id = Node(self.create(data.as_slice())?, PhantomData);
         Ok(IdAndData::new(id, data))
     }
+}
 
+impl<T: store::BlobStore, P: TreeParams> NodeStore<P> for T {}
+
+pub trait NodeStoreRead<P: TreeParams>: store::BlobStoreRead {
     fn data(&self, id: Node<P>) -> Result<OwnedNodeData<P>> {
-        let data = store::BlobStore::read(self, id.0)?;
+        let data = store::BlobStoreRead::read(self, id.0)?;
         Ok(OwnedNodeData::new(data))
     }
 
     fn peek_data<T>(&self, id: Node<P>, f: impl Fn(&NodeData<P>) -> T) -> Result<T> {
-        store::BlobStore::peek(self, id.0, |data| f(NodeData::ref_cast(data)))
+        store::BlobStoreRead::peek(self, id.0, |data| f(NodeData::ref_cast(data)))
     }
 
     fn peek_data_opt<T>(&self, id: Node<P>, f: impl Fn(&NodeData<P>) -> T) -> Result<Option<T>> {
@@ -427,7 +431,7 @@ pub trait NodeStore<P: TreeParams>: store::BlobStore {
     }
 }
 
-impl<T: store::BlobStore, P: TreeParams> NodeStore<P> for T {}
+impl<T: store::BlobStoreRead, P: TreeParams> NodeStoreRead<P> for T {}
 
 #[derive(Debug, Clone, Copy)]
 pub struct SplitOpts {
@@ -461,6 +465,12 @@ pub struct Node<P: TreeParams>(store::NodeId, PhantomData<P>);
 impl<P: TreeParams> From<store::NodeId> for Node<P> {
     fn from(id: store::NodeId) -> Self {
         Node(id, PhantomData)
+    }
+}
+
+impl<P: TreeParams> From<Node<P>> for store::NodeId {
+    fn from(id: Node<P>) -> Self {
+        store::NodeId::from(id.0)
     }
 }
 
@@ -515,7 +525,7 @@ impl<P: TreeParams> Node<P> {
         }
     }
 
-    pub fn count(&self, store: &impl NodeStore<P>) -> Result<u64> {
+    pub fn count(&self, store: &impl NodeStoreRead<P>) -> Result<u64> {
         Ok(if let Some(data) = store.data_opt(*self)? {
             1 + data.left().count(store)? + data.right().count(store)?
         } else {
@@ -630,7 +640,7 @@ impl<P: TreeParams> Node<P> {
 
     pub fn assert_invariants(
         &self,
-        store: &impl NodeStore<P>,
+        store: &impl NodeStoreRead<P>,
         include_summary: bool,
     ) -> Result<()> {
         if !self.is_empty() {
@@ -640,14 +650,14 @@ impl<P: TreeParams> Node<P> {
         Ok(())
     }
 
-    pub fn get(&self, key: &PointRef<P>, store: &impl NodeStore<P>) -> Result<Option<P::V>> {
+    pub fn get(&self, key: &PointRef<P>, store: &impl NodeStoreRead<P>) -> Result<Option<P::V>> {
         Ok(self.get0(key, store)?.map(|x| x.value().clone()))
     }
 
     fn get0(
         &self,
         key: &PointRef<P>,
-        store: &impl NodeStore<P>,
+        store: &impl NodeStoreRead<P>,
     ) -> Result<Option<OwnedNodeData<P>>> {
         if let Some(data) = store.data_opt(*self)? {
             match key.cmp_at_rank(data.key(), data.rank()) {
@@ -672,11 +682,11 @@ impl<P: TreeParams> Node<P> {
         }
     }
 
-    pub fn dump(&self, store: &impl NodeStore<P>) -> Result<()> {
+    pub fn dump(&self, store: &impl NodeStoreRead<P>) -> Result<()> {
         self.dump0("".into(), store)
     }
 
-    fn dump0(&self, prefix: String, store: &impl NodeStore<P>) -> Result<()> {
+    fn dump0(&self, prefix: String, store: &impl NodeStoreRead<P>) -> Result<()> {
         if let Some(data) = store.data_opt(*self)? {
             data.left().dump0(format!("{}  ", prefix), store)?;
             println!(
@@ -747,7 +757,7 @@ impl<P: TreeParams> Node<P> {
 
     pub fn iter<'a>(
         &'a self,
-        store: &'a impl NodeStore<P>,
+        store: &'a impl NodeStoreRead<P>,
     ) -> impl Iterator<Item = Result<(Point<P>, P::V)>> + 'a {
         self.iter_impl(
             &|data, _| (data.key().to_owned(), data.value().clone()),
@@ -757,13 +767,13 @@ impl<P: TreeParams> Node<P> {
 
     pub fn values<'a>(
         &'a self,
-        store: &'a impl NodeStore<P>,
+        store: &'a impl NodeStoreRead<P>,
     ) -> impl Iterator<Item = Result<P::V>> + 'a {
         self.iter_impl(&|data, _| data.value().clone(), store)
     }
 
     /// Computes the average depth of the nodes in the tree, as a measure of the tree's balance.
-    pub fn average_node_depth(&self, store: &impl NodeStore<P>) -> Result<(u64, u64)> {
+    pub fn average_node_depth(&self, store: &impl NodeStoreRead<P>) -> Result<(u64, u64)> {
         let mut sum = 0;
         for item in self.iter_impl(&|_, depth| depth, store) {
             sum += item?;
@@ -779,7 +789,7 @@ impl<P: TreeParams> Node<P> {
     fn iter_impl<'a, T: 'a>(
         &'a self,
         project: &'a impl Fn(&NodeData<P>, u64) -> T,
-        store: &'a impl NodeStore<P>,
+        store: &'a impl NodeStoreRead<P>,
     ) -> impl Iterator<Item = Result<T>> + 'a {
         Gen::new(|co| async move {
             if let Err(cause) = self.iter_rec(0, &project, store, &co).await {
@@ -793,7 +803,7 @@ impl<P: TreeParams> Node<P> {
         &self,
         depth: u64,
         project: &impl Fn(&NodeData<P>, u64) -> T,
-        store: &impl NodeStore<P>,
+        store: &impl NodeStoreRead<P>,
         co: &Co<Result<T>>,
     ) -> Result<()> {
         if self.is_empty() {
@@ -817,7 +827,7 @@ impl<P: TreeParams> Node<P> {
     pub fn range_summary(
         &self,
         query: &QueryRange3d<P>,
-        store: &impl NodeStore<P>,
+        store: &impl NodeStoreRead<P>,
     ) -> Result<P::M> {
         let bbox = BBoxRef::all();
         self.range_summary_rec(query, &bbox, store)
@@ -827,7 +837,7 @@ impl<P: TreeParams> Node<P> {
         &self,
         query: &QueryRange3d<P>,
         bbox: &BBoxRef<P>,
-        store: &impl NodeStore<P>,
+        store: &impl NodeStoreRead<P>,
     ) -> Result<P::M> {
         if self.is_empty() {
             return Ok(P::M::neutral());
@@ -864,7 +874,11 @@ impl<P: TreeParams> Node<P> {
     }
 
     /// Count the number of elements in a 3d range.
-    pub fn range_count(&self, query: &QueryRange3d<P>, store: &impl NodeStore<P>) -> Result<u64> {
+    pub fn range_count(
+        &self,
+        query: &QueryRange3d<P>,
+        store: &impl NodeStoreRead<P>,
+    ) -> Result<u64> {
         let bbox = BBoxRef::all();
         self.range_count_rec(query, &bbox, store)
     }
@@ -873,7 +887,7 @@ impl<P: TreeParams> Node<P> {
         &self,
         query: &QueryRange3d<P>,
         bbox: &BBoxRef<P>,
-        store: &impl NodeStore<P>,
+        store: &impl NodeStoreRead<P>,
     ) -> Result<u64> {
         if self.is_empty() {
             return Ok(0);
@@ -881,11 +895,38 @@ impl<P: TreeParams> Node<P> {
         store.peek_data(*self, |data| range_count(data, bbox, query, store))?
     }
 
+    /// Same as [`Self::split_range`], but takes ownership of `self` and
+    /// `store` to avoid gnarly lifetime/borrowing issues, both of which
+    /// may be cheap to clone/Copy anyways.
+    pub fn split_range_owned(
+        self,
+        query: QueryRange3d<P>,
+        split_factor: u64,
+        store: impl NodeStoreRead<P>,
+    ) -> impl Iterator<Item = Result<(QueryRange3d<P>, u64)>> {
+        Gen::new(|co| async move {
+            let count = match self.range_count(&query, &store) {
+                Ok(count) => count,
+                Err(cause) => {
+                    co.yield_(Err(cause)).await;
+                    return;
+                }
+            };
+            if let Err(cause) = self
+                .split_range_rec(query, count, split_factor, &co, &store)
+                .await
+            {
+                co.yield_(Err(cause)).await;
+            }
+        })
+        .into_iter()
+    }
+
     pub fn split_range<'a>(
         &'a self,
         query: QueryRange3d<P>,
         split_factor: u64,
-        store: &'a impl NodeStore<P>,
+        store: &'a impl NodeStoreRead<P>,
     ) -> impl Iterator<Item = Result<(QueryRange3d<P>, u64)>> + 'a
     where
         P::X: Display,
@@ -913,7 +954,7 @@ impl<P: TreeParams> Node<P> {
     pub fn find_split_plane_supernew(
         &self,
         query: &QueryRange3d<P>,
-        store: &impl NodeStore<P>,
+        store: &impl NodeStoreRead<P>,
     ) -> Result<Option<(QueryRange3d<P>, Node<P>, QueryRange3d<P>, Node<P>)>> {
         if self.is_empty() {
             return Ok(None);
@@ -948,7 +989,7 @@ impl<P: TreeParams> Node<P> {
         &self,
         query: &QueryRange3d<P>,
         count: u64,
-        store: &impl NodeStore<P>,
+        store: &impl NodeStoreRead<P>,
     ) -> Result<Option<(QueryRange3d<P>, u64, QueryRange3d<P>, u64)>> {
         let bbox = BBoxRef::all();
         self.find_split_plane_rec(*self, query, count, &bbox, store)
@@ -958,7 +999,7 @@ impl<P: TreeParams> Node<P> {
         &self,
         query: &QueryRange3d<P>,
         count: u64,
-        store: &impl NodeStore<P>,
+        store: &impl NodeStoreRead<P>,
     ) -> Result<Option<(QueryRange3d<P>, u64, QueryRange3d<P>, u64)>> {
         let Some((point, order)) = self.find_split_plane_2(query, store)? else {
             return Ok(None);
@@ -973,7 +1014,7 @@ impl<P: TreeParams> Node<P> {
     pub fn find_split_plane_2(
         &self,
         query: &QueryRange3d<P>,
-        store: &impl NodeStore<P>,
+        store: &impl NodeStoreRead<P>,
     ) -> Result<Option<(Point<P>, SortOrder)>> {
         let mut points = self.query_interleaved(query, &|_, data| data.key().to_owned(), store);
         let Some(a) = points.next() else {
@@ -1021,7 +1062,7 @@ impl<P: TreeParams> Node<P> {
         query: &QueryRange3d<P>,
         count: u64,
         bbox: &BBoxRef<P>,
-        store: &impl NodeStore<P>,
+        store: &impl NodeStoreRead<P>,
     ) -> Result<Option<(QueryRange3d<P>, u64, QueryRange3d<P>, u64)>> {
         if self.is_empty() {
             return Ok(None);
@@ -1073,7 +1114,7 @@ impl<P: TreeParams> Node<P> {
         count: u64,
         split_factor: u64,
         co: &Co<Result<(QueryRange3d<P>, u64)>>,
-        store: &impl NodeStore<P>,
+        store: &impl NodeStoreRead<P>,
     ) -> Result<()> {
         // we split the query, but not the tree
         let root = self;
@@ -1102,7 +1143,7 @@ impl<P: TreeParams> Node<P> {
     pub fn query<'a>(
         &'a self,
         query: &'a QueryRange3d<P>,
-        store: &'a impl NodeStore<P>,
+        store: &'a impl NodeStoreRead<P>,
     ) -> impl Iterator<Item = Result<(Point<P>, P::V)>> + 'a {
         let project = |_, data: &NodeData<P>| (data.key().to_owned(), data.value().clone());
         Gen::new(|co| async move {
@@ -1126,7 +1167,7 @@ impl<P: TreeParams> Node<P> {
         &self,
         query: &QueryRange3d<P>,
         project: &impl Fn(Node<P>, &NodeData<P>) -> T,
-        store: &impl NodeStore<P>,
+        store: &impl NodeStoreRead<P>,
         co: &Co<Result<T>>,
     ) -> Result<()> {
         if self.is_empty() {
@@ -1166,7 +1207,7 @@ impl<P: TreeParams> Node<P> {
         self,
         query: &'a QueryRange3d<P>,
         ordering: SortOrder,
-        store: &'a impl NodeStore<P>,
+        store: &'a impl NodeStoreRead<P>,
     ) -> impl Iterator<Item = Result<(Point<P>, P::V)>> + 'a {
         Gen::new(|co| async move {
             if let Err(cause) = self.query_ordered_rec(query, ordering, store, &co).await {
@@ -1180,7 +1221,7 @@ impl<P: TreeParams> Node<P> {
         &self,
         query: &QueryRange3d<P>,
         ordering: SortOrder,
-        store: &impl NodeStore<P>,
+        store: &impl NodeStoreRead<P>,
         co: &Co<Result<(Point<P>, P::V)>>,
     ) -> Result<()> {
         if self.is_empty() {
@@ -1246,7 +1287,7 @@ impl<P: TreeParams> Node<P> {
         self,
         query: &'a QueryRange3d<P>,
         project: &'a impl Fn(Node<P>, &NodeData<P>) -> T,
-        store: &'a impl NodeStore<P>,
+        store: &'a impl NodeStoreRead<P>,
     ) -> Box<dyn Iterator<Item = Result<T>> + 'a> {
         match self.query_interleaved_rec(query, project, store) {
             Ok(iter) => Box::new(iter),
@@ -1258,7 +1299,7 @@ impl<P: TreeParams> Node<P> {
         self,
         query: &'a QueryRange3d<P>,
         project: &'a impl Fn(Node<P>, &NodeData<P>) -> T,
-        store: &'a impl NodeStore<P>,
+        store: &'a impl NodeStoreRead<P>,
     ) -> Result<impl Iterator<Item = Result<T>> + 'a> {
         let res = if self.is_empty() {
             None
@@ -1314,7 +1355,7 @@ fn range_count<P: TreeParams>(
     data: &NodeData<P>,
     bbox: &BBoxRef<P>,
     query: &QueryRange3d<P>,
-    store: &impl NodeStore<P>,
+    store: &impl NodeStoreRead<P>,
 ) -> Result<u64> {
     if bbox.contained_in(&query) {
         Ok(data.count())
@@ -1514,7 +1555,7 @@ impl<P: TreeParams> NodeData<P> {
 
     pub fn assert_invariants(
         &self,
-        store: &impl NodeStore<P>,
+        store: &impl NodeStoreRead<P>,
         include_summary: bool,
     ) -> Result<AssertInvariantsRes<P>> {
         let left = store.data_opt(self.left())?;

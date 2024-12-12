@@ -1,7 +1,10 @@
-use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition, WriteTransaction};
+use redb::{
+    Database, ReadTransaction, ReadableTable, ReadableTableMetadata, TableDefinition,
+    WriteTransaction,
+};
 use zerocopy::{AsBytes, FromBytes};
 
-use super::{BlobStore, NodeId, Result};
+use super::{BlobStore, BlobStoreRead, NodeId, Result};
 
 pub struct RedbBlobStore {
     db: Database,
@@ -62,8 +65,7 @@ impl RedbBlobStore {
 
     fn create_tables(db: &redb::Database) -> Result<()> {
         let txn = db.begin_write()?;
-        txn.open_table(AUTOINC_TABLE)?;
-        txn.open_table(BLOB_TABLE)?;
+        Tables::open(&txn)?;
         txn.commit()?;
         Ok(())
     }
@@ -99,34 +101,68 @@ pub struct Snapshot {
     blob_table: redb::ReadOnlyTable<NodeId, &'static [u8]>,
 }
 
-impl BlobStore for Snapshot {
-    fn read(&self, id: NodeId) -> Result<Vec<u8>> {
-        self.peek(id, |x| x.to_vec())
+impl Snapshot {
+    pub fn open(txn: &ReadTransaction) -> Result<Self> {
+        Ok(Self {
+            blob_table: txn.open_table(BLOB_TABLE)?,
+        })
     }
+}
 
+impl BlobStoreRead for Snapshot {
     fn peek<T>(&self, id: NodeId, f: impl Fn(&[u8]) -> T) -> Result<T> {
         match self.blob_table.get(&id)? {
             Some(value) => Ok(f(value.value())),
             None => Err(anyhow::anyhow!("Node not found")),
         }
     }
+}
 
-    fn create(&mut self, _node: &[u8]) -> Result<NodeId> {
-        anyhow::bail!("Cannot create nodes in a snapshot")
-    }
+pub struct Tables<'a> {
+    autoinc: redb::Table<'a, &'static str, u64>,
+    blobs: redb::Table<'a, NodeId, &'static [u8]>,
+}
 
-    fn update(&mut self, _id: NodeId, _node: &[u8]) -> Result<()> {
-        anyhow::bail!("Cannot update nodes in a snapshot")
-    }
-
-    fn delete(&mut self, _id: NodeId) -> Result<()> {
-        anyhow::bail!("Cannot delete nodes in a snapshot")
+impl<'a> Tables<'a> {
+    pub fn open(txn: &'a WriteTransaction) -> Result<Self> {
+        let autoinc = txn.open_table(AUTOINC_TABLE)?;
+        let blobs = txn.open_table(BLOB_TABLE)?;
+        Ok(Self { autoinc, blobs })
     }
 }
 
-struct Tables<'a> {
-    autoinc: redb::Table<'a, &'static str, u64>,
-    blobs: redb::Table<'a, NodeId, &'static [u8]>,
+impl<'a> BlobStoreRead for Tables<'a> {
+    fn peek<T>(&self, id: NodeId, f: impl Fn(&[u8]) -> T) -> Result<T> {
+        let value = self
+            .blobs
+            .get(&id)?
+            .ok_or_else(|| anyhow::anyhow!("Node not found"))?;
+        Ok(f(value.value()))
+    }
+}
+
+impl<'a> BlobStore for Tables<'a> {
+    fn create(&mut self, node: &[u8]) -> Result<NodeId> {
+        let current_id = match self.autoinc.get("id")? {
+            Some(id) => id.value(),
+            None => 0u64,
+        };
+        let new_id = current_id + 1;
+        self.autoinc.insert("id", &new_id)?;
+        let new_node_id = NodeId::from(new_id);
+        self.blobs.insert(&new_node_id, node)?;
+        Ok(new_node_id)
+    }
+
+    fn update(&mut self, id: NodeId, node: &[u8]) -> Result<()> {
+        self.blobs.insert(id, node)?;
+        Ok(())
+    }
+
+    fn delete(&mut self, id: NodeId) -> Result<()> {
+        self.blobs.remove(id)?;
+        Ok(())
+    }
 }
 
 self_cell::self_cell!(
@@ -147,120 +183,55 @@ impl WriteBatch {
     }
 }
 
+impl BlobStoreRead for WriteBatch {
+    fn peek<T>(&self, id: NodeId, f: impl Fn(&[u8]) -> T) -> Result<T> {
+        self.0.with_dependent(|_db, tables| tables.peek(id, f))
+    }
+}
+
 impl BlobStore for WriteBatch {
     fn create(&mut self, node: &[u8]) -> Result<NodeId> {
-        let new_node_id = self.0.with_dependent_mut(|_db, tables| {
-            let autoinc_table = &mut tables.autoinc;
-            let current_id = match autoinc_table.get("id")? {
-                Some(id) => id.value(),
-                None => 0u64,
-            };
-            let new_id = current_id + 1;
-            autoinc_table.insert("id", &new_id)?;
-            let new_node_id = NodeId::from(new_id);
-            let blob_table = &mut tables.blobs;
-            blob_table.insert(&new_node_id, node)?;
-            anyhow::Ok(new_node_id)
-        })?;
+        let new_node_id = self
+            .0
+            .with_dependent_mut(|_db, tables| tables.create(node))?;
         Ok(new_node_id)
     }
 
-    fn peek<T>(&self, id: NodeId, f: impl Fn(&[u8]) -> T) -> Result<T> {
-        self.0.with_dependent(|_db, tables| {
-            let blob_table = &tables.blobs;
-            match blob_table.get(&id)? {
-                Some(value) => Ok(f(value.value())),
-                None => Err(anyhow::anyhow!("Node not found")),
-            }
-        })
-    }
-
-    fn read(&self, id: NodeId) -> Result<Vec<u8>> {
-        self.0.with_dependent(|_db, tables| {
-            let blob_table = &tables.blobs;
-            match blob_table.get(&id)? {
-                Some(value) => Ok(value.value().to_vec()),
-                None => Err(anyhow::anyhow!("Node not found")),
-            }
-        })
-    }
-
     fn update(&mut self, id: NodeId, node: &[u8]) -> Result<()> {
-        self.0.with_dependent_mut(|_db, tables| {
-            let blob_table = &mut tables.blobs;
-            blob_table.insert(&id, node)?;
-            Ok(())
-        })
+        self.0
+            .with_dependent_mut(|_db, tables| tables.update(id, node))
     }
 
     fn delete(&mut self, id: NodeId) -> Result<()> {
-        self.0.with_dependent_mut(|_db, tables| {
-            let blob_table = &mut tables.blobs;
-            blob_table.remove(&id)?;
-            Ok(())
-        })
+        self.0.with_dependent_mut(|_db, tables| tables.delete(id))
+    }
+}
+
+impl BlobStoreRead for RedbBlobStore {
+    fn peek<T>(&self, id: NodeId, f: impl Fn(&[u8]) -> T) -> Result<T> {
+        let read_txn = self.db.begin_read()?;
+        Snapshot::open(&read_txn)?.peek(id, f)
     }
 }
 
 impl BlobStore for RedbBlobStore {
     fn create(&mut self, node: &[u8]) -> Result<NodeId> {
         let write_txn = self.db.begin_write()?;
-        let new_node_id: NodeId;
-        {
-            // Open the autoincrement table
-            let mut autoinc_table = write_txn.open_table(AUTOINC_TABLE)?;
-            // Get the current autoincrement value
-            let current_id = match autoinc_table.get("id")? {
-                Some(id) => id.value(),
-                None => 0u64,
-            };
-            let new_id = current_id + 1;
-            // Update the autoincrement value
-            autoinc_table.insert("id", &new_id)?;
-            // Create a NodeId from the new_id
-            new_node_id = NodeId::from(new_id);
-            // Open the blobs table and insert the new node
-            let mut blob_table = write_txn.open_table(BLOB_TABLE)?;
-            blob_table.insert(&new_node_id, node)?;
-        }
+        let new_node_id = Tables::open(&write_txn)?.create(node)?;
         write_txn.commit()?;
         Ok(new_node_id)
     }
 
-    fn read(&self, id: NodeId) -> Result<Vec<u8>> {
-        let read_txn = self.db.begin_read()?;
-        let blob_table = read_txn.open_table(BLOB_TABLE)?;
-        match blob_table.get(&id)? {
-            Some(value) => Ok(value.value().to_vec()),
-            None => Err(anyhow::anyhow!("Node not found")),
-        }
-    }
-
-    fn peek<T>(&self, id: NodeId, f: impl Fn(&[u8]) -> T) -> Result<T> {
-        let read_txn = self.db.begin_read()?;
-        let blob_table = read_txn.open_table(BLOB_TABLE)?;
-        match blob_table.get(&id)? {
-            Some(value) => Ok(f(value.value())),
-            None => Err(anyhow::anyhow!("Node not found")),
-        }
-    }
-
     fn update(&mut self, id: NodeId, node: &[u8]) -> Result<()> {
         let write_txn = self.db.begin_write()?;
-        {
-            let mut blob_table = write_txn.open_table(BLOB_TABLE)?;
-            blob_table.insert(&id, node)?;
-        }
+        Tables::open(&write_txn)?.update(id, node)?;
         write_txn.commit()?;
         Ok(())
     }
 
     fn delete(&mut self, id: NodeId) -> Result<()> {
         let write_txn = self.db.begin_write()?;
-        {
-            let mut blob_table = write_txn.open_table(BLOB_TABLE)?;
-            blob_table.remove(&id)?;
-        }
+        Tables::open(&write_txn)?.delete(id)?;
         write_txn.commit()?;
         Ok(())
     }

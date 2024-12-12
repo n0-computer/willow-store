@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
-use super::{BlobStore, NodeId, Result};
+use super::{BlobStore, BlobStoreRead, NodeId, Result};
 
 #[derive(Debug, Clone)]
 pub struct MemStore {
@@ -44,25 +44,19 @@ impl BlobStore for MemStore {
         Ok(())
     }
 
-    fn read(&self, id: NodeId) -> Result<Vec<u8>> {
+    fn delete(&mut self, id: NodeId) -> Result<()> {
         assert!(!id.is_empty());
-        match self.nodes.get(&id) {
-            Some(data) => Ok(data.to_vec()),
-            None => Err(anyhow::anyhow!("Node not found")),
-        }
+        self.nodes.remove(&id);
+        Ok(())
     }
+}
 
+impl BlobStoreRead for MemStore {
     fn peek<T>(&self, id: NodeId, f: impl Fn(&[u8]) -> T) -> Result<T> {
         assert!(!id.is_empty());
         match self.nodes.get(&id) {
             Some(data) => Ok(f(data)),
             None => Err(anyhow::anyhow!("Node not found")),
         }
-    }
-
-    fn delete(&mut self, id: NodeId) -> Result<()> {
-        assert!(!id.is_empty());
-        self.nodes.remove(&id);
-        Ok(())
     }
 }
